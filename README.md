@@ -177,7 +177,7 @@ Visit: http://localhost:3000
 
 ### Backend (Python)
 - **Google ADK** - Agent framework
-- **Gemini 2.5** - Large language model
+- **Gemini 3.8 Flash** - Large language model
 - **Kubernetes Python Client** - K8s API interaction
 - **Google Cloud Client Libraries** - GCP services
 - **Uvicorn** - ASGI server
@@ -314,7 +314,7 @@ This project is licensed under the MIT License.
 ## 🙏 Acknowledgments
 
 - Built with [Google Agent Development Kit (ADK)](https://github.com/google/adk)
-- Powered by [Gemini 2.5](https://deepmind.google/technologies/gemini/)
+- Powered by [Gemini 3.8 Flash](https://ai.google.dev/gemini-api/docs/models/gemini-3.8-flash)
 - UI components from [shadcn/ui](https://ui.shadcn.com/)
 
 ## 📬 Support

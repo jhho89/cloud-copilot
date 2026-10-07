@@ -8,7 +8,7 @@ load_dotenv()
 
 # Define the Investigator Agent
 InvestigatorAgent = Agent(
-    model="gemini-2.5-flash",
+    model="gemini-3.8-flash",
     name="investigator_agent",
     description="Kubernetes investigator agent that analyzes pod logs and traces root causes",
     instruction="""You are a Kubernetes investigator agent.

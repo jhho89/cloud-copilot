@@ -30,7 +30,7 @@ export const AGENT_CONFIGS: AgentConfig[] = [
     id: 'k8s-copilot',
     name: 'k8s-copilot',
     displayName: 'K8s Copilot',
-    description: 'Intelligent Kubernetes management agent powered by Gemini 2.5. Provides natural language interface for cluster operations, monitoring, and troubleshooting.',
+    description: 'Intelligent Kubernetes management agent powered by Gemini 3.8 Flash. Provides natural language interface for cluster operations, monitoring, and troubleshooting.',
     baseUrl: K8S_COPILOT_URL,
     webUrl: `${K8S_COPILOT_URL}/dev-ui`,
     features: [

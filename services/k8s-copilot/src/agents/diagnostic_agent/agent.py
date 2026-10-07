@@ -18,7 +18,7 @@ load_dotenv()
 
 # Define the Diagnostic Agent
 DiagnosticAgent = Agent(
-    model="gemini-2.5-flash",
+    model="gemini-3.8-flash",
     name="diagnostic_agent",
     description="Kubernetes diagnostic agent that monitors cluster health, configuration, and identifies issues",
     instruction="""You are a Kubernetes diagnostic agent specialized in cluster monitoring and health checks.

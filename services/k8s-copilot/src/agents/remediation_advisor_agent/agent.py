@@ -8,7 +8,7 @@ load_dotenv()
 
 # Define the Remediation Advisor Agent
 RemediationAdvisorAgent = Agent(
-    model="gemini-2.5-flash",
+    model="gemini-3.8-flash",
     name="remediation_advisor_agent",
     description="Kubernetes remediation advisor that suggests fixes and provides kubectl commands",
     instruction="""You are a Kubernetes remediation advisor agent.

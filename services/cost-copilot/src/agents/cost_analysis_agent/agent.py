@@ -22,7 +22,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 CostAnalysisAgent = Agent(
-    model="gemini-2.5-flash",
+    model="gemini-3.8-flash",
     name="cost_analysis_agent",
     description="GCP cost analysis agent that provides cost optimization recommendations and savings estimates",
     instruction="""You are a GCP cost analysis agent specialized in analyzing billing data and providing actionable cost optimization recommendations.
