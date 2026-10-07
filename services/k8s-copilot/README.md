@@ -6,7 +6,7 @@ An intelligent multi-agent system built with Google's Agent Development Kit (ADK
 
 [![Cloud Run](https://img.shields.io/badge/Google%20Cloud-Run-4285F4?logo=google-cloud)](https://cloud.google.com/run)
 [![ADK](https://img.shields.io/badge/Google-ADK-4285F4?logo=google)](https://google.github.io/adk-docs/)
-[![Gemini](https://img.shields.io/badge/Gemini-2.5%20Flash-8E75B2?logo=google-gemini)](https://ai.google.dev/)
+[![Gemini](https://img.shields.io/badge/Gemini-3.8%20Flash-8E75B2?logo=google-gemini)](https://ai.google.dev/gemini-api/docs/models/gemini-3.8-flash)
 
 ---
 
@@ -72,7 +72,7 @@ Coordinates specialized sub-agents to solve complex troubleshooting workflows. U
 └────────────────────────┬─────────────────────────────────────┘
                          │
 ┌────────────────────────▼─────────────────────────────────────┐
-│                  4 AI Agents (Gemini 2.5 Flash)               │
+│                  4 AI Agents (Gemini 3.8 Flash)               │
 │  kubernetes_copilot | diagnostic | investigator | remediation│
 │  13 tools total across all specialized agents                │
 └────────────────────────┬─────────────────────────────────────┘
@@ -317,7 +317,7 @@ tail -f adk_web.log
 - **Cluster-Wide Visibility**: No namespace restrictions - analyze entire cluster at once
 - **Cloud-Native**: Integrates with Kubernetes API and Google Cloud Monitoring
 - **Production-Ready**: Deploy to Cloud Run with IAM, secrets management, and logging
-- **Intelligent Analysis**: Powered by Gemini 2.5 Flash for accurate troubleshooting
+- **Intelligent Analysis**: Powered by Gemini 3.8 Flash for accurate troubleshooting
 - **Cost-Optimized**: Scales to zero, 256MB RAM, efficient resource usage
 
 ---
@@ -338,7 +338,7 @@ This project is open source and available under the MIT License.
 
 Built with:
 - [Google Agent Development Kit (ADK)](https://google.github.io/adk-docs/)
-- [Gemini 2.5 Flash](https://ai.google.dev/)
+- [Gemini 3.8 Flash](https://ai.google.dev/gemini-api/docs/models/gemini-3.8-flash)
 - [Google Cloud Run](https://cloud.google.com/run)
 - [Kubernetes Python Client](https://github.com/kubernetes-client/python)
 - [Google Cloud Monitoring](https://cloud.google.com/monitoring)

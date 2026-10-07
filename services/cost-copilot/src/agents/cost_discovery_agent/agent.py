@@ -16,7 +16,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 CostDiscoveryAgent = Agent(
-    model="gemini-2.5-flash",
+    model="gemini-3.8-flash",
     name="cost_discovery_agent",
     description="GCP cost discovery agent that identifies idle and underutilized resources",
     instruction="""You are a GCP cost discovery agent specialized in finding wasted resources and cost optimization opportunities.

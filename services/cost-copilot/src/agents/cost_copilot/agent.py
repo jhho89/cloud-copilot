@@ -21,7 +21,7 @@ load_dotenv()
 
 # Define the Root Agent as an orchestrator with sub-agents
 CostCopilot = Agent(
-    model="gemini-2.5-flash",
+    model="gemini-3.8-flash",
     name="cost_copilot",
     description="GCP Cost Copilot - intelligent orchestrator for discovering wasted resources and optimizing cloud costs",
     instruction="""You are the Cost Copilot - an intelligent orchestrator that coordinates specialized agents to help users reduce GCP costs and eliminate waste.

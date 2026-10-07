@@ -37,7 +37,7 @@ except Exception as e:
 
 # Define the Root Agent as an orchestrator with sub-agents
 KubernetesCopilot = Agent(
-    model="gemini-2.5-flash",
+    model="gemini-3.8-flash",
     name="kubernetes_copilot",
     description="Kubernetes Copilot - intelligent orchestrator that coordinates specialized agents for cluster management, troubleshooting, and cost analysis",
     instruction="""You are the Kubernetes Copilot - an intelligent orchestrator that coordinates specialized agents to manage and troubleshoot Kubernetes clusters with cost analysis capabilities.
