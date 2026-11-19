@@ -8,6 +8,7 @@ google-cloud-compute>=1.15.0
 google-cloud-monitoring>=2.15.0
 google-cloud-recommender>=2.19.0
 google-cloud-resource-manager>=1.10.0
+google-cloud-bigquery>=3.25.0
 
 # Core Dependencies
 python-dotenv>=1.0.0
