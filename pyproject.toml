@@ -1,0 +1,13 @@
+[tool.pytest.ini_options]
+addopts = "--cov=services/k8s-copilot/src/agents --cov-report=term-missing --ignore=tests/test_gemini_38_flash_e2e.py"
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 120
+
+[tool.ruff.lint]
+# Existing service code has many style and unused-import findings. Until those
+# are cleaned up separately, gate on errors that make Python invalid or names
+# impossible to resolve without adding unrelated churn to service code.
+select = ["E9", "F7", "F63", "F821"]
