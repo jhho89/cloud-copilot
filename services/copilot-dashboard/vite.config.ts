@@ -4,7 +4,6 @@ import viteReact from '@vitejs/plugin-react'
 import viteTsConfigPaths from 'vite-tsconfig-paths'
 import tailwindcss from '@tailwindcss/vite'
 import { nitroV2Plugin } from '@tanstack/nitro-v2-vite-plugin'
-import { fileURLToPath } from 'node:url'
 
 const config = defineConfig({
   plugins: [
@@ -17,16 +16,6 @@ const config = defineConfig({
     tanstackStart(),
     viteReact(),
   ],
-  resolve: {
-    alias: {
-      h3: fileURLToPath(
-        new URL(
-          './node_modules/@tanstack/start-server-core/node_modules/h3',
-          import.meta.url,
-        ),
-      ),
-    },
-  },
 })
 
 export default config
