@@ -70,7 +70,7 @@ Coordinates specialized sub-agents to solve complex troubleshooting workflows. U
 - `get_mysql_query_plan()` - Run `EXPLAIN` for a single read-only MySQL statement
 - `recommend_mysql_indexes()` - Analyze a MySQL query plan and suggest indexes without applying them
 
-Slow-query analysis requires the database to emit its slow query log to the container's `stdout`/`stderr`. If MySQL writes to a file, use a log-streaming sidecar or configure the hosted database image/container to stream the slow log.
+Slow-query analysis reads the container's `stdout`/`stderr` by default. A read-only file mode is also available when an operator allowlists an absolute slow-log path; it uses a shell-free `tail` exec and emits audit metadata without SQL or credentials. See [docs/dba-rbac.md](../docs/dba-rbac.md) for RBAC, file prerequisites, and replica-selection guidance.
 
 For query-plan analysis, the database agent runs a validated `EXPLAIN` statement inside the MySQL/MariaDB pod and can use the result plus `SHOW INDEX` output to recommend indexes. It does not create or alter indexes.
 

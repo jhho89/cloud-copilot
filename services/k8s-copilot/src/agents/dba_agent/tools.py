@@ -3,13 +3,27 @@ from __future__ import annotations
 import os
 import re
 import json
+import logging
 import shlex
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from pathlib import PurePosixPath
 from typing import Optional
 from typing import Any
 
 from kubernetes import client, config, stream
+
+
+_AUDIT_LOGGER = logging.getLogger("cloud_copilot.dba_agent")
+_SLOW_LOG_READER = "/usr/bin/tail"
+
+
+class SlowLogFileConfigError(ValueError):
+    """Raised when a slow-log file path is missing, ambiguous, or not allowlisted."""
+
+
+class SlowLogFileAccessError(RuntimeError):
+    """Raised when an allowlisted slow-log file cannot be read via pod/exec."""
 
 
 @dataclass
@@ -151,6 +165,134 @@ def _parse_slow_query_block(lines: list[str], namespace: str, pod_name: str) -> 
     )
 
 
+def _validate_slow_log_path(path: object) -> str:
+    """Validate an absolute POSIX slow-log path without invoking a shell."""
+    if not isinstance(path, str):
+        raise SlowLogFileConfigError("The slow-log path must be a string.")
+    if not path or path != path.strip():
+        raise SlowLogFileConfigError("The slow-log path must be non-empty and have no leading or trailing whitespace.")
+    if "\x00" in path or "\\" in path:
+        raise SlowLogFileConfigError("The slow-log path must be a POSIX path without NUL or backslash characters.")
+    if any(ord(char) < 32 or ord(char) == 127 for char in path):
+        raise SlowLogFileConfigError("The slow-log path must not contain control characters.")
+
+    raw_components = path[1:].split("/")
+    if not raw_components or any(component in {"", ".", ".."} for component in raw_components):
+        raise SlowLogFileConfigError(
+            "The slow-log path must contain no empty, '.', or '..' components."
+        )
+
+    parsed = PurePosixPath(path)
+    if not parsed.is_absolute():
+        raise SlowLogFileConfigError("The slow-log path must be absolute.")
+    return path
+
+
+def _configured_slow_log_paths() -> list[str]:
+    """Return exact paths configured by the operator, validated before use."""
+    allowlist = os.getenv("DBA_ALLOWED_SLOW_LOG_PATHS")
+    configured = os.getenv("DBA_SLOW_LOG_FILE_PATH")
+    if allowlist is not None:
+        segments = allowlist.split(";")
+        if any(not segment for segment in segments):
+            raise SlowLogFileConfigError(
+                "DBA_ALLOWED_SLOW_LOG_PATHS must not contain empty path entries."
+            )
+        raw_paths = segments
+    else:
+        raw_paths = [configured] if configured is not None else []
+    return [_validate_slow_log_path(path) for path in raw_paths]
+
+
+def _resolve_slow_log_path(file_path: Optional[str]) -> str:
+    """Select a file path only from operator-configured choices."""
+    configured_paths = _configured_slow_log_paths()
+    if not configured_paths:
+        raise SlowLogFileConfigError(
+            "File-based slow-log reading is disabled. Set DBA_ALLOWED_SLOW_LOG_PATHS "
+            "or DBA_SLOW_LOG_FILE_PATH to one validated absolute path."
+        )
+    if file_path is None:
+        if len(configured_paths) != 1:
+            choices = "; ".join(configured_paths)
+            raise SlowLogFileConfigError(
+                f"Multiple slow-log paths are configured ({choices}); pass file_path to select one."
+            )
+        return configured_paths[0]
+    if not isinstance(file_path, str) or file_path not in configured_paths:
+        raise SlowLogFileConfigError(
+            "The requested slow-log path is not allowlisted. Use an exact value from "
+            "DBA_ALLOWED_SLOW_LOG_PATHS or DBA_SLOW_LOG_FILE_PATH."
+        )
+    return file_path
+
+
+def _audit_pod_exec(
+    namespace: str,
+    pod_name: str,
+    container: Optional[str],
+    operation: str,
+    binary: Optional[str] = None,
+    target_path: Optional[str] = None,
+) -> None:
+    """Emit minimal pod/exec metadata without SQL, output, or credentials."""
+    payload: dict[str, Any] = {
+        "event": "dba.pod_exec",
+        "namespace": namespace,
+        "operation": operation,
+        "pod": pod_name,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+    if container:
+        payload["container"] = container
+    if binary is not None:
+        payload["binary"] = binary
+    if target_path is not None:
+        payload["path"] = target_path
+    _AUDIT_LOGGER.info(json.dumps(payload, sort_keys=True, separators=(",", ":")))
+
+
+def _read_slow_log_file(
+    namespace: str,
+    pod_name: str,
+    slow_log_path: str,
+    container: Optional[str] = None,
+    tail_lines: int = 1000,
+) -> str:
+    """Tail an allowlisted slow-log file with one shell-free, read-only exec."""
+    lines = max(1, int(tail_lines))
+    command = [_SLOW_LOG_READER, f"--lines={lines}", "--", slow_log_path]
+    _audit_pod_exec(
+        namespace,
+        pod_name,
+        container,
+        "slow_log_file_read",
+        _SLOW_LOG_READER,
+        slow_log_path,
+    )
+    kwargs: dict[str, Any] = {
+        "name": pod_name,
+        "namespace": namespace,
+        "command": command,
+        "stderr": True,
+        "stdin": False,
+        "stdout": True,
+        "tty": False,
+        "_preload_content": True,
+    }
+    if container:
+        kwargs["container"] = container
+    try:
+        output = stream.stream(_load_kubernetes_client().connect_get_namespaced_pod_exec, **kwargs)
+    except Exception as exc:
+        raise SlowLogFileAccessError(
+            f"Unable to read slow-log file {slow_log_path} from {namespace}/{pod_name}: {exc}"
+        ) from exc
+    if isinstance(output, bytes):
+        return output.decode("utf-8", errors="replace")
+    return output
+
+
 def get_mysql_slow_queries(
     namespace: Optional[str] = None,
     pod_name: Optional[str] = None,
@@ -159,15 +301,24 @@ def get_mysql_slow_queries(
     minutes: int = 5,
     min_query_time: float = 0.5,
     limit: int = 20,
+    log_source: str = "container",
+    file_path: Optional[str] = None,
 ) -> str:
-    """Reads recent MySQL/MariaDB slow-query entries from pod logs.
+    """Reads recent MySQL/MariaDB slow-query entries from pod logs or an allowlisted file.
 
-    The database must emit slow-query log output to stdout/stderr. For
-    databases writing to a file, mount or configure that file as a container
-    log stream, or specify the container emitting it.
+    Container mode keeps the existing stdout/stderr pod-log path. File mode
+    performs a read-only `tail` exec and accepts only an operator-configured
+    path.
     """
     try:
         v1 = _load_kubernetes_client()
+        if log_source not in {"container", "file"}:
+            return "Invalid log_source: use 'container' for stdout/stderr logs or 'file'."
+        if log_source == "container" and file_path is not None:
+            return "file_path requires log_source='file'."
+        slow_log_path = None
+        if log_source == "file":
+            slow_log_path = _resolve_slow_log_path(file_path)
 
         if pod_name:
             if not namespace:
@@ -198,10 +349,24 @@ def get_mysql_slow_queries(
 
         for pod in pods:
             try:
-                kwargs = {"name": pod.metadata.name, "namespace": pod.metadata.namespace, "since_seconds": since_seconds, "tail_lines": tail_lines}
-                if container:
-                    kwargs["container"] = container
-                log = v1.read_namespaced_pod_log(**kwargs)
+                if slow_log_path is not None:
+                    log = _read_slow_log_file(
+                        pod.metadata.namespace,
+                        pod.metadata.name,
+                        slow_log_path,
+                        container,
+                        tail_lines,
+                    )
+                else:
+                    kwargs = {
+                        "name": pod.metadata.name,
+                        "namespace": pod.metadata.namespace,
+                        "since_seconds": since_seconds,
+                        "tail_lines": tail_lines,
+                    }
+                    if container:
+                        kwargs["container"] = container
+                    log = v1.read_namespaced_pod_log(**kwargs)
                 all_queries.extend(_parse_slow_query_log(log or "", pod.metadata.namespace, pod.metadata.name))
             except Exception as exc:
                 errors.append(f"{pod.metadata.namespace}/{pod.metadata.name}: {exc}")
@@ -239,6 +404,8 @@ def get_mysql_slow_queries(
         if errors:
             result.extend(["Skipped pods:", *[f"- {error}" for error in errors]])
         return "\n".join(result)
+    except SlowLogFileConfigError as exc:
+        return f"Slow-log file configuration error: {exc}"
     except Exception as exc:
         return f"Error reading MySQL slow-query logs: {exc}"
 
@@ -300,6 +467,7 @@ def _run_mysql_command(
     pod_name: str,
     command: str,
     container: Optional[str] = None,
+    operation: str = "mysql_readonly_query",
 ) -> str:
     api = _load_kubernetes_client()
     exec_command = ["/bin/sh", "-c", command]
@@ -315,6 +483,7 @@ def _run_mysql_command(
     }
     if container:
         kwargs["container"] = container
+    _audit_pod_exec(namespace, pod_name, container, operation, "/bin/sh")
     return stream.stream(api.connect_get_namespaced_pod_exec, **kwargs)
 
 
