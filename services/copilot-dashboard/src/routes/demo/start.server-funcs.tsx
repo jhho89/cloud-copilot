@@ -17,6 +17,11 @@ const loggedServerFunction = createServerFn({ method: "GET" }).middleware([
 
 const TODOS_FILE = 'todos.json'
 
+interface Todo {
+  id: number
+  name: string
+}
+
 async function readTodos() {
   return JSON.parse(
     await fs.promises.readFile(TODOS_FILE, 'utf-8').catch(() =>
@@ -52,7 +57,7 @@ export const Route = createFileRoute('/demo/start/server-funcs')({
 
 function Home() {
   const router = useRouter()
-  let todos = Route.useLoaderData()
+  let todos = Route.useLoaderData() as Todo[]
 
   const [todo, setTodo] = useState('')
 

@@ -5,7 +5,10 @@
  * Environment Variables:
  * - VITE_K8S_COPILOT_URL: K8s Copilot base URL (default: Cloud Run production)
  * - VITE_COST_COPILOT_URL: Cost Copilot base URL (default: Cloud Run production)
+ * - VITE_DASHBOARD_ROLE: Explicit console role for the deployment (`viewer` or `operator`)
  */
+
+import type { ToolCapability } from '../types/agent'
 
 export interface AgentConfig {
   id: string
@@ -19,6 +22,8 @@ export interface AgentConfig {
     type: string
     description: string
   }
+  requiredCapability: ToolCapability
+  agentKind: 'kubernetes' | 'database' | 'cost'
 }
 
 // Get URLs from environment or use Cloud Run defaults
@@ -45,7 +50,29 @@ export const AGENT_CONFIGS: AgentConfig[] = [
     architecture: {
       type: 'A2A Protocol + ADK Web UI',
       description: 'Built with Google Agent Development Kit (ADK), exposing both A2A protocol for agent-to-agent communication and a web-based chat interface for human interaction.'
-    }
+    },
+    requiredCapability: 'kubernetes:read',
+    agentKind: 'kubernetes'
+  },
+  {
+    id: 'dba-copilot',
+    name: 'dba-copilot',
+    displayName: 'DBA Copilot',
+    description: 'Reads recent MySQL and MariaDB slow-query logs from Kubernetes pods and explains query performance findings without executing SQL.',
+    baseUrl: K8S_COPILOT_URL,
+    webUrl: `${K8S_COPILOT_URL}/dev-ui`,
+    features: [
+      'MySQL and MariaDB slow-query logs',
+      'Recent database diagnostics',
+      'Query plan guidance',
+      'Read-only database inspection'
+    ],
+    architecture: {
+      type: 'A2A endpoint shared with K8s Copilot',
+      description: 'Uses the same K8s Copilot A2A service as a specialized database diagnostic target.'
+    },
+    requiredCapability: 'database:read',
+    agentKind: 'database'
   },
   {
     id: 'cost-copilot',
@@ -64,7 +91,9 @@ export const AGENT_CONFIGS: AgentConfig[] = [
     architecture: {
       type: 'A2A Protocol + ADK Web UI',
       description: 'Built with Google Agent Development Kit (ADK), exposing both A2A protocol for agent-to-agent communication and a web-based chat interface for human interaction.'
-    }
+    },
+    requiredCapability: 'cloud:cost:read',
+    agentKind: 'cost'
   },
 ]
 
