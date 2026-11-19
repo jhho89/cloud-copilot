@@ -45,9 +45,9 @@ function AgentDetail() {
               <h1 className="text-4xl font-bold text-white mb-3">{agent.displayName}</h1>
               <p className="text-gray-300 text-lg leading-relaxed">{agent.description}</p>
             </div>
-            <div className="flex items-center gap-2 px-4 py-2 bg-green-500/10 border border-green-500/50 rounded-lg">
-              <span className="w-2 h-2 rounded-full bg-green-500"></span>
-              <span className="text-green-400 font-medium">Available</span>
+            <div className="flex items-center gap-2 px-4 py-2 bg-slate-500/10 border border-slate-500/50 rounded-lg">
+              <span className="w-2 h-2 rounded-full bg-slate-400"></span>
+              <span className="text-slate-300 font-medium">Configured endpoint</span>
             </div>
           </div>
 
@@ -58,7 +58,8 @@ function AgentDetail() {
               rel="noopener noreferrer"
               className="px-6 py-3 bg-cyan-500 text-white rounded-lg hover:bg-cyan-600 transition-colors font-semibold"
             >
-              Open Agent Service →
+              Open Agent Service
+              <span className="ml-2 rounded-full bg-black/20 px-2 py-1 text-xs">Read-only</span>
             </a>
             <a
               href={agent.baseUrl}

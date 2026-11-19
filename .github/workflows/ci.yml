@@ -1,0 +1,66 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  python:
+    name: Python lint and tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: |
+            services/k8s-copilot/requirements.txt
+            services/cost-copilot/requirements.txt
+      - name: Install Python dependencies
+        run: make install-python
+      - name: Lint Python
+        run: make lint-python
+      - name: Test Python
+        run: make test-python
+
+  dashboard:
+    name: Dashboard checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Install dashboard dependencies
+        run: make install-dashboard
+      - name: Typecheck dashboard
+        run: make lint-dashboard
+      - name: Test dashboard
+        run: make test-dashboard
+      - name: Build dashboard
+        run: make build-dashboard
+
+  docker-k8s-copilot:
+    name: Docker build (k8s-copilot)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Build image
+        run: make build-k8s-copilot
+
+  docker-cost-copilot:
+    name: Docker build (cost-copilot)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Build image
+        run: make build-cost-copilot
