@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import os
 import re
+import json
+import shlex
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Optional
+from typing import Any
 
-from kubernetes import client, config
+from kubernetes import client, config, stream
 
 
 @dataclass
@@ -247,3 +250,235 @@ def _pod_identity(pod: client.V1Pod) -> str:
     for container in pod.spec.containers or []:
         values.extend([container.name or "", container.image or ""])
     return " ".join(values).lower()
+
+
+def _validate_mysql_read_only_query(sql: str, allow_analyze: bool = False) -> str:
+    """Normalizes a single SQL statement and rejects non-read-only statements."""
+    normalized = sql.strip()
+    if normalized.endswith(";"):
+        normalized = normalized[:-1].strip()
+    if not normalized or ";" in normalized:
+        return ""
+
+    first_keyword = re.match(r"(?i)^\s*([A-Za-z]+)", normalized)
+    if not first_keyword:
+        return ""
+    keyword = first_keyword.group(1).upper()
+    if allow_analyze:
+        allowed = {"SELECT", "WITH"}
+    else:
+        allowed = {"SELECT", "WITH", "SHOW", "DESCRIBE", "DESC"}
+    if keyword not in allowed:
+        return ""
+    return normalized
+
+
+def _mysql_shell_command(
+    sql: str,
+    database: str,
+    port: int = 3306,
+    user: Optional[str] = None,
+    password: Optional[str] = None,
+) -> str:
+    """Builds a mysql invocation that reads credentials from the pod environment."""
+    user_value = shlex.quote(user) if user else '"${MYSQL_USER:-root}"'
+    password_value = (
+        shlex.quote(password)
+        if password is not None
+        else '"${MYSQL_PASSWORD:-$MYSQL_ROOT_PASSWORD}"'
+    )
+    return (
+        f"export MYSQL_PWD={password_value}; "
+        f"mysql --host=localhost --port={int(port)} --user={user_value} "
+        f"--database={shlex.quote(database)} --batch --raw --skip-column-names "
+        f"--execute={shlex.quote(sql)}"
+    )
+
+
+def _run_mysql_command(
+    namespace: str,
+    pod_name: str,
+    command: str,
+    container: Optional[str] = None,
+) -> str:
+    api = _load_kubernetes_client()
+    exec_command = ["/bin/sh", "-c", command]
+    kwargs: dict[str, Any] = {
+        "name": pod_name,
+        "namespace": namespace,
+        "command": exec_command,
+        "stderr": True,
+        "stdin": False,
+        "stdout": True,
+        "tty": False,
+        "_preload_content": True,
+    }
+    if container:
+        kwargs["container"] = container
+    return stream.stream(api.connect_get_namespaced_pod_exec, **kwargs)
+
+
+def get_mysql_query_plan(
+    namespace: str,
+    pod_name: str,
+    database: str,
+    sql: str,
+    container: Optional[str] = None,
+    port: int = 3306,
+    user: Optional[str] = None,
+    password: Optional[str] = None,
+    analyze: bool = False,
+) -> str:
+    """Runs EXPLAIN for one read-only SQL statement inside a MySQL pod."""
+    normalized = _validate_mysql_read_only_query(sql, allow_analyze=analyze)
+    if not normalized:
+        return "Invalid SQL: provide one read-only SELECT, WITH, SHOW, DESCRIBE, or DESC statement without a semicolon or embedded statement separator."
+
+    explained_sql = f"EXPLAIN ANALYZE {normalized}" if analyze else f"EXPLAIN FORMAT=JSON {normalized}"
+    command = _mysql_shell_command(explained_sql, database, port, user, password)
+    try:
+        return _run_mysql_command(namespace, pod_name, command, container)
+    except Exception as exc:
+        return f"Error reading MySQL query plan from {namespace}/{pod_name}: {exc}"
+
+
+def _collect_mysql_plan_tables(value: Any, tables: Optional[list[dict[str, Any]]] = None) -> list[dict[str, Any]]:
+    if tables is None:
+        tables = []
+    if isinstance(value, dict):
+        if isinstance(value.get("table_name"), str):
+            tables.append(value)
+        for child in value.values():
+            _collect_mysql_plan_tables(child, tables)
+    elif isinstance(value, list):
+        for child in value:
+            _collect_mysql_plan_tables(child, tables)
+    return tables
+
+
+def _parse_show_index_output(output: str) -> list[dict[str, str]]:
+    lines = [line for line in output.splitlines() if line.strip()]
+    if len(lines) < 2:
+        return []
+    headers = lines[0].split("\t")
+    rows = []
+    for line in lines[1:]:
+        values = line.split("\t")
+        rows.append({header: values[index] if index < len(values) else "" for index, header in enumerate(headers)})
+    return rows
+
+
+def _format_existing_indexes(index_rows: list[dict[str, str]]) -> list[str]:
+    grouped: dict[str, list[str]] = {}
+    for row in index_rows:
+        key = row.get("Key_name", "unknown")
+        column = row.get("Column_name", "")
+        if column:
+            grouped.setdefault(key, []).append(column)
+    return [f"{key}({', '.join(columns)})" for key, columns in grouped.items()]
+
+
+def _recommend_mysql_indexes_from_plan(plan_text: str, sql: str) -> str:
+    try:
+        plan = json.loads(plan_text)
+    except json.JSONDecodeError:
+        return "Could not parse the MySQL EXPLAIN JSON output. Review the raw query plan before changing indexes."
+
+    table_nodes = _collect_mysql_plan_tables(plan)
+    if not table_nodes:
+        return "No MySQL table access nodes were found in the query plan."
+
+    recommendations: list[str] = []
+    for node in table_nodes[:10]:
+        table = node.get("table_name", "unknown")
+        access_type = node.get("access_type", "unknown")
+        key = node.get("key")
+        possible_keys = node.get("possible_keys") or []
+        rows = node.get("rows")
+        extra = node.get("Extra") or ""
+        reasons: list[str] = []
+
+        if access_type == "ALL" and not key:
+            reasons.append("full table scan")
+            if rows:
+                reasons.append(f"estimated {rows} rows")
+        if possible_keys and not key:
+            reasons.append("optimizer did not use any available index")
+        if "Using filesort" in extra:
+            reasons.append("filesort")
+        if "Using temporary" in extra:
+            reasons.append("temporary table")
+
+        if reasons:
+            recommendation = f"**{table}**: {access_type} access ({', '.join(reasons)}). "
+            recommendation += "Review the predicates and join columns for a selective composite index. "
+            if possible_keys:
+                recommendation += f"Existing candidate indexes: {', '.join(possible_keys)}."
+            recommendations.append(recommendation)
+
+    if not recommendations:
+        return "The MySQL plan uses indexed access paths; no obvious index recommendation was found from this plan."
+
+    result = [
+        "MySQL index recommendations (analysis only; do not apply without validation):",
+        "",
+        "```sql",
+        sql,
+        "```",
+        "",
+    ]
+    result.extend(f"- {recommendation}" for recommendation in recommendations)
+    return "\n".join(result)
+
+
+def recommend_mysql_indexes(
+    namespace: str,
+    pod_name: str,
+    database: str,
+    sql: str,
+    container: Optional[str] = None,
+    port: int = 3306,
+    user: Optional[str] = None,
+    password: Optional[str] = None,
+) -> str:
+    """Analyzes a read-only query and suggests indexes without creating them."""
+    normalized = _validate_mysql_read_only_query(sql, allow_analyze=False)
+    if not normalized:
+        return "Invalid SQL: provide one read-only SELECT, WITH, SHOW, DESCRIBE, or DESC statement without a semicolon or embedded statement separator."
+
+    plan_text = get_mysql_query_plan(
+        namespace,
+        pod_name,
+        database,
+        normalized,
+        container,
+        port,
+        user,
+        password,
+        False,
+    )
+    if plan_text.startswith("Error reading MySQL query plan") or plan_text.startswith("Invalid SQL"):
+        return plan_text
+
+    recommendations = _recommend_mysql_indexes_from_plan(plan_text, normalized)
+    try:
+        plan = json.loads(plan_text)
+        tables = list({node["table_name"] for node in _collect_mysql_plan_tables(plan) if node.get("table_name")})
+    except (json.JSONDecodeError, TypeError):
+        tables = []
+
+    existing_index_lines: list[str] = []
+    for table in tables[:5]:
+        safe_table = table.replace("`", "``")
+        command = _mysql_shell_command(f"SHOW INDEX FROM `{safe_table}`", database, port, user, password)
+        try:
+            output = _run_mysql_command(namespace, pod_name, command, container)
+            indexes = _format_existing_indexes(_parse_show_index_output(output))
+            if indexes:
+                existing_index_lines.append(f"- `{table}`: {', '.join(indexes)}")
+        except Exception as exc:
+            existing_index_lines.append(f"- `{table}`: unable to read indexes ({exc})")
+
+    if existing_index_lines:
+        recommendations += "\n\n**Existing indexes**\n" + "\n".join(existing_index_lines)
+    return recommendations

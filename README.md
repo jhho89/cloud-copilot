@@ -155,6 +155,7 @@ Visit: http://localhost:3000
 💬 "Why is my pod in CrashLoopBackOff?"
 💬 "Find slow MySQL queries from the last 5 minutes"
 💬 "Show MySQL queries slower than 2 seconds in the orders namespace"
+💬 "Explain this SQL query and recommend indexes"
 💬 "Show me the cost of the production namespace"
 💬 "Compare costs between staging and production namespaces"
 ```

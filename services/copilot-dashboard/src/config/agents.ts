@@ -38,6 +38,7 @@ export const AGENT_CONFIGS: AgentConfig[] = [
       'Pod and deployment management',
       'Real-time troubleshooting',
       'MySQL and MariaDB slow-query logs',
+      'MySQL query plans and index recommendations',
       'Resource optimization',
       'Multi-cluster support'
     ],

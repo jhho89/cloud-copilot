@@ -31,7 +31,7 @@ Kubernetes troubleshooting is complex and time-consuming, requiring engineers to
    ┌────▼───────┐ ┌─▼──────────┐ ┌─▼───────────┐ ┌▼────────────┐
    │ diagnostic │ │investigator│ │    dba      │ │ remediation │
    │  agent     │ │   agent    │ │   agent     │ │ advisor     │
-   │  7 tools   │ │  3 tools   │ │  2 tools    │ │  3 tools    │
+   │  7 tools   │ │  3 tools   │ │  4 tools    │ │  3 tools    │
    └────────────┘ └────────────┘ └─────────────┘ └─────────────┘
 ```
 
@@ -64,8 +64,12 @@ Coordinates specialized sub-agents to solve complex troubleshooting workflows. U
 **Tools:**
 - `find_database_pods()` - Discover MySQL/MariaDB pods by image, container name, or labels
 - `get_mysql_slow_queries()` - Read recent MySQL/MariaDB slow-query entries from pod logs
+- `get_mysql_query_plan()` - Run `EXPLAIN` for a single read-only MySQL statement
+- `recommend_mysql_indexes()` - Analyze a MySQL query plan and suggest indexes without applying them
 
 Slow-query analysis requires the database to emit its slow query log to the container's `stdout`/`stderr`. If MySQL writes to a file, use a log-streaming sidecar or configure the hosted database image/container to stream the slow log.
+
+For query-plan analysis, the database agent runs a validated `EXPLAIN` statement inside the MySQL/MariaDB pod and can use the result plus `SHOW INDEX` output to recommend indexes. It does not create or alter indexes.
 
 ---
 
@@ -82,7 +86,7 @@ Slow-query analysis requires the database to emit its slow query log to the cont
 │                  6 AI Agents (Gemini 3.8 Flash)               │
 │ kubernetes_copilot | diagnostic | investigator | dba |       │
 │ remediation                                                  │
-│ 15 tools total across all specialized agents                 │
+│ 17 tools total across all specialized agents                 │
 └────────────────────────┬─────────────────────────────────────┘
                          │
          ┌───────────────┼───────────────┐
@@ -144,6 +148,8 @@ Select an agent and ask questions:
 - "Investigate pod xyz in namespace default"
 - "Find slow MySQL queries from the last 5 minutes"
 - "Show MySQL queries slower than 2 seconds in the orders namespace"
+- "Explain this SQL query and recommend indexes"
+- "What indexes should I add for this SELECT query?"
 
 ---
 
