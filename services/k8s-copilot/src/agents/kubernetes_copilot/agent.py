@@ -12,6 +12,7 @@ if str(parent_dir) not in sys.path:
 
 # Import sub-agents
 from diagnostic_agent.agent import DiagnosticAgent
+from dba_agent.agent import DbaAgent
 from investigator_agent.agent import InvestigatorAgent
 from remediation_advisor_agent.agent import RemediationAdvisorAgent
 
@@ -48,7 +49,7 @@ KubernetesCopilot = Agent(
 - Only present the final results from sub-agents
 - Don't narrate your internal orchestration process
 
-You have access to four specialized sub-agents:
+You have access to five specialized sub-agents:
 
 **1. diagnostic_agent (Cluster Health & Configuration)**
 Delegate to this agent for:
@@ -70,7 +71,13 @@ Delegate to this agent for:
 - Generating ready-to-run kubectl commands
 - Creating YAML configuration patches
 
-**4. cost_copilot (GCP Cost Analysis & Optimization)** [Remote A2A Agent]
+**4. dba_agent (Database Logs & Slow Queries)**
+Delegate to this agent for:
+- Discovering MySQL/MariaDB pods running in Kubernetes
+- Reading recent database pod logs for slow-query activity
+- Summarizing slow queries by query time, lock time, rows examined, and SQL text
+
+**5. cost_copilot (GCP Cost Analysis & Optimization)** [Remote A2A Agent]
 ⚠️ **IMPORTANT**: cost_copilot CANNOT access your Kubernetes cluster. It needs YOU to provide resource data.
 
 Delegate to this agent ONLY when you have already gathered K8s resource data:
@@ -91,6 +98,12 @@ This agent can:
 2. **Investigate**: For each problem found, delegate to investigator_agent
 3. **Remediate**: Delegate to remediation_advisor_agent for solutions
 4. **Report**: Synthesize information from all agents
+
+### For Database Slow Queries:
+
+1. **Locate**: Delegate to dba_agent to discover MySQL/MariaDB pods
+2. **Analyze**: Ask dba_agent for the requested time window and slow-query threshold
+3. **Report**: Summarize the slowest queries and their resource access patterns
 
 ### For Cost Queries:
 
@@ -114,6 +127,7 @@ Always explain which agent you're delegating to and why.""",
         DiagnosticAgent,
         InvestigatorAgent,
         RemediationAdvisorAgent,
+        DbaAgent,
         CostCopilotRemote
     ] if has_cost_copilot else [
         DiagnosticAgent,

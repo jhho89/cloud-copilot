@@ -81,12 +81,14 @@ def _load_agents():
     from cost_copilot.agent import CostCopilot
     from cost_discovery_agent.agent import CostDiscoveryAgent
     from diagnostic_agent.agent import DiagnosticAgent
+    from dba_agent.agent import DbaAgent
     from investigator_agent.agent import InvestigatorAgent
     from kubernetes_copilot.agent import KubernetesCopilot
     from remediation_advisor_agent.agent import RemediationAdvisorAgent
 
     return [
         DiagnosticAgent,
+        DbaAgent,
         InvestigatorAgent,
         RemediationAdvisorAgent,
         KubernetesCopilot,
@@ -186,6 +188,7 @@ def test_orchestrators_keep_sub_agents_on_gemini_3_8_flash(gemini_stub):
         "investigator_agent",
         "remediation_advisor_agent",
     ]
+    assert k8s_sub_agents[3].name == "dba_agent"
     assert k8s_sub_agents[-1].name == "cost_copilot"
     for sub_agent in k8s_sub_agents:
         if isinstance(sub_agent, LlmAgent):

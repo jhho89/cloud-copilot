@@ -37,6 +37,7 @@ export const AGENT_CONFIGS: AgentConfig[] = [
       'Cluster health monitoring',
       'Pod and deployment management',
       'Real-time troubleshooting',
+      'MySQL and MariaDB slow-query logs',
       'Resource optimization',
       'Multi-cluster support'
     ],

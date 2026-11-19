@@ -153,6 +153,8 @@ Visit: http://localhost:3000
 ```
 💬 "Check the health of my cluster"
 💬 "Why is my pod in CrashLoopBackOff?"
+💬 "Find slow MySQL queries from the last 5 minutes"
+💬 "Show MySQL queries slower than 2 seconds in the orders namespace"
 💬 "Show me the cost of the production namespace"
 💬 "Compare costs between staging and production namespaces"
 ```

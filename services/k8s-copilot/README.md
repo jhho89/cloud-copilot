@@ -21,18 +21,18 @@ Kubernetes troubleshooting is complex and time-consuming, requiring engineers to
 ```
 ┌─────────────────────────────────────────────────────────┐
 │           kubernetes_copilot (Orchestrator)             │
-│         Coordinates 3 specialized sub-agents            │
+│         Coordinates 5 specialized sub-agents            │
 └────────────────────┬────────────────────────────────────┘
                      │
                      │ delegates to
                      │
-        ┌────────────┼────────────┐
-        │            │            │
-   ┌────▼───────┐ ┌─▼──────────┐ ┌▼────────────┐
-   │ diagnostic │ │investigator│ │ remediation │
-   │  agent     │ │   agent    │ │    agent    │
-   │  7 tools   │ │  3 tools   │ │  3 tools    │
-   └────────────┘ └────────────┘ └─────────────┘
+        ┌────────────┼────────────┬──────────────┐
+        │            │            │              │
+   ┌────▼───────┐ ┌─▼──────────┐ ┌─▼───────────┐ ┌▼────────────┐
+   │ diagnostic │ │investigator│ │    dba      │ │ remediation │
+   │  agent     │ │   agent    │ │   agent     │ │ advisor     │
+   │  7 tools   │ │  3 tools   │ │  2 tools    │ │  3 tools    │
+   └────────────┘ └────────────┘ └─────────────┘ └─────────────┘
 ```
 
 ### 1. **kubernetes_copilot** (Intelligent Orchestrator)
@@ -60,6 +60,13 @@ Coordinates specialized sub-agents to solve complex troubleshooting workflows. U
 - `generate_kubectl_commands()` - Ready-to-run kubectl commands
 - `generate_yaml_patch()` - Configuration patches
 
+### 5. **dba_agent** (Database Logs & Slow Queries)
+**Tools:**
+- `find_database_pods()` - Discover MySQL/MariaDB pods by image, container name, or labels
+- `get_mysql_slow_queries()` - Read recent MySQL/MariaDB slow-query entries from pod logs
+
+Slow-query analysis requires the database to emit its slow query log to the container's `stdout`/`stderr`. If MySQL writes to a file, use a log-streaming sidecar or configure the hosted database image/container to stream the slow log.
+
 ---
 
 ## 🏗️ System Architecture
@@ -72,9 +79,10 @@ Coordinates specialized sub-agents to solve complex troubleshooting workflows. U
 └────────────────────────┬─────────────────────────────────────┘
                          │
 ┌────────────────────────▼─────────────────────────────────────┐
-│                  4 AI Agents (Gemini 3.8 Flash)               │
-│  kubernetes_copilot | diagnostic | investigator | remediation│
-│  13 tools total across all specialized agents                │
+│                  6 AI Agents (Gemini 3.8 Flash)               │
+│ kubernetes_copilot | diagnostic | investigator | dba |       │
+│ remediation                                                  │
+│ 15 tools total across all specialized agents                 │
 └────────────────────────┬─────────────────────────────────────┘
                          │
          ┌───────────────┼───────────────┐
@@ -134,6 +142,8 @@ Select an agent and ask questions:
 - "What's the resource usage on my nodes?"
 - "How do I fix OOMKilled errors?"
 - "Investigate pod xyz in namespace default"
+- "Find slow MySQL queries from the last 5 minutes"
+- "Show MySQL queries slower than 2 seconds in the orders namespace"
 
 ---
 
@@ -312,8 +322,8 @@ tail -f adk_web.log
 
 ## 🔑 Key Features
 
-- **Multi-Agent Architecture**: 4 specialized AI agents working in coordination
-- **Comprehensive Diagnostics**: 13 tools covering cluster config, monitoring, investigation, and remediation
+- **Multi-Agent Architecture**: 5 specialized AI agents working in coordination
+- **Comprehensive Diagnostics**: 15 tools covering cluster config, monitoring, investigation, remediation, and database slow-query analysis
 - **Cluster-Wide Visibility**: No namespace restrictions - analyze entire cluster at once
 - **Cloud-Native**: Integrates with Kubernetes API and Google Cloud Monitoring
 - **Production-Ready**: Deploy to Cloud Run with IAM, secrets management, and logging
