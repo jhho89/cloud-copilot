@@ -47,6 +47,9 @@ Coordinates specialized sub-agents to solve complex troubleshooting workflows. U
 - `get_cluster_metrics()` - CPU/memory via Cloud Monitoring
 - `get_node_resources()` - Node capacity and usage
 - `get_pod_events()` - Kubernetes events for specific pod
+- `run_read_only_diagnostics()` - Prioritized diagnosis from pods, events, conditions, logs, resource usage, PVCs, node pressure, rollout history, and connectivity signals
+- `check_network_and_quota_signals()` - Service, endpoint, Ingress, DNS endpoint, NetworkPolicy, and ResourceQuota evidence
+- `correlate_rollout_history()` - Timing correlation between failures and ReplicaSet revisions
 
 ### 3. **investigator_agent** (Root Cause Analyzer)
 **Tools:**
@@ -86,7 +89,7 @@ For query-plan analysis, the database agent runs a validated `EXPLAIN` statement
 │                  6 AI Agents (Gemini 3.8 Flash)               │
 │ kubernetes_copilot | diagnostic | investigator | dba |       │
 │ remediation                                                  │
-│ 17 tools total across all specialized agents                 │
+│ 20 tools total across all specialized agents                 │
 └────────────────────────┬─────────────────────────────────────┘
                          │
          ┌───────────────┼───────────────┐
@@ -102,6 +105,8 @@ For query-plan analysis, the database agent runs a validated `EXPLAIN` statement
 - **Cluster-wide visibility** - No namespace restrictions, full cluster analysis
 - **Comprehensive diagnostics** - From cluster info to node resources
 - **Smart troubleshooting** - Correlates pod issues with node resources
+- **Evidence-backed diagnostics** - Covers crash loops, OOM kills, image pulls, Pending pods, PVCs, probes, node pressure, scheduling, quotas, and network signals
+- **Partial visibility** - Explicitly reports RBAC-denied API checks instead of treating them as no issue
 - **Automated remediation** - Generates kubectl commands and YAML patches
 
 **How it works:**
@@ -110,6 +115,8 @@ The orchestrator delegates tasks to specialized agents based on the workflow:
 2. **Investigate** → investigator_agent analyzes root causes
 3. **Remediate** → remediation_advisor_agent suggests fixes
 4. **Report** → orchestrator synthesizes findings
+
+See [diagnostics documentation](docs/diagnostics.md) for evidence boundaries and RBAC behavior.
 
 ---
 

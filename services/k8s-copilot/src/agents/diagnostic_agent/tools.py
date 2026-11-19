@@ -1,9 +1,487 @@
 from kubernetes import config, client
 from google.cloud import monitoring_v3
-from google.protobuf import duration_pb2
 import time
 import os
-from typing import Optional
+from typing import Any, Iterable, Mapping, Optional
+
+from . import analysis
+
+
+def _load_kubernetes_client() -> client.CoreV1Api:
+    """Loads the in-cluster or kubeconfig client without performing API calls."""
+    try:
+        config.load_incluster_config()
+    except config.ConfigException:
+        kubeconfig_path = os.getenv("KUBECONFIG", os.path.expanduser("~/.kube/config"))
+        config.load_kube_config(config_file=kubeconfig_path)
+    return client.CoreV1Api()
+
+
+def _load_kubernetes_clients() -> tuple[Any, Any, Any, Any]:
+    core = _load_kubernetes_client()
+    return (
+        core,
+        client.AppsV1Api(),
+        client.NetworkingV1Api(),
+        client.CustomObjectsApi(),
+    )
+
+
+def _is_forbidden(exc: Exception) -> bool:
+    status = getattr(exc, "status", None)
+    reason = str(getattr(exc, "reason", "") or "").lower()
+    body = str(getattr(exc, "body", "") or "").lower()
+    return status == 403 or "forbidden" in reason or "forbidden" in body
+
+
+def _error_text(exc: Exception) -> str:
+    status = getattr(exc, "status", None)
+    reason = getattr(exc, "reason", None)
+    body = getattr(exc, "body", None)
+    detail = f" status={status} reason={reason}"
+    if body:
+        detail += f" body={body}"
+    return detail.strip()
+
+
+def _result(sections: list[str]) -> str:
+    return "\n".join(section for section in sections if section)
+
+
+def _safe_list(call: Any, denied: list[str], unavailable: list[str], section: str):
+    try:
+        return call()
+    except Exception as exc:
+        if _is_forbidden(exc):
+            denied.append((section, f"RBAC denied the Kubernetes API read:{_error_text(exc)}"))
+        else:
+            unavailable.append((section, f"API read failed:{_error_text(exc)}"))
+        return None
+
+
+def _pod_snapshot(
+    core: Any,
+    namespace: Optional[str],
+    pod_name: Optional[str],
+    denied: list[tuple[str, str]],
+    unavailable: list[tuple[str, str]],
+) -> list[Any]:
+    if pod_name:
+        if not namespace:
+            raise ValueError("pod_name requires namespace")
+        pod = _safe_list(
+            lambda: core.read_namespaced_pod(name=pod_name, namespace=namespace),
+            denied,
+            unavailable,
+            "pods",
+        )
+        return [pod] if pod else []
+    if namespace:
+        result = _safe_list(
+            lambda: core.list_namespaced_pod(namespace),
+            denied,
+            unavailable,
+            "pods",
+        )
+    else:
+        result = _safe_list(
+            lambda: core.list_pod_for_all_namespaces(),
+            denied,
+            unavailable,
+            "pods",
+        )
+    return result.items if result else []
+
+
+def _events_snapshot(
+    core: Any,
+    namespace: Optional[str],
+    denied: list[tuple[str, str]],
+    unavailable: list[tuple[str, str]],
+) -> list[Any]:
+    if namespace:
+        result = _safe_list(
+            lambda: core.list_namespaced_event(namespace),
+            denied,
+            unavailable,
+            "events",
+        )
+    else:
+        result = _safe_list(
+            lambda: core.list_event_for_all_namespaces(),
+            denied,
+            unavailable,
+            "events",
+        )
+    return result.items if result else []
+
+
+def _metrics_snapshot(
+    custom: Any,
+    namespace: Optional[str],
+    denied: list[tuple[str, str]],
+    unavailable: list[tuple[str, str]],
+) -> dict[str, dict[str, Any]]:
+    group = "metrics.k8s.io"
+    version = "v1beta1"
+    try:
+        if namespace:
+            raw = custom.list_namespaced_custom_object(group, version, namespace, "pods")
+        else:
+            raw = custom.list_cluster_custom_object(group, version, "pods")
+    except Exception as exc:
+        if _is_forbidden(exc):
+            denied.append(("resource_usage", f"RBAC denied metrics.k8s.io:{_error_text(exc)}"))
+        else:
+            unavailable.append(("resource_usage", f"metrics.k8s.io read failed:{_error_text(exc)}"))
+        return {}
+
+    metrics: dict[str, dict[str, Any]] = {}
+    for item in raw.get("items", []) if isinstance(raw, Mapping) else []:
+        metadata = item.get("metadata", {})
+        key = f"{metadata.get('namespace', '')}/{metadata.get('name', '')}"
+        cpu_millicores = 0.0
+        memory_bytes = 0.0
+        for container in item.get("containers", []) or []:
+            usage = container.get("usage", {}) or {}
+            cpu = analysis._quantity_millicores(usage.get("cpu"))
+            memory = analysis._quantity_bytes(usage.get("memory"))
+            cpu_millicores += cpu or 0
+            memory_bytes += memory or 0
+        metrics[key] = {"cpu_millicores": cpu_millicores, "memory_bytes": memory_bytes}
+    return metrics
+
+
+def _pod_logs_snapshot(
+    core: Any,
+    pods: Iterable[Any],
+    denied: list[tuple[str, str]],
+    unavailable: list[tuple[str, str]],
+    tail_lines: int,
+    limit: int = 25,
+) -> tuple[dict[str, str], bool]:
+    logs: dict[str, str] = {}
+    truncated = False
+    read_count = 0
+    for pod in pods:
+        namespace = _value_safe(pod, "metadata", "namespace")
+        name = _value_safe(pod, "metadata", "name")
+        if not namespace or not name:
+            continue
+        if read_count >= limit:
+            truncated = True
+            break
+        read_count += 1
+        try:
+            body = core.read_namespaced_pod_log(
+                name=name,
+                namespace=namespace,
+                tail_lines=tail_lines,
+                previous=False,
+            )
+            logs[f"{namespace}/{name}"] = body or ""
+        except Exception as exc:
+            if _is_forbidden(exc):
+                denied.append(
+                    ("pod_logs", f"RBAC denied logs for {namespace}/{name}:{_error_text(exc)}")
+                )
+                break
+            else:
+                unavailable.append(
+                    ("pod_logs", f"log read failed for {namespace}/{name}:{_error_text(exc)}")
+                )
+    return logs, truncated
+
+
+def _value_safe(container: Any, parent: str, child: str) -> Optional[str]:
+    parent_value = getattr(container, parent, None)
+    return getattr(parent_value, child, None)
+
+
+def _network_snapshot(
+    core: Any,
+    networking: Any,
+    namespace: Optional[str],
+    denied: list[tuple[str, str]],
+    unavailable: list[tuple[str, str]],
+) -> tuple[list[Any], list[Any], list[Any], list[Any], list[Any], list[Any]]:
+    def listed(call: Any, section: str) -> Any:
+        result = _safe_list(call, denied, unavailable, section)
+        return result.items if result else []
+
+    if namespace:
+        services = listed(lambda: core.list_namespaced_service(namespace), "services")
+        endpoints = listed(lambda: core.list_namespaced_endpoints(namespace), "endpoints")
+        ingresses = listed(lambda: networking.list_namespaced_ingress(namespace), "ingresses")
+        policies = listed(
+            lambda: networking.list_namespaced_network_policy(namespace), "network_policies"
+        )
+        quotas = listed(
+            lambda: core.list_namespaced_resource_quota(namespace), "resource_quotas"
+        )
+    else:
+        services = listed(lambda: core.list_service_for_all_namespaces(), "services")
+        endpoints = listed(lambda: core.list_endpoints_for_all_namespaces(), "endpoints")
+        ingresses = listed(lambda: networking.list_ingress_for_all_namespaces(), "ingresses")
+        policies = listed(
+            lambda: networking.list_network_policy_for_all_namespaces(), "network_policies"
+        )
+        quotas = listed(
+            lambda: core.list_resource_quota_for_all_namespaces(), "resource_quotas"
+        )
+    dns_services = listed(lambda: core.list_namespaced_service("kube-system"), "cluster_dns")
+    return services, endpoints, ingresses, policies, quotas, dns_services
+
+
+def run_read_only_diagnostics(
+    namespace: Optional[str] = None,
+    pod_name: Optional[str] = None,
+    include_logs: bool = True,
+    include_connectivity: bool = True,
+    log_tail_lines: int = 50,
+) -> str:
+    """Collect read-only Kubernetes evidence and return a prioritized report.
+
+    Denied API reads are reported under Partial Visibility rather than treated
+    as absence of evidence.
+    """
+    try:
+        core, apps, networking, custom = _load_kubernetes_clients()
+    except Exception as exc:
+        return f"Error loading Kubernetes clients: {exc}"
+
+    denied: list[tuple[str, str]] = []
+    unavailable: list[tuple[str, str]] = []
+    try:
+        pods = _pod_snapshot(core, namespace, pod_name, denied, unavailable)
+        events = _events_snapshot(core, namespace, denied, unavailable)
+        nodes_result = _safe_list(
+            lambda: core.list_node(), denied, unavailable, "nodes"
+        )
+        nodes = nodes_result.items if nodes_result else []
+        metrics = _metrics_snapshot(custom, namespace, denied, unavailable)
+    except ValueError as exc:
+        return f"Invalid diagnostic request: {exc}"
+
+    logs, logs_truncated = ({}, False)
+    if include_logs:
+        logs, logs_truncated = _pod_logs_snapshot(
+            core, pods, denied, unavailable, tail_lines=log_tail_lines
+        )
+
+    replica_sets: list[Any] = []
+    deployments: list[Any] = []
+    rs_result = _safe_list(
+        lambda: (
+            apps.list_namespaced_replica_set(namespace)
+            if namespace
+            else apps.list_replica_set_for_all_namespaces()
+        ),
+        denied,
+        unavailable,
+        "rollout_history",
+    )
+    if rs_result:
+        replica_sets = rs_result.items
+    deploy_result = _safe_list(
+        lambda: (
+            apps.list_namespaced_deployment(namespace)
+            if namespace
+            else apps.list_deployment_for_all_namespaces()
+        ),
+        denied,
+        unavailable,
+        "rollout_history",
+    )
+    if deploy_result:
+        deployments = deploy_result.items
+
+    pvc_result = _safe_list(
+        lambda: (
+            core.list_namespaced_persistent_volume_claim(namespace)
+            if namespace
+            else core.list_persistent_volume_claim_for_all_namespaces()
+        ),
+        denied,
+        unavailable,
+        "persistent_volume_claims",
+    )
+    pvcs = pvc_result.items if pvc_result else []
+
+    deployment_conditions: list[Any] = []
+    if replica_sets and deployments:
+        newest_name = getattr(getattr(replica_sets[0], "metadata", None), "name", None)
+        deployment_owners = {
+            owner.name
+            for owner in getattr(getattr(replica_sets[0], "metadata", None), "owner_references", []) or []
+            if getattr(owner, "kind", "") == "Deployment"
+        }
+        for deployment in deployments:
+            deploy_name = getattr(getattr(deployment, "metadata", None), "name", None)
+            if deploy_name == newest_name or deploy_name in deployment_owners:
+                deployment_conditions = getattr(
+                    getattr(deployment, "status", None), "conditions", []
+                ) or []
+                break
+
+    findings = analysis.diagnose_failures(
+        pods=pods,
+        events=events,
+        nodes=nodes,
+        pod_logs=logs,
+        pod_metrics=metrics,
+        pvcs=pvcs,
+        replica_sets=replica_sets,
+        deployment_conditions=deployment_conditions,
+    )
+
+    if include_connectivity:
+        services, endpoints, ingresses, policies, quotas, dns_services = _network_snapshot(
+            core, networking, namespace, denied, unavailable
+        )
+        dns_denied = any(
+            section in {"endpoints", "cluster_dns"} for section, _ in denied + unavailable
+        )
+        findings.extend(
+            analysis.diagnose_connectivity(
+                services=services,
+                endpoints=endpoints,
+                pods=pods,
+                ingresses=ingresses,
+                network_policies=policies,
+                dns_services=dns_services,
+                include_dns=not dns_denied,
+            )
+        )
+        findings.extend(analysis.diagnose_quotas(quotas, events))
+
+    findings = analysis.sort_findings(findings)
+    sections = [analysis.format_findings(findings)]
+    if logs_truncated:
+        unavailable.append(
+            ("pod_logs", "log collection stopped after the read limit of 25 pods; remaining pod logs were not read")
+        )
+    sections.append(analysis.format_partial_visibility(denied + unavailable))
+    return _result(sections)
+
+
+def check_network_and_quota_signals(namespace: Optional[str] = None) -> str:
+    """Read Service, endpoint, Ingress, DNS, policy, and quota signals."""
+    try:
+        core, _, networking, _ = _load_kubernetes_clients()
+    except Exception as exc:
+        return f"Error loading Kubernetes clients: {exc}"
+
+    denied: list[tuple[str, str]] = []
+    unavailable: list[tuple[str, str]] = []
+    services, endpoints, ingresses, policies, quotas, dns_services = _network_snapshot(
+        core, networking, namespace, denied, unavailable
+    )
+    pods = []
+    if namespace:
+        pod_result = _safe_list(
+            lambda: core.list_namespaced_pod(namespace), denied, unavailable, "pods"
+        )
+        pods = pod_result.items if pod_result else []
+    else:
+        pod_result = _safe_list(
+            lambda: core.list_pod_for_all_namespaces(), denied, unavailable, "pods"
+        )
+        pods = pod_result.items if pod_result else []
+    events = _events_snapshot(core, namespace, denied, unavailable)
+    dns_denied = any(
+        section in {"endpoints", "cluster_dns"} for section, _ in denied + unavailable
+    )
+    findings = analysis.diagnose_connectivity(
+        services=services,
+        endpoints=endpoints,
+        pods=pods,
+        ingresses=ingresses,
+        network_policies=policies,
+        dns_services=dns_services,
+        include_dns=not dns_denied,
+    )
+    findings.extend(analysis.diagnose_quotas(quotas, events))
+    return _result(
+        [
+            analysis.format_findings(findings),
+            analysis.format_partial_visibility(denied + unavailable),
+        ]
+    )
+
+
+def correlate_rollout_history(
+    namespace: Optional[str] = None,
+    deployment_name: Optional[str] = None,
+) -> str:
+    """Correlate failing pods and warning events with ReplicaSet timing."""
+    try:
+        core, apps, _, _ = _load_kubernetes_clients()
+    except Exception as exc:
+        return f"Error loading Kubernetes clients: {exc}"
+
+    denied: list[tuple[str, str]] = []
+    unavailable: list[tuple[str, str]] = []
+    pods = _pod_snapshot(core, namespace, None, denied, unavailable)
+    events = _events_snapshot(core, namespace, denied, unavailable)
+    if deployment_name and namespace:
+        deployment_result = _safe_list(
+            lambda: apps.read_namespaced_deployment(deployment_name, namespace),
+            denied,
+            unavailable,
+            "rollout_history",
+        )
+        deployment = deployment_result
+        replica_sets = []
+        matching_pods = []
+        if deployment:
+            selector = getattr(getattr(deployment, "spec", None), "selector", None)
+            match_labels = getattr(selector, "match_labels", None) or {}
+            label_selector = ",".join(f"{key}={value}" for key, value in match_labels.items())
+            rs_result = _safe_list(
+                lambda: apps.list_namespaced_replica_set(namespace, label_selector=label_selector),
+                denied,
+                unavailable,
+                "rollout_history",
+            )
+            replica_sets = rs_result.items if rs_result else []
+            rs_names = {
+                getattr(getattr(rs, "metadata", None), "name", "")
+                for rs in replica_sets
+            }
+            for pod in pods:
+                owners = getattr(getattr(pod, "metadata", None), "owner_references", []) or []
+                if any(getattr(owner, "name", "") in rs_names for owner in owners):
+                    matching_pods.append(pod)
+            pods = matching_pods
+        conditions = getattr(getattr(deployment, "status", None), "conditions", []) or []
+    else:
+        rs_result = _safe_list(
+            lambda: (
+                apps.list_namespaced_replica_set(namespace)
+                if namespace
+                else apps.list_replica_set_for_all_namespaces()
+            ),
+            denied,
+            unavailable,
+            "rollout_history",
+        )
+        replica_sets = rs_result.items if rs_result else []
+        conditions = []
+
+    findings = analysis._rollout_findings(
+        pods,
+        replica_sets,
+        deployment_conditions=conditions,
+        events=events,
+        deployment_name=deployment_name,
+    )
+    return _result(
+        [
+            analysis.format_findings(findings),
+            analysis.format_partial_visibility(denied + unavailable),
+        ]
+    )
 
 def get_cluster_info() -> str:
     """Gets information about the current Kubernetes cluster.
