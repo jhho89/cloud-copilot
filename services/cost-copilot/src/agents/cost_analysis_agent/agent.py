@@ -7,6 +7,7 @@ from google.adk.agents.llm_agent import Agent
 from .tools import (
     get_billing_account_for_project,
     get_cost_breakdown,
+    detect_billing_anomalies,
     analyze_vm_rightsizing,
     suggest_committed_use_discounts,
     estimate_cost_savings,
@@ -36,44 +37,48 @@ Your mission is to help users understand their cloud spending and identify oppor
 - Verifies billing is enabled
 - Starting point for cost analysis
 
-**2. get_cost_breakdown(project_id, days=30)**
-- Provides guidance on accessing cost breakdowns
-- Explains BigQuery billing export setup
-- Currently informational (requires BigQuery export for real data)
+**2. get_cost_breakdown(project_id, group_by, days, end_date)**
+    - Queries the BigQuery billing export for real cost data
+    - Supports grouping by service, sku, project and date
+    - Uses ADC; never accepts credentials in arguments
 
-**3. analyze_vm_rightsizing(project_id)**
+**3. detect_billing_anomalies(project_id, days, threshold_pct)**
+    - Flags daily cost spikes and drops using percentage-change rules
+    - Requires the BigQuery billing export
+
+**4. analyze_vm_rightsizing(project_id)**
 - Queries Recommender API for VM downsizing opportunities
 - Shows potential savings from rightsizing overprovisioned VMs
 - Provides specific recommendations with cost impact
 
-**4. suggest_committed_use_discounts(project_id)**
+**5. suggest_committed_use_discounts(project_id)**
 - Identifies CUD opportunities (25-55% savings)
 - Recommends 1-year or 3-year commitments
 - Best for stable, predictable workloads
 
-**5. estimate_cost_savings(recommendations_summary)**
+**6. estimate_cost_savings(recommendations_summary)**
 - Calculates potential monthly/yearly savings
 - Provides realistic cost reduction scenarios
 - Helps prioritize optimization efforts
 
-**6. analyze_storage_costs(project_id)**
+**7. analyze_storage_costs(project_id)**
 - Reviews storage optimization opportunities
 - Suggests cheaper storage classes
 - Recommends lifecycle policies and snapshot management
 
-**7. estimate_namespace_cost(namespace, cpu_cores, memory_gb, storage_gb, pod_count, is_autopilot, days)** [K8s]
+**8. estimate_namespace_cost(namespace, cpu_cores, memory_gb, storage_gb, pod_count, is_autopilot, days)** [K8s]
 - Estimates cost of a Kubernetes namespace based on resource allocation
 - Provides detailed breakdown of CPU, memory, and storage costs
 - Includes monthly/annual projections and optimization tips
 - Use when asked about namespace-specific costs
 
-**8. estimate_cluster_cost(total_cpu_cores, total_memory_gb, total_storage_gb, total_pods, node_count, is_autopilot, days)** [K8s]
+**9. estimate_cluster_cost(total_cpu_cores, total_memory_gb, total_storage_gb, total_pods, node_count, is_autopilot, days)** [K8s]
 - Estimates total GKE cluster cost
 - Provides cluster-wide cost analysis
 - Includes per-pod cost averages
 - Use when asked about overall cluster costs
 
-**9. compare_namespace_costs(namespaces_data)** [K8s]
+**10. compare_namespace_costs(namespaces_data)** [K8s]
 - Compares costs across multiple namespaces
 - Shows which namespaces are most expensive
 - Input format: "namespace1:cpu,memory,storage|namespace2:cpu,memory,storage|..."
@@ -127,6 +132,7 @@ For namespace cost questions, you MUST use the estimate_namespace_cost tool with
     tools=[
         get_billing_account_for_project,
         get_cost_breakdown,
+        detect_billing_anomalies,
         analyze_vm_rightsizing,
         suggest_committed_use_discounts,
         estimate_cost_savings,

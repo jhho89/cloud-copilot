@@ -33,6 +33,7 @@ Cost Copilot (Orchestrator)
 - Suggests Committed Use Discounts (25-55% savings)
 - Reviews storage optimization strategies
 - Calculates total potential savings
+- Queries the BigQuery billing export for real cost breakdowns and anomalies
 
 ## Features
 
@@ -47,6 +48,8 @@ Cost Copilot (Orchestrator)
 - CUD opportunity analysis
 - Storage class suggestions
 - Savings estimation
+- BigQuery billing-export cost breakdowns by service, SKU, project and date
+- Daily cost anomaly detection
 
 ✅ **Actionable Recommendations**
 - Dollar-quantified savings
@@ -68,6 +71,11 @@ pip install -r requirements.txt
 cp .env.example .env
 # Edit .env and add GOOGLE_API_KEY
 
+# Set the BigQuery billing export target (see docs/BIGQUERY-BILLING-EXPORT.md)
+# BILLING_EXPORT_PROJECT=your-project-id
+# BILLING_EXPORT_DATASET=your_billing_dataset
+# BILLING_EXPORT_TABLE=gcp_billing_export_v1_0X9ABC-DEF123
+
 # 3. Authenticate with GCP (for ADC)
 gcloud auth application-default login
 
@@ -85,6 +93,7 @@ The service account needs:
 - `roles/recommender.viewer` - Get optimization recommendations
 - `roles/billing.viewer` - Access billing data
 - `roles/resourcemanager.projectViewer` - List projects
+- `roles/bigquery.jobUser` and `roles/bigquery.dataViewer` - Query the billing export
 
 ### Example Queries
 
@@ -110,7 +119,8 @@ The service account needs:
 ### Cost Analysis Tools
 
 - `get_billing_account_for_project(project_id)` - Verify billing access
-- `get_cost_breakdown(project_id, days=30)` - BigQuery export guidance
+- `get_cost_breakdown(project_id, group_by, days, end_date)` - Query the BigQuery billing export
+- `detect_billing_anomalies(project_id, days, threshold_pct)` - Daily cost anomaly detection
 - `analyze_vm_rightsizing(project_id)` - Recommender API suggestions
 - `suggest_committed_use_discounts(project_id)` - CUD opportunities
 - `estimate_cost_savings(summary)` - Calculate potential savings
@@ -153,14 +163,13 @@ KubernetesCopilot = Agent(
 
 ## Limitations
 
-- **Cost Breakdown**: Requires BigQuery billing export (guidance provided)
+- **Cost Breakdown**: Requires BigQuery billing export (see docs/BIGQUERY-BILLING-EXPORT.md)
 - **Recommender API**: Needs 24-48 hours of data collection
 - **Zone/Region Scanning**: Limited to top 10 zones for performance
 - **Read-Only**: No automated actions (recommendations only)
 
 ## Future Enhancements
 
-- [ ] BigQuery billing export integration
 - [ ] CostActionAgent for safe automation
 - [ ] Cloud Storage analysis tools
 - [ ] GKE cost breakdown

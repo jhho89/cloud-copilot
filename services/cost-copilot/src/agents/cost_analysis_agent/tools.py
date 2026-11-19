@@ -4,10 +4,21 @@ Analyzes GCP billing data and provides cost optimization recommendations
 """
 
 import os
-from typing import Optional
+from typing import List, Optional
+
 from google.cloud import billing_v1, recommender_v1
-from datetime import datetime, timedelta
-import json
+
+from .billing import (
+    BillingExportError,
+    BillingExportNotConfigured,
+    EmptyBillingDataset,
+    build_cost_breakdown_query,
+    detect_cost_anomalies,
+    format_cost_breakdown,
+)
+from .billing import (
+    get_cost_breakdown as query_cost_breakdown,
+)
 
 
 def get_current_project() -> str:
@@ -19,7 +30,7 @@ def get_current_project() -> str:
     return project_id or "unknown"
 
 
-def get_billing_account_for_project(project_id: Optional[str] = None) -> str:
+def get_billing_account_for_project(project_id: str | None = None) -> str:
     """
     Gets the billing account ID associated with a project.
     Required for querying Cloud Billing API.
@@ -39,58 +50,81 @@ def get_billing_account_for_project(project_id: Optional[str] = None) -> str:
         return f"Billing account for {project_id}: {billing_account}"
 
     except Exception as e:
-        return f"Error getting billing account: {str(e)}\nEnsure service account has roles/billing.viewer role."
+        return f"Error getting billing account: {e!s}\nEnsure service account has roles/billing.viewer role."
 
 
-def get_cost_breakdown(project_id: Optional[str] = None, days: int = 30) -> str:
+def get_cost_breakdown(
+    project_id: str | None = None,
+    group_by: list[str] | None = None,
+    days: int = 30,
+    end_date: str | None = None,
+) -> str:
     """
-    Gets cost breakdown by service for the specified time period.
-    Note: This requires BigQuery export of billing data to be enabled.
+    Queries the BigQuery billing export and returns grouped cost totals.
+
+    Supported group-by fields: service, sku, project, date.
+    The label breakdown is not exposed through this tool yet.
     """
     if not project_id:
         project_id = get_current_project()
 
-    # Note: Cloud Billing API doesn't directly provide cost data
-    # In production, this would query BigQuery billing export
-    # For MVP, we provide guidance on enabling billing export
-
-    return f"""## Cost Breakdown for {project_id}
-
-**Note**: To get detailed cost breakdowns, you need to:
-
-1. **Enable Cloud Billing Export to BigQuery**:
-   - Go to Cloud Console → Billing → Billing export
-   - Enable "Detailed usage cost" export
-   - Select a BigQuery dataset
-
-2. **Query BigQuery for costs** (example):
-   ```sql
-   SELECT
-     service.description AS service_name,
-     SUM(cost) AS total_cost,
-     SUM(CAST(usage.amount AS FLOAT64)) AS usage_amount
-   FROM `project.dataset.gcp_billing_export_v1_XXXXX`
-   WHERE DATE(_PARTITIONTIME) >= DATE_SUB(CURRENT_DATE(), INTERVAL {days} DAY)
-   GROUP BY service_name
-   ORDER BY total_cost DESC
-   LIMIT 10
-   ```
-
-3. **Alternative**: Use Cloud Console's Billing Reports:
-   - Console → Billing → Reports
-   - View costs by service, SKU, project, etc.
-
-**What this agent can do**:
-- Analyze VM rightsizing opportunities
-- Suggest committed use discounts
-- Identify idle resources (via CostDiscoveryAgent)
-- Provide general cost optimization recommendations
-
-For real-time cost data, please check Cloud Console Billing Reports or enable BigQuery export.
-"""
+    try:
+        fields = group_by or ["service"]
+        rows = query_cost_breakdown(fields, days=days, end_date=end_date)
+        query, params = build_cost_breakdown_query(fields, days=days, end_date=end_date)
+        result = f"## Cost Breakdown for {project_id} ({days} days)\n\n"
+        result += format_cost_breakdown(rows, fields)
+        return result
+    except BillingExportNotConfigured as exc:
+        return (
+            f"## Billing Export Not Configured\n\n{exc}\n\n"
+            "Enable the detailed usage cost export in Cloud Billing and set "
+            "BILLING_EXPORT_PROJECT, BILLING_EXPORT_DATASET and "
+            "BILLING_EXPORT_TABLE. See docs/BIGQUERY-BILLING-EXPORT.md."
+        )
+    except EmptyBillingDataset as exc:
+        return (
+            f"## No Cost Data for {project_id}\n\n{exc}\n\n"
+            "Exports can take 24-48 hours to populate after they are enabled."
+        )
+    except BillingExportError as exc:
+        return f"## Billing Export Error\n\n{exc}"
+    except ValueError as exc:
+        return f"## Invalid Request\n\n{exc}"
+    except Exception as exc:  # pragma: no cover - defensive
+        return f"## Unexpected Error\n\n{exc}"
 
 
-def analyze_vm_rightsizing(project_id: Optional[str] = None) -> str:
+def detect_billing_anomalies(
+    project_id: str | None = None,
+    days: int = 30,
+    threshold_pct: float = 30.0,
+) -> str:
+    """Detect cost anomalies over the look-back window using daily totals."""
+    if not project_id:
+        project_id = get_current_project()
+    try:
+        anomalies = detect_cost_anomalies(days=days, threshold_pct=threshold_pct)
+        if not anomalies:
+            return f"## No Cost Anomalies Detected for {project_id}\n\nDaily costs stayed within {threshold_pct}% of the running mean."
+        lines = [f"## Cost Anomalies for {project_id}", ""]
+        for anomaly in anomalies:
+            lines.append(
+                f"- {anomaly['day']}: {anomaly['currency']} {anomaly['cost']:.2f} "
+                f"({anomaly['direction']} {anomaly['change_pct']:.1f}% vs mean {anomaly['mean_prior']:.2f})"
+            )
+        return "\n".join(lines)
+    except BillingExportNotConfigured as exc:
+        return f"## Billing Export Not Configured\n\n{exc}"
+    except EmptyBillingDataset as exc:
+        return f"## No Cost Data for Anomaly Detection\n\n{exc}"
+    except BillingExportError as exc:
+        return f"## Billing Export Error\n\n{exc}"
+    except ValueError as exc:
+        return f"## Invalid Request\n\n{exc}"
+
+
+def analyze_vm_rightsizing(project_id: str | None = None) -> str:
     """
     Gets VM rightsizing recommendations from Recommender API.
     Suggests downsizing overprovisioned VMs to save costs.
@@ -127,7 +161,7 @@ def analyze_vm_rightsizing(project_id: Optional[str] = None) -> str:
         if not recommendations:
             return f"No VM rightsizing recommendations found for project {project_id}.\nEither VMs are already optimally sized, or Recommender API needs more time to collect data (usually 24-48 hours)."
 
-        result = f"## VM Rightsizing Recommendations\n\n"
+        result = "## VM Rightsizing Recommendations\n\n"
         result += f"Project: {project_id}\n\n"
         result += f"Found {len(recommendations)} recommendation(s):\n\n"
 
@@ -149,10 +183,10 @@ def analyze_vm_rightsizing(project_id: Optional[str] = None) -> str:
         return result
 
     except Exception as e:
-        return f"Error analyzing VM rightsizing: {str(e)}\nEnsure service account has roles/recommender.viewer role."
+        return f"Error analyzing VM rightsizing: {e!s}\nEnsure service account has roles/recommender.viewer role."
 
 
-def suggest_committed_use_discounts(project_id: Optional[str] = None) -> str:
+def suggest_committed_use_discounts(project_id: str | None = None) -> str:
     """
     Suggests Committed Use Discounts (CUD) based on usage patterns.
     CUDs can save 25-55% for predictable workloads.
@@ -207,7 +241,7 @@ This could mean:
 **Ideal for**: VMs running 24/7, databases, production clusters
 """
 
-        result = f"## Committed Use Discount Recommendations\n\n"
+        result = "## Committed Use Discount Recommendations\n\n"
         result += f"Project: {project_id}\n\n"
         result += f"Found {len(recommendations)} CUD opportunity/opportunities:\n\n"
 
@@ -224,7 +258,7 @@ This could mean:
         return result
 
     except Exception as e:
-        return f"Error analyzing CUD opportunities: {str(e)}"
+        return f"Error analyzing CUD opportunities: {e!s}"
 
 
 def estimate_cost_savings(recommendations_summary: str) -> str:
@@ -279,7 +313,7 @@ def estimate_cost_savings(recommendations_summary: str) -> str:
     return result
 
 
-def analyze_storage_costs(project_id: Optional[str] = None) -> str:
+def analyze_storage_costs(project_id: str | None = None) -> str:
     """
     Analyzes storage usage and suggests cheaper storage classes.
     Helps optimize Cloud Storage, Persistent Disk costs.
