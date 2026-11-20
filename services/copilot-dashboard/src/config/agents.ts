@@ -58,13 +58,14 @@ export const AGENT_CONFIGS: AgentConfig[] = [
     id: 'dba-copilot',
     name: 'dba-copilot',
     displayName: 'DBA Copilot',
-    description: 'Reads recent MySQL and MariaDB slow-query logs from Kubernetes pods and explains query performance findings without executing SQL.',
+    description: 'Reads MySQL/MariaDB slow-query evidence and reports read-only Redis/Valkey diagnostics, metrics trends, and snapshot deltas without changing databases.',
     baseUrl: K8S_COPILOT_URL,
     webUrl: `${K8S_COPILOT_URL}/dev-ui`,
     features: [
       'MySQL and MariaDB slow-query logs',
       'Recent database diagnostics',
       'Query plan guidance',
+      'Redis/Valkey metrics trends and snapshot diffs',
       'Read-only database inspection'
     ],
     architecture: {

@@ -5,6 +5,7 @@ import re
 import json
 import logging
 import shlex
+import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import PurePosixPath
@@ -56,6 +57,51 @@ _REDIS_REMEDIATION_MIN_SLOW_MS = 100.0
 _REDIS_REMEDIATION_FORK_USEC = 100_000
 _REDIS_REMEDIATION_EXPIRED_KEYS = 1_000
 _REDIS_REMEDIATION_TOP_COMMAND_COUNT = 10
+_REDIS_STRUCTURED_SCHEMA_VERSION = "cloud-copilot.dba.redis.v1"
+_REDIS_METRIC_ALIASES = {
+    "memory_used_bytes": ("redis_memory_used_bytes", "redis_used_memory_bytes"),
+    "maxmemory_bytes": ("redis_memory_max_bytes", "redis_maxmemory_bytes"),
+    "fragmentation_ratio": (
+        "redis_mem_fragmentation_ratio",
+        "redis_memory_fragmentation_ratio",
+    ),
+    "evicted_total": (
+        "redis_evicted_keys_total",
+        "redis_evicted_keys",
+        "redis_total_keys_evicted",
+    ),
+    "connected_clients": (
+        "redis_connected_clients",
+        "redis_clients_connected",
+    ),
+    "commands_total": (
+        "redis_commands_processed_total",
+        "redis_total_commands_processed",
+    ),
+    "instantaneous_ops": (
+        "redis_instantaneous_ops_per_sec",
+        "redis_commands_per_second",
+    ),
+    "hits_total": (
+        "redis_keyspace_hits_total",
+        "redis_keyspace_hits",
+    ),
+    "misses_total": (
+        "redis_keyspace_misses_total",
+        "redis_keyspace_misses",
+    ),
+}
+_REDIS_METRIC_KINDS = {
+    "memory_used_bytes": "gauge",
+    "maxmemory_bytes": "gauge",
+    "fragmentation_ratio": "gauge",
+    "evicted_total": "counter",
+    "connected_clients": "gauge",
+    "commands_total": "counter",
+    "instantaneous_ops": "gauge",
+    "hits_total": "counter",
+    "misses_total": "counter",
+}
 
 
 class SlowLogFileConfigError(ValueError):
@@ -76,6 +122,10 @@ class RedisCommandNotAllowlistedError(ValueError):
 
 class RedisCliMissingError(RuntimeError):
     """Raised when neither valkey-cli nor redis-cli is present in a pod."""
+
+
+class RedisMetricsUnavailableError(RuntimeError):
+    """Raised when no configured Redis metrics pipeline is discoverable."""
 
 
 @dataclass
@@ -125,6 +175,66 @@ class RedisRemediation:
             f"  - Risk/trade-off: {self.risk}",
             "  - No change was applied.",
         ]
+
+
+@dataclass
+class RedisMetricSample:
+    timestamp: datetime
+    value: float
+
+
+def _redis_output_mode(output_mode: object) -> str:
+    if not isinstance(output_mode, str) or output_mode not in {"human", "json"}:
+        raise ValueError("Invalid output_mode: use 'human' or 'json'.")
+    return output_mode
+
+
+def _redis_tool_output(
+    tool: str,
+    report: str,
+    output_mode: object = "human",
+    *,
+    metadata: Optional[dict[str, Any]] = None,
+) -> str:
+    """Return the existing Markdown report, or a stable structured envelope."""
+    mode = _redis_output_mode(output_mode)
+    if mode == "human":
+        return report
+    payload: dict[str, Any] = {
+        "schema_version": _REDIS_STRUCTURED_SCHEMA_VERSION,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "tool": tool,
+        "status": "ok",
+        "data": {
+            "format": "markdown",
+            "report": report,
+        },
+    }
+    if metadata is not None:
+        payload["metadata"] = metadata
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"))
+
+
+def _redis_tool_error(
+    tool: str,
+    message: str,
+    output_mode: object = "human",
+) -> str:
+    """Return a Redis tool error without adding command output or credentials."""
+    try:
+        mode = _redis_output_mode(output_mode)
+    except ValueError as exc:
+        return str(exc)
+    if mode == "human":
+        return message
+    payload = {
+        "schema_version": _REDIS_STRUCTURED_SCHEMA_VERSION,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "tool": tool,
+        "status": "error",
+        "errors": [message],
+    }
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"))
 
 
 def _load_kubernetes_client() -> client.CoreV1Api:
@@ -559,6 +669,388 @@ def _pod_identity(pod: client.V1Pod) -> str:
     for container in pod.spec.containers or []:
         values.extend([container.name or "", container.image or ""])
     return " ".join(values).lower()
+
+
+def _redis_metrics_sidecars(pod: client.V1Pod) -> list[dict[str, str]]:
+    """Find redis_exporter-style sidecars and their scrape annotations."""
+    annotations = dict(getattr(pod.metadata, "annotations", None) or {})
+    scrape = str(annotations.get("prometheus.io/scrape", "")).lower() in {"true", "1", "yes"}
+    port = str(annotations.get("prometheus.io/port") or "").strip()
+    path = str(annotations.get("prometheus.io/path") or "/metrics").strip() or "/metrics"
+    sidecars: list[dict[str, str]] = []
+    for container in pod.spec.containers or []:
+        name = str(container.name or "")
+        image = str(container.image or "")
+        combined = f"{name} {image}".lower()
+        if "redis-exporter" in combined or "redis_exporter" in combined or "valkey-exporter" in combined:
+            sidecars.append(
+                {
+                    "container": name,
+                    "image": image,
+                    "port": port,
+                    "path": path,
+                    "scrape": "true" if scrape else "unknown",
+                }
+            )
+    return sidecars
+
+
+def _redis_metrics_discovery(
+    v1: client.CoreV1Api,
+    namespace: Optional[str],
+    pod_name: Optional[str],
+) -> dict[str, Any]:
+    """Discover Kubernetes-visible Redis/Valkey exporter candidates."""
+    pods = _redis_pods_for_analysis(v1, namespace, pod_name, include_sentinels=False)
+    candidates: list[dict[str, Any]] = []
+    for pod in pods:
+        sidecars = _redis_metrics_sidecars(pod)
+        if sidecars:
+            candidates.append(
+                {
+                    "namespace": pod.metadata.namespace,
+                    "pod": pod.metadata.name,
+                    "source": "redis-exporter-sidecar",
+                    "sidecars": sidecars,
+                }
+            )
+    return {"pods": pods, "candidates": candidates}
+
+
+def _load_cloud_monitoring_client() -> Any:
+    from google.cloud import monitoring_v3
+
+    return monitoring_v3.MetricServiceClient()
+
+
+def _redis_project_id(requested: Optional[str]) -> str:
+    project = requested or os.getenv("DBA_REDIS_METRICS_PROJECT_ID")
+    if project:
+        return project
+    import google.auth
+
+    _, inferred = google.auth.default()
+    if not inferred:
+        raise RedisMetricsUnavailableError(
+            "A metrics project is not configured. Set DBA_REDIS_METRICS_PROJECT_ID "
+            "or provide project_id when using Google Cloud Monitoring."
+        )
+    return inferred
+
+
+def _normalize_redis_metric_labels(
+    metric_labels: Optional[dict[str, str]],
+    resource_labels: Optional[dict[str, str]],
+) -> dict[str, str]:
+    labels = {str(key): str(value) for key, value in (metric_labels or {}).items()}
+    labels.update({str(key): str(value) for key, value in (resource_labels or {}).items()})
+    return labels
+
+
+def _redis_metric_matches_target(labels: dict[str, str], namespace: str, pod_name: str) -> bool:
+    label_namespace = next(
+        (
+            labels.get(name, "")
+            for name in ("namespace", "namespace_name", "k8s_namespace", "k8s_pod_namespace")
+            if labels.get(name)
+        ),
+        "",
+    )
+    label_pod = next(
+        (
+            labels.get(name, "")
+            for name in ("pod", "pod_name", "k8s_pod", "k8s_pod_name")
+            if labels.get(name)
+        ),
+        "",
+    )
+    if not label_namespace and not label_pod:
+        return True
+    if label_namespace and namespace and label_namespace != namespace:
+        return False
+    if label_pod and pod_name and label_pod != pod_name:
+        return False
+    return True
+
+
+def _redis_metric_samples(points: Any) -> list[RedisMetricSample]:
+    samples: list[RedisMetricSample] = []
+    for point in points or []:
+        interval = getattr(point, "interval", None)
+        value = getattr(point, "value", None)
+        end_time = getattr(interval, "end_time", None)
+        number = getattr(value, "double_value", None)
+        if number is None:
+            number = getattr(value, "int64_value", None)
+        if number is None:
+            number = getattr(value, "distribution_value", None)
+        if end_time is None or number is None or not isinstance(number, (int, float)):
+            continue
+        timestamp = end_time
+        if isinstance(timestamp, str):
+            timestamp = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+        if getattr(timestamp, "tzinfo", None) is None:
+            timestamp = timestamp.replace(tzinfo=timezone.utc)
+        samples.append(RedisMetricSample(timestamp, float(number)))
+    samples.sort(key=lambda sample: sample.timestamp)
+    return samples
+
+
+def _read_redis_monitoring_series(
+    project_id: str,
+    start_time: datetime,
+    end_time: datetime,
+    target_namespace: str,
+    target_pod: str,
+) -> dict[str, dict[str, Any]]:
+    from google.cloud import monitoring_v3
+
+    client = _load_cloud_monitoring_client()
+    interval = monitoring_v3.TimeInterval(
+        {
+            "start_time": {"seconds": int(start_time.timestamp())},
+            "end_time": {"seconds": int(end_time.timestamp())},
+        }
+    )
+    metrics: dict[str, dict[str, Any]] = {}
+    descriptors = client.list_metric_descriptors(
+        request={
+            "name": f"projects/{project_id}",
+            "filter": 'metric.type = starts_with("prometheus.googleapis.com/redis_")',
+        }
+    )
+    for descriptor in descriptors:
+        metric_type = getattr(descriptor, "type", "")
+        parts = metric_type.split("/")
+        if len(parts) < 3:
+            continue
+        metric_name = parts[-2]
+        logical = next(
+            (logical_name for logical_name, aliases in _REDIS_METRIC_ALIASES.items() if metric_name in aliases),
+            None,
+        )
+        if logical is None or logical in metrics:
+            continue
+        series_list = client.list_time_series(
+            request={
+                "name": f"projects/{project_id}",
+                "filter": f'metric.type = "{metric_type}"',
+                "interval": interval,
+                "view": monitoring_v3.ListTimeSeriesRequest.TimeSeriesView.FULL,
+            }
+        )
+        matched_samples: list[RedisMetricSample] = []
+        matched_labels: dict[str, str] = {}
+        for series in series_list:
+            labels = _normalize_redis_metric_labels(
+                getattr(series.metric, "labels", None),
+                getattr(series.resource, "labels", None),
+            )
+            if not _redis_metric_matches_target(labels, target_namespace, target_pod):
+                continue
+            samples = _redis_metric_samples(getattr(series, "points", None))
+            if samples:
+                matched_samples.extend(samples)
+                matched_labels = labels
+        if matched_samples:
+            matched_samples.sort(key=lambda sample: sample.timestamp)
+            metrics[logical] = {
+                "metric_type": metric_type,
+                "kind": _REDIS_METRIC_KINDS[logical],
+                "labels": matched_labels,
+                "samples": matched_samples,
+            }
+    if not metrics:
+        raise RedisMetricsUnavailableError(
+            "No Redis/Valkey metric series were found in the configured monitoring project "
+            "for the requested time window."
+        )
+    return metrics
+
+
+def _redis_metric_change(metric: Optional[dict[str, Any]], window_seconds: Optional[float]) -> dict[str, Any]:
+    if not metric:
+        return {"available": False, "reason": "metric not reported"}
+    samples = list(metric["samples"])
+    if not samples:
+        return {"available": False, "reason": "no samples"}
+    first, latest = samples[0], samples[-1]
+    result: dict[str, Any] = {
+        "available": True,
+        "metric_type": metric["metric_type"],
+        "kind": metric["kind"],
+        "first": first.value,
+        "latest": latest.value,
+        "change": latest.value - first.value,
+        "sample_count": len(samples),
+        "window_seconds": window_seconds,
+    }
+    if metric["kind"] == "counter" and window_seconds and window_seconds > 0:
+        if latest.value >= first.value:
+            result["rate_per_second"] = (latest.value - first.value) / window_seconds
+        else:
+            result["rate_per_second"] = None
+            result["note"] = "counter decreased; a process restart or reset is likely"
+    if metric["kind"] == "gauge" and len(samples) > 1:
+        result["mean"] = sum(sample.value for sample in samples) / len(samples)
+    return result
+
+
+def _redis_trends_from_metrics(
+    metrics: dict[str, dict[str, Any]],
+    start_time: datetime,
+    end_time: datetime,
+) -> dict[str, Any]:
+    window_seconds = max(1.0, (end_time - start_time).total_seconds())
+    trends: dict[str, Any] = {}
+    for name in (
+        "memory_used_bytes",
+        "maxmemory_bytes",
+        "fragmentation_ratio",
+        "evicted_total",
+        "connected_clients",
+        "commands_total",
+        "instantaneous_ops",
+        "hits_total",
+        "misses_total",
+    ):
+        trends[name] = _redis_metric_change(metrics.get(name), window_seconds)
+
+    evicted = trends["evicted_total"]
+    if evicted["available"] and evicted.get("rate_per_second") is not None:
+        trends["eviction_rate_per_second"] = evicted["rate_per_second"]
+    ops_counter = _redis_metric_change(metrics.get("commands_total"), window_seconds)
+    if ops_counter["available"] and ops_counter.get("rate_per_second") is not None:
+        trends["ops_per_second_from_counter"] = ops_counter["rate_per_second"]
+    elif trends["instantaneous_ops"]["available"]:
+        trends["ops_per_second_from_gauge"] = trends["instantaneous_ops"]["latest"]
+
+    hits = trends["hits_total"]
+    misses = trends["misses_total"]
+    if hits["available"] and misses["available"]:
+        hit_total = max(0.0, hits["latest"])
+        miss_total = max(0.0, misses["latest"])
+        total = hit_total + miss_total
+        if total > 0:
+            trends["hit_rate_latest"] = hit_total / total
+        if (
+            hits.get("rate_per_second") is not None
+            and misses.get("rate_per_second") is not None
+            and (hits["rate_per_second"] + misses["rate_per_second"]) > 0
+        ):
+            trends["hit_rate_from_window_rates"] = (
+                hits["rate_per_second"] / (hits["rate_per_second"] + misses["rate_per_second"])
+            )
+    return trends
+
+
+def get_redis_metrics_trends(
+    namespace: Optional[str] = None,
+    pod: Optional[str] = None,
+    minutes: int = 15,
+    project_id: Optional[str] = None,
+    output_mode: str = "human",
+) -> str:
+    """Report Redis/Valkey trends from a discovered metrics pipeline.
+
+    Metrics are preferred for hit-rate, memory, eviction, client, and ops-rate
+    trends. Pod/exec is intentionally not used as a fallback for trends.
+    """
+    tool = "get_redis_metrics_trends"
+    try:
+        output_mode = _redis_output_mode(output_mode)
+        window_minutes = int(minutes)
+        if window_minutes < 1 or window_minutes > 1440:
+            raise ValueError("minutes must be between 1 and 1440.")
+        if pod and not namespace:
+            raise ValueError("A namespace is required when pod is specified.")
+        end_time = datetime.now(timezone.utc)
+        start_time = end_time - timedelta(minutes=window_minutes)
+
+        v1 = _load_kubernetes_client()
+        discovery = _redis_metrics_discovery(v1, namespace, pod)
+        pods = discovery["pods"]
+        if not pods:
+            return _redis_tool_error(
+                tool,
+                "No Redis or Valkey pods found. Use find_database_pods first to confirm labels and namespace.",
+                output_mode,
+            )
+        selected = next(
+            (
+                candidate
+                for candidate in discovery["candidates"]
+                if (not pod or candidate["pod"] == pod) and (not namespace or candidate["namespace"] == namespace)
+            ),
+            discovery["candidates"][0] if discovery["candidates"] else None,
+        )
+        resolved_pod = pod or (selected["pod"] if selected else None)
+        resolved_namespace = namespace or (selected["namespace"] if selected else None)
+        if not resolved_pod and pods:
+            resolved_pod = pods[0].metadata.name
+            resolved_namespace = resolved_namespace or pods[0].metadata.namespace
+        if not resolved_namespace or not resolved_pod:
+            return _redis_tool_error(
+                tool,
+                "A metrics pipeline was found, but namespace/pod attribution is ambiguous. Pass a namespace and pod.",
+                output_mode,
+            )
+
+        metrics = _read_redis_monitoring_series(
+            _redis_project_id(project_id),
+            start_time,
+            end_time,
+            resolved_namespace,
+            resolved_pod,
+        )
+        trends = _redis_trends_from_metrics(metrics, start_time, end_time)
+    except RedisMetricsUnavailableError as exc:
+        return _redis_tool_error(tool, f"Metrics unavailable: {exc}", output_mode)
+    except Exception as exc:
+        return _redis_tool_error(tool, f"Error reading Redis/Valkey metrics trends: {exc}", output_mode)
+
+    lines = [
+        f"Redis/Valkey metrics trends for {resolved_namespace}/{resolved_pod}:",
+        f"- Window: last {window_minutes} minutes (metrics-only; no pod/exec was used).",
+        f"- Source: Google Cloud Monitoring in project {metrics and next(iter(metrics.values()))['metric_type'] and '' or ''}".rstrip(":"),
+    ]
+    for name, data in trends.items():
+        if isinstance(data, bool):
+            continue
+        if data.get("available"):
+            line = f"- {name}: latest={data['latest']:.6g}, change={data['change']:.6g}, samples={data['sample_count']}"
+            if data.get("rate_per_second") is not None:
+                line += f", rate={data['rate_per_second']:.6g}/s"
+            if data.get("mean") is not None:
+                line += f", mean={data['mean']:.6g}"
+            lines.append(line)
+        else:
+            lines.append(f"- {name}: unavailable ({data.get('reason', 'unavailable')}).")
+    if discovery["candidates"]:
+        lines.append("- Sidecar discovery: yes (Kubernetes annotations/container image).")
+    else:
+        lines.append("- Sidecar discovery: no; metric data came from the existing monitoring pipeline.")
+    lines.extend(
+        [
+            "",
+            "Trends are observations, not causal proof. Use get_redis_memory_report or get_redis_client_report for "
+            "point-in-time forensics.",
+            "No changes were made; this analysis is advisory only.",
+        ]
+    )
+    report = "\n".join(lines)
+    return _redis_tool_output(
+        tool,
+        report,
+        output_mode,
+        metadata={
+            "namespace": resolved_namespace,
+            "pod": resolved_pod,
+            "window_minutes": window_minutes,
+            "sidecar_discovered": bool(discovery["candidates"]),
+            "metrics_reported": sorted(metrics),
+        },
+    )
 
 
 def _pod_matches_database_type(pod: client.V1Pod, db_type: str) -> bool:
@@ -1445,25 +1937,41 @@ def analyze_redis_bigkeys(
     container: Optional[str] = None,
     port: Optional[int] = None,
     sample_interval_seconds: float = 0.01,
+    output_mode: str = "human",
 ) -> str:
     """Analyze large keys with redis-cli/valkey-cli SCAN-based --bigkeys/--memkeys.
 
     This never invokes `KEYS`, a manual `SCAN`, `DEBUG`, or a mutation command.
     A namespace and pod are required to keep the O(N) SCAN bounded to one node.
     """
+    tool = "analyze_redis_bigkeys"
+    try:
+        output_mode = _redis_output_mode(output_mode)
+    except ValueError as exc:
+        return _redis_tool_error(tool, str(exc), "human")
     if not namespace or not pod:
-        return (
+        return _redis_tool_error(
+            tool,
             "A namespace and pod are required for big-key analysis so the O(N) "
-            "SCAN-based CLI remains bounded to a single node."
+            "SCAN-based CLI remains bounded to a single node.",
+            output_mode,
         )
     if mode not in {"bigkeys", "memkeys"}:
-        return "Invalid mode: use 'bigkeys' or 'memkeys'."
+        return _redis_tool_error(tool, "Invalid mode: use 'bigkeys' or 'memkeys'.", output_mode)
     try:
         interval = float(sample_interval_seconds)
     except (TypeError, ValueError):
-        return "Invalid sample_interval_seconds: use a non-negative number of seconds."
+        return _redis_tool_error(
+            tool,
+            "Invalid sample_interval_seconds: use a non-negative number of seconds.",
+            output_mode,
+        )
     if interval < 0 or interval > 1:
-        return "Invalid sample_interval_seconds: use a value between 0 and 1."
+        return _redis_tool_error(
+            tool,
+            "Invalid sample_interval_seconds: use a value between 0 and 1.",
+            output_mode,
+        )
 
     try:
         v1 = _load_kubernetes_client()
@@ -1495,7 +2003,11 @@ def analyze_redis_bigkeys(
         )
         findings, sampled = _parse_bigkeys_output(output)
     except Exception as exc:
-        return f"Error analyzing Redis/Valkey big keys in {namespace}/{pod}: {exc}"
+        return _redis_tool_error(
+            tool,
+            f"Error analyzing Redis/Valkey big keys in {namespace}/{pod}: {exc}",
+            output_mode,
+        )
 
     result = [
         f"Redis/Valkey big-key analysis ({mode}; SCAN-based) for {_redis_context_label(context)}:",
@@ -1543,7 +2055,12 @@ def analyze_redis_bigkeys(
             "No changes were made; this analysis is advisory only.",
         ]
     )
-    return "\n".join(result)
+    return _redis_tool_output(
+        tool,
+        "\n".join(result),
+        output_mode,
+        metadata={"namespace": namespace, "pod": pod, "mode": mode},
+    )
 
 
 def get_redis_memory_report(
@@ -1551,23 +2068,39 @@ def get_redis_memory_report(
     pod: Optional[str] = None,
     container: Optional[str] = None,
     port: Optional[int] = None,
+    output_mode: str = "human",
 ) -> str:
     """Report Redis/Valkey memory, eviction, fragmentation, and fork evidence.
 
     Uses only `INFO memory`, `INFO stats`, `INFO persistence`,
     `INFO replication`, and `MEMORY STATS`; recommendations are advisory.
     """
+    tool = "get_redis_memory_report"
+    try:
+        output_mode = _redis_output_mode(output_mode)
+    except ValueError as exc:
+        return _redis_tool_error(tool, str(exc), "human")
     if pod and not namespace:
-        return "A namespace is required when pod is specified."
+        return _redis_tool_error(
+            tool,
+            "A namespace is required when pod is specified.",
+            output_mode,
+        )
     try:
         v1 = _load_kubernetes_client()
         pods = _redis_pods_for_analysis(v1, namespace, pod)
     except Exception as exc:
-        return f"Error discovering or reading Redis/Valkey pods: {exc}"
+        return _redis_tool_error(
+            tool,
+            f"Error discovering or reading Redis/Valkey pods: {exc}",
+            output_mode,
+        )
     if not pods:
-        return (
+        return _redis_tool_error(
+            tool,
             "No Redis or Valkey pods found. Use find_database_pods first "
-            "to confirm the labels and namespace."
+            "to confirm the labels and namespace.",
+            output_mode,
         )
 
     sections: list[str] = []
@@ -1632,7 +2165,208 @@ def get_redis_memory_report(
     if errors:
         result.extend(["Skipped pods:", *(f"- {error}" for error in errors), ""])
     result.append("No changes were made; this analysis is advisory only.")
-    return "\n".join(result)
+    return _redis_tool_output(
+        tool,
+        "\n".join(result),
+        output_mode,
+        metadata={"namespace": namespace, "pod": pod, "pods_reported": len(sections)},
+    )
+
+
+_REDIS_SNAPSHOT_FIELDS = (
+    "used_memory",
+    "maxmemory",
+    "mem_fragmentation_ratio",
+    "fragmentation",
+    "evicted_keys",
+    "keyspace_hits",
+    "keyspace_misses",
+    "instantaneous_ops_per_sec",
+    "connected_clients",
+    "maxclients",
+    "role",
+)
+
+
+def _read_redis_snapshot(
+    namespace: str,
+    pod_name: str,
+    cli: str,
+    context: dict[str, str],
+    container: Optional[str],
+    port: Optional[int],
+) -> tuple[dict[str, Any], datetime, list[str]]:
+    evidence = _read_redis_evidence(namespace, pod_name, cli, context, container, port)
+    metrics = evidence["metrics"]
+    try:
+        metrics.update(
+            _parse_info_sections(
+                _run_redis_command(namespace, pod_name, cli, ["INFO", "clients"], container, port)
+            )
+        )
+    except Exception as exc:
+        evidence["errors"].append(f"INFO clients: {exc}")
+    snapshot = {name: metrics.get(name) for name in _REDIS_SNAPSHOT_FIELDS if name in metrics}
+    return snapshot, datetime.now(timezone.utc), list(evidence["errors"])
+
+
+def _redis_snapshot_delta(
+    first: dict[str, Any],
+    second: dict[str, Any],
+    elapsed_seconds: float,
+) -> dict[str, Any]:
+    def delta(name: str) -> Optional[float]:
+        first_value = _redis_number(first.get(name))
+        second_value = _redis_number(second.get(name))
+        if first_value is None or second_value is None:
+            return None
+        return second_value - first_value
+
+    fragmentation = delta("mem_fragmentation_ratio")
+    if fragmentation is None:
+        fragmentation = delta("fragmentation")
+    evictions = delta("evicted_keys")
+    eviction_rate = evictions / elapsed_seconds if evictions is not None and evictions >= 0 else None
+    ops = delta("instantaneous_ops_per_sec")
+    hits = delta("keyspace_hits")
+    misses = delta("keyspace_misses")
+    hit_ratio = None
+    if hits is not None and misses is not None and (hits + misses) > 0:
+        hit_ratio = hits / (hits + misses)
+    return {
+        "memory_bytes": delta("used_memory"),
+        "maxmemory_bytes": delta("maxmemory"),
+        "fragmentation": fragmentation,
+        "evicted_keys": evictions,
+        "eviction_rate_per_second": eviction_rate,
+        "keyspace_hits": hits,
+        "keyspace_misses": misses,
+        "hit_ratio_from_delta": hit_ratio,
+        "instantaneous_ops_per_sec": ops,
+        "connected_clients": delta("connected_clients"),
+        "maxclients": delta("maxclients"),
+        "elapsed_seconds": elapsed_seconds,
+    }
+
+
+def get_redis_snapshot_diff(
+    namespace: Optional[str] = None,
+    pod: Optional[str] = None,
+    interval_minutes: int = 5,
+    container: Optional[str] = None,
+    port: Optional[int] = None,
+    output_mode: str = "human",
+) -> str:
+    """Capture two read-only INFO snapshots N minutes apart and report deltas.
+
+    The call intentionally blocks while the two snapshots are separated. Only
+    selected numeric INFO fields and role evidence are retained; raw command
+    output and credentials are never persisted in the report.
+    """
+    tool = "get_redis_snapshot_diff"
+    try:
+        output_mode = _redis_output_mode(output_mode)
+        interval = int(interval_minutes)
+        if interval < 1 or interval > 60:
+            raise ValueError("interval_minutes must be between 1 and 60.")
+        if pod and not namespace:
+            raise ValueError("A namespace is required when pod is specified.")
+        v1 = _load_kubernetes_client()
+        pods = _redis_pods_for_analysis(v1, namespace, pod, include_sentinels=False)
+        if not pods:
+            return _redis_tool_error(
+                tool,
+                "No Redis or Valkey pods found. Use find_database_pods first to confirm labels and namespace.",
+                output_mode,
+            )
+
+        sections: list[str] = []
+        structured_snapshots: list[dict[str, Any]] = []
+        errors: list[str] = []
+        for pod_item in pods:
+            context = _redis_result_context(pod_item, "")
+            label = f"{context['namespace']}/{context['pod']}"
+            try:
+                cli = _detect_redis_cli(context["namespace"], context["pod"], container)
+                first, first_at, first_errors = _read_redis_snapshot(
+                    context["namespace"], context["pod"], cli, context, container, port
+                )
+                context["runtime_role"] = str(first.get("role") or "unknown")
+                time.sleep(interval * 60)
+                second, second_at, second_errors = _read_redis_snapshot(
+                    context["namespace"], context["pod"], cli, context, container, port
+                )
+                elapsed = (second_at - first_at).total_seconds()
+                deltas = _redis_snapshot_delta(first, second, elapsed)
+                node_snapshot = {
+                    "namespace": context["namespace"],
+                    "pod": context["pod"],
+                    "runtime_role": context["runtime_role"],
+                    "first_at": first_at.isoformat(),
+                    "second_at": second_at.isoformat(),
+                    "first": first,
+                    "second": second,
+                    "deltas": deltas,
+                    "errors": first_errors + second_errors,
+                }
+                structured_snapshots.append(node_snapshot)
+                section = [
+                    f"### {label} (CLI: {cli})",
+                    f"- {_redis_context_label(context)}",
+                    f"- First snapshot: {first_at.isoformat()}",
+                    f"- Second snapshot: {second_at.isoformat()}",
+                    f"- Elapsed: {elapsed:.1f}s",
+                    "",
+                    "Deltas:",
+                    f"- memory: {deltas['memory_bytes'] if deltas['memory_bytes'] is not None else 'unavailable'} bytes",
+                    f"- fragmentation: {deltas['fragmentation'] if deltas['fragmentation'] is not None else 'unavailable'}",
+                    (
+                        f"- evictions: {deltas['evicted_keys'] if deltas['evicted_keys'] is not None else 'unavailable'} "
+                        f"({deltas['eviction_rate_per_second']:.6g}/s)"
+                        if deltas["eviction_rate_per_second"] is not None
+                        else "- eviction rate: unavailable"
+                    ),
+                    (
+                        f"- ops/sec point value change: {deltas['instantaneous_ops_per_sec'] if deltas['instantaneous_ops_per_sec'] is not None else 'unavailable'}"
+                    ),
+                    (
+                        f"- hit ratio from hit/miss deltas: {deltas['hit_ratio_from_delta']:.4f}"
+                        if deltas["hit_ratio_from_delta"] is not None
+                        else "- hit ratio delta: unavailable"
+                    ),
+                    (
+                        f"- connected clients: {deltas['connected_clients'] if deltas['connected_clients'] is not None else 'unavailable'}"
+                    ),
+                    "",
+                    "Point-in-time INFO role was re-read at both snapshots. Only selected numeric fields and role "
+                    "evidence were retained; raw CLI output and credentials were not recorded.",
+                    "No changes were made; this analysis is advisory only.",
+                    "",
+                ]
+                sections.append("\n".join(section))
+                if first_errors or second_errors:
+                    errors.extend(first_errors + second_errors)
+            except Exception as exc:
+                errors.append(f"{label}: {exc}")
+
+        report = [f"Redis/Valkey snapshot diff: {len(sections)} pod(s) reported.", ""]
+        report.extend("\n".join(sections).splitlines())
+        if errors:
+            report.extend(["Evidence errors:", *(f"- {error}" for error in errors), ""])
+        report.append("No changes were made; this analysis is advisory only.")
+        return _redis_tool_output(
+            tool,
+            "\n".join(report),
+            output_mode,
+            metadata={
+                "interval_minutes": interval,
+                "snapshots": structured_snapshots,
+            },
+        )
+    except ValueError as exc:
+        return _redis_tool_error(tool, str(exc), output_mode)
+    except Exception as exc:
+        return _redis_tool_error(tool, f"Error diffing Redis/Valkey snapshots: {exc}", output_mode)
 
 
 def _redis_sentinel_snapshot(
@@ -1877,6 +2611,7 @@ def get_redis_client_report(
     pod: Optional[str] = None,
     container: Optional[str] = None,
     port: Optional[int] = None,
+    output_mode: str = "human",
 ) -> str:
     """Report Redis/Valkey client health and topology-aware role evidence.
 
@@ -1884,8 +2619,17 @@ def get_redis_client_report(
     diagnostics. Roles are read again while the report runs; findings are not
     inferred from Kubernetes role labels.
     """
+    tool = "get_redis_client_report"
+    try:
+        output_mode = _redis_output_mode(output_mode)
+    except ValueError as exc:
+        return _redis_tool_error(tool, str(exc), "human")
     if pod and not namespace:
-        return "A namespace is required when pod is specified."
+        return _redis_tool_error(
+            tool,
+            "A namespace is required when pod is specified.",
+            output_mode,
+        )
     try:
         v1 = _load_kubernetes_client()
         all_pods = _redis_pods_for_analysis(v1, namespace, pod)
@@ -1896,11 +2640,17 @@ def get_redis_client_report(
             if _redis_pod_is_sentinel(candidate) and (not pod or candidate.metadata.name == pod)
         ]
     except Exception as exc:
-        return f"Error discovering or reading Redis/Valkey pods: {exc}"
+        return _redis_tool_error(
+            tool,
+            f"Error discovering or reading Redis/Valkey pods: {exc}",
+            output_mode,
+        )
     if not pods and not sentinel_pods:
-        return (
+        return _redis_tool_error(
+            tool,
             "No Redis, Valkey, or Sentinel pods found. Use find_database_pods first "
-            "to confirm the labels and namespace."
+            "to confirm the labels and namespace.",
+            output_mode,
         )
 
     sections: list[str] = []
@@ -1964,7 +2714,12 @@ def get_redis_client_report(
     if errors:
         result.extend(["Skipped pods:", *(f"- {error}" for error in errors), ""])
     result.append("No changes were made; this analysis is advisory only.")
-    return "\n".join(result)
+    return _redis_tool_output(
+        tool,
+        "\n".join(result),
+        output_mode,
+        metadata={"namespace": namespace, "pod": pod, "nodes_reported": len(sections)},
+    )
 
 
 def _parse_config_get_value(output: str, name: str) -> Optional[str]:
@@ -2380,19 +3135,35 @@ def get_redis_latency_report(
     pod: Optional[str] = None,
     container: Optional[str] = None,
     port: Optional[int] = None,
+    output_mode: str = "human",
 ) -> str:
     """Correlate LATENCY evidence with memory, persistence, command, and slowlog data."""
+    tool = "get_redis_latency_report"
+    try:
+        output_mode = _redis_output_mode(output_mode)
+    except ValueError as exc:
+        return _redis_tool_error(tool, str(exc), "human")
     if pod and not namespace:
-        return "A namespace is required when pod is specified."
+        return _redis_tool_error(
+            tool,
+            "A namespace is required when pod is specified.",
+            output_mode,
+        )
     try:
         v1 = _load_kubernetes_client()
         pods = _redis_pods_for_analysis(v1, namespace, pod)
     except Exception as exc:
-        return f"Error discovering or reading Redis/Valkey pods: {exc}"
+        return _redis_tool_error(
+            tool,
+            f"Error discovering or reading Redis/Valkey pods: {exc}",
+            output_mode,
+        )
     if not pods:
-        return (
+        return _redis_tool_error(
+            tool,
             "No Redis or Valkey pods found. Use find_database_pods first "
-            "to confirm the labels and namespace."
+            "to confirm the labels and namespace.",
+            output_mode,
         )
 
     sections: list[str] = []
@@ -2533,7 +3304,12 @@ def get_redis_latency_report(
     result.extend("\n".join(sections).splitlines())
     if errors:
         result.extend(["Skipped pods:", *(f"- {error}" for error in errors), ""])
-    return "\n".join(result)
+    return _redis_tool_output(
+        tool,
+        "\n".join(result),
+        output_mode,
+        metadata={"namespace": namespace, "pod": pod, "pods_reported": len(sections)},
+    )
 
 
 def get_redis_slowlog(
@@ -2543,6 +3319,7 @@ def get_redis_slowlog(
     min_duration_ms: Optional[float] = None,
     container: Optional[str] = None,
     port: Optional[int] = None,
+    output_mode: str = "human",
 ) -> str:
     """Analyze Redis/Valkey slow-log entries using read-only commands only.
 
@@ -2551,21 +3328,38 @@ def get_redis_slowlog(
     container environment (`REDISCLI_AUTH` or `VALKEYCLI_AUTH`); they are never
     added to argv by this tool.
     """
+    tool = "get_redis_slowlog"
+    try:
+        output_mode = _redis_output_mode(output_mode)
+    except ValueError as exc:
+        return _redis_tool_error(tool, str(exc), "human")
     if pod and not namespace:
-        return "A namespace is required when pod is specified."
+        return _redis_tool_error(
+            tool,
+            "A namespace is required when pod is specified.",
+            output_mode,
+        )
     try:
         requested_count = int(count)
     except (TypeError, ValueError):
-        return "Invalid count: use an integer between 1 and 128."
+        return _redis_tool_error(tool, "Invalid count: use an integer between 1 and 128.", output_mode)
     if requested_count < 1 or requested_count > 128:
-        return "Invalid count: use an integer between 1 and 128."
+        return _redis_tool_error(tool, "Invalid count: use an integer between 1 and 128.", output_mode)
     if min_duration_ms is not None:
         try:
             threshold = float(min_duration_ms)
         except (TypeError, ValueError):
-            return "Invalid min_duration_ms: use a non-negative number of milliseconds."
+            return _redis_tool_error(
+                tool,
+                "Invalid min_duration_ms: use a non-negative number of milliseconds.",
+                output_mode,
+            )
         if threshold < 0:
-            return "Invalid min_duration_ms: use a non-negative number of milliseconds."
+            return _redis_tool_error(
+                tool,
+                "Invalid min_duration_ms: use a non-negative number of milliseconds.",
+                output_mode,
+            )
     else:
         threshold = 0.0
 
@@ -2586,9 +3380,11 @@ def get_redis_slowlog(
             ]
 
         if not pods:
-            return (
+            return _redis_tool_error(
+                tool,
                 "No Redis or Valkey pods found. Use find_database_pods first "
-                "to confirm the labels and namespace."
+                "to confirm the labels and namespace.",
+                output_mode,
             )
 
         contexts: list[dict[str, str]] = []
@@ -2686,7 +3482,7 @@ def get_redis_slowlog(
                     "No changes were made; this analysis is advisory only.",
                 ]
             )
-            return "\n".join(result)
+            return _redis_tool_output(tool, "\n".join(result), output_mode)
 
         family_summary: dict[str, dict[str, float]] = {}
         for entry in filtered:
@@ -2759,9 +3555,11 @@ def get_redis_slowlog(
                 "No changes were made; this analysis is advisory only.",
             ]
         )
-        return "\n".join(result)
+        return _redis_tool_output(tool, "\n".join(result), output_mode)
     except Exception as exc:
-        return f"Error reading Redis/Valkey slow log: {exc}"
+        return _redis_tool_error(tool, f"Error reading Redis/Valkey slow log: {exc}", output_mode)
+
+
 def _validate_mysql_read_only_query(sql: str, allow_analyze: bool = False) -> str:
     """Normalizes a single SQL statement and rejects non-read-only statements."""
     normalized = sql.strip()
@@ -3835,20 +4633,38 @@ def get_redis_remediation_recommendations(
     port: Optional[int] = None,
     include_bigkeys: bool = True,
     sample_interval_seconds: float = 0.01,
+    output_mode: str = "human",
 ) -> str:
     """Produce evidence-linked, advisory Redis/Valkey remediation recommendations.
 
     Uses only the existing read-only Redis diagnostics and the SCAN-based CLI
     big-key mode. It never changes Redis/Valkey state or Kubernetes resources.
     """
+    tool = "get_redis_remediation_recommendations"
+    try:
+        output_mode = _redis_output_mode(output_mode)
+    except ValueError as exc:
+        return _redis_tool_error(tool, str(exc), "human")
     if pod and not namespace:
-        return "A namespace is required when pod is specified."
+        return _redis_tool_error(
+            tool,
+            "A namespace is required when pod is specified.",
+            output_mode,
+        )
     try:
         interval = float(sample_interval_seconds)
     except (TypeError, ValueError):
-        return "Invalid sample_interval_seconds: use a value between 0 and 1."
+        return _redis_tool_error(
+            tool,
+            "Invalid sample_interval_seconds: use a value between 0 and 1.",
+            output_mode,
+        )
     if interval < 0 or interval > 1:
-        return "Invalid sample_interval_seconds: use a value between 0 and 1."
+        return _redis_tool_error(
+            tool,
+            "Invalid sample_interval_seconds: use a value between 0 and 1.",
+            output_mode,
+        )
 
     try:
         v1 = _load_kubernetes_client()
@@ -3860,11 +4676,17 @@ def get_redis_remediation_recommendations(
             if _redis_pod_is_sentinel(candidate) and (not pod or candidate.metadata.name == pod)
         ]
     except Exception as exc:
-        return f"Error discovering or reading Redis/Valkey pods: {exc}"
+        return _redis_tool_error(
+            tool,
+            f"Error discovering or reading Redis/Valkey pods: {exc}",
+            output_mode,
+        )
     if not pods and not sentinel_pods:
-        return (
+        return _redis_tool_error(
+            tool,
             "No Redis, Valkey, or Sentinel pods found. Use find_database_pods first "
-            "to confirm the labels and namespace."
+            "to confirm the labels and namespace.",
+            output_mode,
         )
 
     sections: list[str] = []
@@ -3944,4 +4766,9 @@ def get_redis_remediation_recommendations(
     if errors:
         result.extend(["Skipped pods/evidence errors:", *(f"- {error}" for error in errors), ""])
     result.append("No changes were made; this analysis is advisory only.")
-    return "\n".join(result)
+    return _redis_tool_output(
+        tool,
+        "\n".join(result),
+        output_mode,
+        metadata={"namespace": namespace, "pod": pod, "nodes_reported": len(sections)},
+    )

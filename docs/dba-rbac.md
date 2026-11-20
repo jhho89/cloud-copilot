@@ -120,6 +120,20 @@ For cluster mode, client evidence is per node. A single shard's report does not 
 
 The shared pod/exec wrapper uses fixed argv, no stdin, no TTY, enabled stderr, a bounded request timeout, and the same audit event as MySQL file mode. The audit record does not include Redis commands, output, or credentials.
 
+## Redis/Valkey metrics and snapshot mode
+
+`get_redis_metrics_trends` uses metrics rather than pod/exec for time-window questions about hit rate, memory, evictions, connected clients, and ops/sec. It can use a `redis_exporter`/`valkey-exporter` sidecar identified by container/image text and `prometheus.io/scrape`, `prometheus.io/port`, and `prometheus.io/path` annotations, or an existing Google Managed Prometheus/GKE pipeline readable through the service's existing Cloud Monitoring integration. It does not create a new metrics integration or fall back to pod/exec. If no sidecar and no matching Redis series are discoverable, it reports the prerequisite clearly. Set `DBA_REDIS_METRICS_PROJECT_ID` when the default workload credentials do not identify the monitoring project.
+
+`get_redis_snapshot_diff` makes two bounded, read-only INFO evidence collections on one selected pod, separated by 1-60 minutes. It reports selected deltas such as memory, fragmentation drift, eviction rate, hit/miss delta, instantaneous ops change, and connected-client change. It retains only selected numeric fields and runtime role evidence; it does not persist credentials, secrets, Redis commands, or raw output. Because the tool waits between snapshots, avoid long intervals and simultaneous fan-out without explicit agreement.
+
+No Redis/Valkey metrics or snapshot tool changes configuration, resources, or data.
+
+## Redis/Valkey structured output
+
+Redis/Valkey tools accept `output_mode='human'` (the default, preserving existing Markdown) or `output_mode='json'`. JSON uses `schema_version: cloud-copilot.dba.redis.v1`, `tool`, `status`, `generated_at`, a Markdown `data.report`, and bounded metadata. Failures use `status: error` and an `errors` array. The envelope excludes credentials, command arguments, and raw CLI output. Pass JSON verbatim to dashboards or automation.
+
+For common discovery labels, exporter prerequisites, TLS limitations, CLI availability, and Valkey release differences, see `services/k8s-copilot/docs/redis-valkey-dba.md`.
+
 ## Redis/Valkey remediation recommendations
 
 `get_redis_remediation_recommendations` reuses the existing diagnostics and produces node-level, evidence-linked advisory cards for command patterns, memory, persistence, clients, and topology. It does not introduce a new Redis command. It reads the fixed slowlog, INFO/MEMORY, latency, client/topology, and `CONFIG GET` forms already described above. When `include_bigkeys` is enabled (the default), it invokes only the existing SCAN-based `--bigkeys` CLI mode for one selected pod with a bounded interval and timeout; it never issues `KEYS`, a manual `SCAN`, `DEBUG`, or a mutation command.

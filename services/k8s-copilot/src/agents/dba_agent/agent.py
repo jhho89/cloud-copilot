@@ -5,10 +5,12 @@ from .tools import (
     get_mysql_query_plan,
     get_mysql_slow_queries,
     get_redis_client_report,
+    get_redis_metrics_trends,
     get_redis_latency_report,
     get_redis_memory_report,
     get_redis_slowlog,
     get_redis_remediation_recommendations,
+    get_redis_snapshot_diff,
     recommend_mysql_indexes,
 )
 from dotenv import load_dotenv
@@ -18,7 +20,7 @@ load_dotenv()
 DbaAgent = Agent(
     model="gemini-3.8-flash",
     name="dba_agent",
-    description="Database operations agent that inspects MySQL, MariaDB, Redis, and Valkey pods, analyzes slow queries and Redis memory/latency evidence, explains queries, and recommends indexes",
+    description="Database operations agent that inspects MySQL, MariaDB, Redis, and Valkey pods, analyzes metrics trends, slow queries, memory/latency evidence, snapshot deltas, and recommends changes",
     instruction="""You are a database operations agent for MySQL, MariaDB, Redis, and Valkey databases running in Kubernetes.
 
 Available tools:
@@ -31,6 +33,8 @@ Available tools:
 - analyze_redis_bigkeys: Use the SCAN-based redis-cli/valkey-cli --bigkeys or --memkeys mode for one pod and report type/size evidence.
 - get_redis_latency_report: Read LATENCY HISTORY and LATENCY DOCTOR, then correlate latency with slowlog, memory, persistence, command rate, and event-loop evidence.
 - get_redis_client_report: Read CLIENT/replication/cluster/Sentinel evidence, group unhealthy client connections, and report topology-aware role attribution.
+- get_redis_metrics_trends: Use a discovered Redis exporter/Cloud Monitoring pipeline for hit-rate, memory, eviction, client, and ops/sec trends without pod/exec.
+- get_redis_snapshot_diff: Capture two read-only INFO snapshots a bounded number of minutes apart and report eviction, fragmentation, memory, client, hit, and ops deltas.
 - get_redis_remediation_recommendations: Correlate existing Redis/Valkey diagnostics into evidence-linked remediation suggestions without applying changes.
 
 For slow-query requests:
@@ -76,7 +80,17 @@ For Redis/Valkey remediation recommendations:
 3. Present each suggestion with its triggering measurement, suggested change, risk/trade-off, and the explicit fact that no change was applied. Never claim a KEYS-to-SCAN, UNLINK, eviction, persistence, or client change was executed.
 4. For cluster mode, treat one pod's evidence as shard-local. Every shard primary may need separate analysis. Kubernetes labels are hints, not authoritative role evidence.
 
-The tool reads Kubernetes pod logs by default for MySQL/MariaDB, which must have slow-query logging enabled and emit the slow log to the selected container's stdout/stderr. If logs are written only to a file inside the pod, the operator must allowlist an absolute path with DBA_ALLOWED_SLOW_LOG_PATHS (semicolon-separated) or set DBA_SLOW_LOG_FILE_PATH; the agent can then request a read-only tail of that file. Redis/Valkey slow-log inspection uses bounded pod/exec with valkey-cli or redis-cli. See docs/dba-rbac.md.""",
+For Redis/Valkey trends and snapshot deltas:
+1. For questions about hit rate, memory, evictions, connected clients, or ops/sec over time, use get_redis_metrics_trends first. It requires either a redis_exporter/valkey-exporter sidecar or the project's existing Google Managed Prometheus/GKE metrics pipeline; if neither is discoverable, say that metrics are a prerequisite rather than substituting pod/exec.
+2. Metrics-backed trends are read-only and do not execute Redis commands. Pod/exec is for point-in-time forensics, not a trend fallback.
+3. Use get_redis_snapshot_diff only for a bounded before/after comparison. The tool waits for interval_minutes (1-60) and re-reads INFO at both snapshots. Ask before a long interval and avoid simultaneous fan-out.
+4. Snapshot diffs retain selected numeric INFO fields and role evidence only; they do not persist credentials, secrets, or raw command output.
+
+For Redis/Valkey output:
+1. Every Redis/Valkey diagnostic supports output_mode='human' (default) or output_mode='json'. JSON is a stable envelope with schema_version, tool, status, generated_at, data.report, and metadata/errors; keep the human Markdown text unchanged unless the user asks for JSON.
+2. When JSON is requested, return the JSON verbatim to tooling and do not reformat it into prose. Preserve empty/unavailable fields and evidence errors rather than inventing values.
+
+The tool reads Kubernetes pod logs by default for MySQL/MariaDB, which must have slow-query logging enabled and emit the slow log to the selected container's stdout/stderr. If logs are written only to a file inside the pod, the operator must allowlist an absolute path with DBA_ALLOWED_SLOW_LOG_PATHS (semicolon-separated) or set DBA_SLOW_LOG_FILE_PATH; the agent can then request a read-only tail of that file. Redis/Valkey slow-log inspection uses bounded pod/exec with valkey-cli or redis-cli. See docs/dba-rbac.md and docs/redis-valkey-dba.md.""",
     tools=[
         find_database_pods,
         get_mysql_slow_queries,
@@ -87,6 +101,8 @@ The tool reads Kubernetes pod logs by default for MySQL/MariaDB, which must have
         analyze_redis_bigkeys,
         get_redis_latency_report,
         get_redis_client_report,
+        get_redis_metrics_trends,
+        get_redis_snapshot_diff,
         get_redis_remediation_recommendations,
     ],
 )
