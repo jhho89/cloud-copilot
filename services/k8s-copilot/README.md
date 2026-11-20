@@ -31,7 +31,7 @@ Kubernetes troubleshooting is complex and time-consuming, requiring engineers to
    ┌────▼───────┐ ┌─▼──────────┐ ┌─▼───────────┐ ┌▼────────────┐
    │ diagnostic │ │investigator│ │    dba      │ │ remediation │
    │  agent     │ │   agent    │ │   agent     │ │ advisor     │
-   │  7 tools   │ │  3 tools   │ │  4 tools    │ │  3 tools    │
+   │  7 tools   │ │  3 tools   │ │  5 tools    │ │  3 tools    │
    └────────────┘ └────────────┘ └─────────────┘ └─────────────┘
 ```
 
@@ -65,14 +65,17 @@ Coordinates specialized sub-agents to solve complex troubleshooting workflows. U
 
 ### 5. **dba_agent** (Database Logs & Slow Queries)
 **Tools:**
-- `find_database_pods()` - Discover MySQL/MariaDB pods by image, container name, or labels
+- `find_database_pods()` - Discover MySQL/MariaDB/Redis/Valkey pods by image, container name, or labels
 - `get_mysql_slow_queries()` - Read recent MySQL/MariaDB slow-query entries from pod logs
 - `get_mysql_query_plan()` - Run `EXPLAIN` for a single read-only MySQL statement
 - `recommend_mysql_indexes()` - Analyze a MySQL query plan and suggest indexes without applying them
+- `get_redis_slowlog()` - Analyze Redis/Valkey `SLOWLOG` entries and command families
 
 Slow-query analysis reads the container's `stdout`/`stderr` by default. A read-only file mode is also available when an operator allowlists an absolute slow-log path; it uses a shell-free `tail` exec and emits audit metadata without SQL or credentials. See [docs/dba-rbac.md](../docs/dba-rbac.md) for RBAC, file prerequisites, and replica-selection guidance.
 
 For query-plan analysis, the database agent runs a validated `EXPLAIN` statement inside the MySQL/MariaDB pod and can use the result plus `SHOW INDEX` output to recommend indexes. It does not create or alter indexes.
+
+Redis and Valkey slow-log analysis uses `valkey-cli` when available, otherwise `redis-cli`, through direct argv pod/exec. It runs only `SLOWLOG GET`, `SLOWLOG LEN`, and `CONFIG GET slowlog-max-len`; destructive and maintenance commands are blocked. Passwords must already be available in the container environment (`REDISCLI_AUTH` or `VALKEYCLI_AUTH`) or via a mounted CLI configuration, never as command-line arguments.
 
 ---
 
@@ -89,7 +92,7 @@ For query-plan analysis, the database agent runs a validated `EXPLAIN` statement
 │                  6 AI Agents (Gemini 3.8 Flash)               │
 │ kubernetes_copilot | diagnostic | investigator | dba |       │
 │ remediation                                                  │
-│ 20 tools total across all specialized agents                 │
+│ 21 tools total across all specialized agents                 │
 └────────────────────────┬─────────────────────────────────────┘
                          │
          ┌───────────────┼───────────────┐
@@ -157,6 +160,7 @@ Select an agent and ask questions:
 - "Show MySQL queries slower than 2 seconds in the orders namespace"
 - "Explain this SQL query and recommend indexes"
 - "What indexes should I add for this SELECT query?"
+- "Show Redis slow commands in the cache namespace"
 
 ---
 
@@ -336,7 +340,7 @@ tail -f adk_web.log
 ## 🔑 Key Features
 
 - **Multi-Agent Architecture**: 5 specialized AI agents working in coordination
-- **Comprehensive Diagnostics**: 15 tools covering cluster config, monitoring, investigation, remediation, and database slow-query analysis
+- **Comprehensive Diagnostics**: 16 tools covering cluster config, monitoring, investigation, remediation, and database slow-query analysis
 - **Cluster-Wide Visibility**: No namespace restrictions - analyze entire cluster at once
 - **Cloud-Native**: Integrates with Kubernetes API and Google Cloud Monitoring
 - **Production-Ready**: Deploy to Cloud Run with IAM, secrets management, and logging

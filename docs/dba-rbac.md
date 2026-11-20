@@ -1,6 +1,6 @@
 # DBA agent read-only access
 
-The DBA agent is diagnostic-only. It does not execute application SQL, create or alter database objects, mutate pods, or restart workloads. `EXPLAIN` is the only query execution supported, and destructive statements are rejected before execution.
+The DBA agent is diagnostic-only. It does not execute application SQL, create or alter database objects, mutate pods, or restart workloads. For MySQL/MariaDB, `EXPLAIN` is the only query execution supported and destructive statements are rejected before execution. For Redis/Valkey, only the explicit slow-log commands below are allowed.
 
 ## Kubernetes RBAC
 
@@ -75,3 +75,23 @@ The pod/exec audit record contains the event time, namespace, pod, operation, fi
 Pass `namespace` and `pod_name` for a targeted investigation. When discovery is needed, use `namespace` plus a narrow `label_selector`; avoid cluster-wide scans in production.
 
 For a replicated deployment, analyze the primary for write-path queries and replicas separately for read-path queries. Do not assume every replica has the same workload or slow-log contents. For file mode, selecting one pod at a time also limits exec fan-out; repeat the analysis on additional replicas only when their traffic pattern is relevant.
+
+## Redis/Valkey slow-log mode
+
+`find_database_pods` recognizes Redis and Valkey by pod name, label text, container name, or image. When a pod has a StatefulSet owner reference and an ordinal suffix such as `cache-2`, the tool reports the StatefulSet and ordinal as topology hints. Explicit role labels (`app.kubernetes.io/component`, `redis-role`, `valkey-role`, or provider-specific role labels) are reported when they name `master`, `primary`, `replica`, `slave`, or `sentinel`. These are hints, not authoritative topology probes.
+
+The Redis path runs `valkey-cli --json` first and falls back to `redis-cli --json`. It does not try alternate or renamed binaries, does not probe credentials, and does not attempt to discover renamed commands. If neither known CLI binary exists in the selected pod/container, the tool fails clearly.
+
+Commands are validated against a strict allowlist before execution:
+
+- `SLOWLOG GET <count>`
+- `SLOWLOG LEN`
+- `CONFIG GET slowlog-max-len`
+
+The blocked-command layer explicitly rejects `KEYS`, `DEBUG`, `CONFIG SET`, `LATENCY RESET`, `SLOWLOG RESET`, `CLIENT KILL`, `MONITOR`, `SAVE`, `FLUSHDB`, `FLUSHALL`, and destructive or maintenance commands. The CLI runs as direct argv over pod/exec; there is no shell for the Redis path.
+
+Password authentication must already be present in the selected container. Prefer `REDISCLI_AUTH` or `VALKEYCLI_AUTH` populated from a Kubernetes Secret, or mount a read-only CLI configuration if ACL or transport settings require one. The tool does not accept passwords, usernames, or authentication tokens as arguments and does not add credentials to argv. Pod environment values are inherited by `valkey-cli`/`redis-cli`; the tool itself does not read them.
+
+Redis/Valkey analysis performs four bounded pod/exec calls per selected pod: CLI detection with `--version`, `SLOWLOG GET`, `SLOWLOG LEN`, and `CONFIG GET slowlog-max-len`. Output is parsed as CLI JSON or RESP arrays, filtered by duration, sorted by total duration, and grouped by command family. Each entry is labeled with its pod and known role/topology. If `SLOWLOG LEN` equals `slowlog-max-len`, the report states that the slow log is saturated and older entries may have been evicted. All findings are advisory only; the tool changes no Redis or Valkey state.
+
+The shared pod/exec wrapper uses fixed argv, no stdin, no TTY, enabled stderr, a bounded request timeout, and the same audit event as MySQL file mode. The audit record does not include Redis commands, output, or credentials.
