@@ -351,3 +351,269 @@ def test_parse_show_index_output_groups_columns() -> None:
     indexes = tools._format_existing_indexes(tools._parse_show_index_output(output))
 
     assert indexes == ["PRIMARY(id)", "idx_customer(customer_id, created_at)"]
+
+
+def _redis_pod(
+    name: str = "cache-1",
+    namespace: str = "cache",
+    image: str = "valkey/valkey:8.0",
+    labels: dict[str, str] | None = None,
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        metadata=SimpleNamespace(
+            name=name,
+            namespace=namespace,
+            labels=labels or {"app.kubernetes.io/name": "valkey"},
+            owner_references=[SimpleNamespace(kind="StatefulSet", name="cache")],
+        ),
+        spec=SimpleNamespace(containers=[SimpleNamespace(name="redis", image=image)]),
+        status=SimpleNamespace(phase="Running"),
+    )
+
+
+def test_find_database_pods_supports_valkey_with_topology_hints(monkeypatch) -> None:
+    pod = _redis_pod(
+        name="cache-2",
+        labels={
+            "app.kubernetes.io/name": "valkey",
+            "app.kubernetes.io/component": "replica",
+        },
+    )
+    api = SimpleNamespace(
+        list_pod_for_all_namespaces=lambda label_selector=None: SimpleNamespace(items=[pod])
+    )
+    monkeypatch.setattr(tools, "_load_kubernetes_client", lambda: api)
+
+    result = tools.find_database_pods("valkey")
+
+    assert result == (
+        "cache/cache-2 (Status: Running; statefulset=cache, ordinal=2, role=replica)"
+    )
+
+
+def test_detect_redis_cli_prefers_valkey(monkeypatch) -> None:
+    calls = []
+
+    def fake_exec(namespace, pod, command, container, operation, timeout_seconds, target_path=None):
+        calls.append(command)
+        if command[0] == "valkey-cli":
+            return "valkey-cli 8.0.0"
+        return "redis-cli 7.2.0"
+
+    monkeypatch.setattr(tools, "_pod_exec", fake_exec)
+
+    assert tools._detect_redis_cli("cache", "cache-0") == "valkey-cli"
+    assert calls == [["valkey-cli", "--version"]]
+
+
+def test_detect_redis_cli_fails_clearly_when_both_are_missing(monkeypatch) -> None:
+    def fake_exec(namespace, pod, command, container, operation, timeout_seconds, target_path=None):
+        return (
+            'OCI runtime exec failed: exec: "redis-cli": executable file not '
+            "found in $PATH: unknown"
+        )
+
+    monkeypatch.setattr(tools, "_pod_exec", fake_exec)
+
+    with pytest.raises(
+        tools.RedisCliMissingError,
+        match="Neither valkey-cli nor redis-cli is available",
+    ):
+        tools._detect_redis_cli("cache", "cache-0")
+
+
+def test_validate_redis_command_blocks_destructive_and_maintenance_commands() -> None:
+    for command in [
+        "KEYS *",
+        "DEBUG SLEEP 0",
+        "CONFIG SET slowlog-max-len 1",
+        "LATENCY RESET",
+        "SLOWLOG RESET",
+        "CLIENT KILL id 1",
+        "MONITOR",
+        "SAVE",
+        "FLUSHDB",
+        "FLUSHALL",
+    ]:
+        with pytest.raises(Exception):
+            tools._validate_redis_command(command)
+
+    assert tools._validate_redis_command(["SLOWLOG", "GET", "25"]) == [
+        "SLOWLOG",
+        "GET",
+        "25",
+    ]
+    assert tools._validate_redis_command("SLOWLOG LEN") == ["SLOWLOG", "LEN"]
+    assert tools._validate_redis_command(
+        ["CONFIG", "GET", "slowlog-max-len"]
+    ) == ["CONFIG", "GET", "slowlog-max-len"]
+
+
+def test_redis_cli_argv_uses_container_auth_env_only(monkeypatch) -> None:
+    monkeypatch.setenv("VALKEYCLI_AUTH", "super-secret")
+    monkeypatch.setenv("REDISCLI_AUTH", "super-secret")
+
+    argv = tools._redis_cli_argv(
+        "valkey-cli",
+        ["CONFIG", "GET", "slowlog-max-len"],
+        6380,
+    )
+
+    assert argv == [
+        "valkey-cli",
+        "--json",
+        "--port",
+        "6380",
+        "CONFIG",
+        "GET",
+        "slowlog-max-len",
+    ]
+    assert "super-secret" not in argv
+    assert "--pass" not in argv
+    assert "-a" not in argv
+
+
+REDIS6_RESP = (
+    b"*1\r\n*4\r\n:1\r\n:1700000000\r\n:1500\r\n"
+    b"*2\r\n$3\r\nGET\r\n$7\r\nkey-six\r\n"
+)
+REDIS7_RESP = (
+    b"*1\r\n*6\r\n:2\r\n:1700000001\r\n:2500\r\n"
+    b"*2\r\n$3\r\nSET\r\n$9\r\nkey-seven\r\n"
+    b"$14\r\n127.0.0.1:6379\r\n$8\r\nworker-7\r\n"
+)
+VALKEY8_RESP = (
+    b"*1\r\n*6\r\n:3\r\n:1700000002\r\n:3750\r\n"
+    b"*2\r\n$4\r\nSCAN\r\n$1\r\n0\r\n"
+    b"*4\r\n$4\r\naddr\r\n$14\r\n127.0.0.1:6379\r\n$2\r\nfd\r\n$4\r\nname\r\n$8\r\nworker-8\r\n"
+)
+
+
+def test_parse_slowlog_entries_supports_redis_6_7_and_valkey_8_resp() -> None:
+    redis6 = tools._parse_slowlog_entry(
+        tools._parse_slowlog_entries(REDIS6_RESP.decode())[0],
+        {"namespace": "cache", "pod": "redis-0"},
+    )
+    redis7 = tools._parse_slowlog_entry(
+        tools._parse_slowlog_entries(REDIS7_RESP.decode())[0],
+        {"namespace": "cache", "pod": "redis-1"},
+    )
+    valkey8 = tools._parse_slowlog_entry(
+        tools._parse_slowlog_entries(VALKEY8_RESP.decode())[0],
+        {"namespace": "cache", "pod": "valkey-0"},
+    )
+
+    assert redis6 and redis6.command == "GET key-six" and redis6.duration_ms == 1.5
+    assert redis7 and redis7.command == "SET key-seven" and redis7.client == "127.0.0.1:6379"
+    assert redis7 and redis7.client_name == "worker-7"
+    assert valkey8 and valkey8.command == "SCAN 0" and valkey8.duration_ms == 3.75
+    assert valkey8 and "127.0.0.1:6379" in valkey8.client_info
+
+
+def test_get_redis_slowlog_shapes_report_and_filters_duration(monkeypatch) -> None:
+    pod = _redis_pod(
+        name="cache-1",
+        labels={
+            "app.kubernetes.io/name": "valkey",
+            "app.kubernetes.io/component": "replica",
+        },
+    )
+    commands = []
+
+    class DiscoveryApi:
+        def read_namespaced_pod(self, name, namespace):
+            return pod
+
+    def fake_cli(*args, **kwargs):
+        return "valkey-cli"
+
+    def fake_run_redis_command(namespace, pod_name, cli, redis_command, container=None, port=None):
+        commands.append(list(redis_command))
+        if redis_command[1] == "GET":
+            return (
+                '[["7", 1700000002, 1500, ["GET", "cache:key"], '
+                '"127.0.0.1:6379", "worker"]]'
+            )
+        if redis_command[1] == "LEN":
+            return "2"
+        return '["slowlog-max-len", "2"]'
+
+    monkeypatch.setattr(tools, "_load_kubernetes_client", lambda: DiscoveryApi())
+    monkeypatch.setattr(tools, "_detect_redis_cli", fake_cli)
+    monkeypatch.setattr(tools, "_run_redis_command", fake_run_redis_command)
+
+    result = tools.get_redis_slowlog("cache", "cache-1", count=25, min_duration_ms=1)
+
+    assert "### 1. cache/cache-1 (CLI: valkey-cli)" in result
+    assert "role=replica; statefulset=cache, ordinal=1" in result
+    assert "Duration: 1.500ms" in result
+    assert "`GET cache:key`" in result
+    assert "No changes were made" in result
+    assert commands[:3] == [
+        ["SLOWLOG", "GET", "25"],
+        ["SLOWLOG", "LEN"],
+        ["CONFIG", "GET", "slowlog-max-len"],
+    ]
+
+
+def test_get_redis_slowlog_reports_saturation_and_no_changes(monkeypatch) -> None:
+    pod = _redis_pod(name="cache-0")
+
+    class DiscoveryApi:
+        def read_namespaced_pod(self, name, namespace):
+            return pod
+
+    def fake_run_redis_command(namespace, pod_name, cli, redis_command, container=None, port=None):
+        if redis_command[0] == "SLOWLOG" and redis_command[1] == "GET":
+            return "[]"
+        if redis_command[0] == "SLOWLOG" and redis_command[1] == "LEN":
+            return "128"
+        return '["slowlog-max-len", "128"]'
+
+    monkeypatch.setattr(tools, "_load_kubernetes_client", lambda: DiscoveryApi())
+    monkeypatch.setattr(tools, "_detect_redis_cli", lambda *args, **kwargs: "valkey-cli")
+    monkeypatch.setattr(tools, "_run_redis_command", fake_run_redis_command)
+
+    result = tools.get_redis_slowlog("cache", "cache-0", count=25)
+
+    assert "Slow-log saturation detected:" in result
+    assert "cache/cache-0" in result
+    assert "No changes were made" in result
+
+
+def test_pod_exec_captures_timeout_stderr_and_audit_only(monkeypatch, caplog) -> None:
+    captured = {}
+
+    class ExecApi:
+        def connect_get_namespaced_pod_exec(self, **kwargs):
+            captured.update(kwargs)
+            return "stdout output"
+
+    monkeypatch.setattr(tools, "_load_kubernetes_client", lambda: ExecApi())
+    monkeypatch.setattr(
+        tools.stream,
+        "stream",
+        lambda connect_method, **kwargs: captured.update(kwargs) or "stdout output",
+    )
+    caplog.set_level(logging.INFO, logger=tools._AUDIT_LOGGER.name)
+
+    output = tools._pod_exec(
+        "cache",
+        "cache-0",
+        ["valkey-cli", "--json", "SLOWLOG", "LEN"],
+        "redis",
+        "redis_readonly_command",
+        timeout_seconds=17,
+    )
+
+    assert output == "stdout output"
+    assert captured["command"] == ["valkey-cli", "--json", "SLOWLOG", "LEN"]
+    assert captured["stderr"] is True
+    assert captured["stdin"] is False
+    assert captured["tty"] is False
+    assert captured["_preload_content"] is True
+    assert captured["_request_timeout"] == (10, 17)
+    message = caplog.records[0].getMessage()
+    assert '"operation":"redis_readonly_command"' in message
+    assert '"binary":"valkey-cli"' in message
+    assert "SLOWLOG" not in message
