@@ -8,6 +8,7 @@ from .tools import (
     get_redis_latency_report,
     get_redis_memory_report,
     get_redis_slowlog,
+    get_redis_remediation_recommendations,
     recommend_mysql_indexes,
 )
 from dotenv import load_dotenv
@@ -30,6 +31,7 @@ Available tools:
 - analyze_redis_bigkeys: Use the SCAN-based redis-cli/valkey-cli --bigkeys or --memkeys mode for one pod and report type/size evidence.
 - get_redis_latency_report: Read LATENCY HISTORY and LATENCY DOCTOR, then correlate latency with slowlog, memory, persistence, command rate, and event-loop evidence.
 - get_redis_client_report: Read CLIENT/replication/cluster/Sentinel evidence, group unhealthy client connections, and report topology-aware role attribution.
+- get_redis_remediation_recommendations: Correlate existing Redis/Valkey diagnostics into evidence-linked remediation suggestions without applying changes.
 
 For slow-query requests:
 1. If the user provides a namespace or pod, pass it directly. Otherwise search cluster-wide.
@@ -68,6 +70,12 @@ For Redis/Valkey client and topology analysis:
 4. The tool permits only fixed read-only commands: CLIENT LIST, CLIENT ID, selected INFO sections, CONFIG GET client-output-buffer-limit, selected CLUSTER read-only commands, and selected SENTINEL views.
 5. Keep recommendations advisory only and clearly say that nothing was changed.
 
+For Redis/Valkey remediation recommendations:
+1. Prefer a namespace and pod. One pod keeps the optional SCAN-based --bigkeys sampling bounded; do not fan it out across every replica at once.
+2. Use get_redis_remediation_recommendations only after explaining that it is diagnostic. It may collect slowlog, memory, big-key, latency, client, and topology evidence with the same fixed read-only allowlist.
+3. Present each suggestion with its triggering measurement, suggested change, risk/trade-off, and the explicit fact that no change was applied. Never claim a KEYS-to-SCAN, UNLINK, eviction, persistence, or client change was executed.
+4. For cluster mode, treat one pod's evidence as shard-local. Every shard primary may need separate analysis. Kubernetes labels are hints, not authoritative role evidence.
+
 The tool reads Kubernetes pod logs by default for MySQL/MariaDB, which must have slow-query logging enabled and emit the slow log to the selected container's stdout/stderr. If logs are written only to a file inside the pod, the operator must allowlist an absolute path with DBA_ALLOWED_SLOW_LOG_PATHS (semicolon-separated) or set DBA_SLOW_LOG_FILE_PATH; the agent can then request a read-only tail of that file. Redis/Valkey slow-log inspection uses bounded pod/exec with valkey-cli or redis-cli. See docs/dba-rbac.md.""",
     tools=[
         find_database_pods,
@@ -78,6 +86,8 @@ The tool reads Kubernetes pod logs by default for MySQL/MariaDB, which must have
         get_redis_memory_report,
         analyze_redis_bigkeys,
         get_redis_latency_report,
+        get_redis_client_report,
+        get_redis_remediation_recommendations,
     ],
 )
 

@@ -119,3 +119,11 @@ Topology is always observed at report execution time. `INFO replication` supplie
 For cluster mode, client evidence is per node. A single shard's report does not describe the whole dataset or connection population; every shard master must be examined when a cluster-wide view is required, which increases pod/exec fan-out with shard count. Kubernetes labels remain hints, not authoritative role evidence. Reports explicitly mark missing, denied, or malformed topology data and remain advisory-only.
 
 The shared pod/exec wrapper uses fixed argv, no stdin, no TTY, enabled stderr, a bounded request timeout, and the same audit event as MySQL file mode. The audit record does not include Redis commands, output, or credentials.
+
+## Redis/Valkey remediation recommendations
+
+`get_redis_remediation_recommendations` reuses the existing diagnostics and produces node-level, evidence-linked advisory cards for command patterns, memory, persistence, clients, and topology. It does not introduce a new Redis command. It reads the fixed slowlog, INFO/MEMORY, latency, client/topology, and `CONFIG GET` forms already described above. When `include_bigkeys` is enabled (the default), it invokes only the existing SCAN-based `--bigkeys` CLI mode for one selected pod with a bounded interval and timeout; it never issues `KEYS`, a manual `SCAN`, `DEBUG`, or a mutation command.
+
+Each recommendation states the measurement that triggered it, a suggested change, and the risk or trade-off, and explicitly says that no change was applied. Evidence gaps are labeled rather than filled with assumptions. Cluster evidence is shard-local, so one pod's report does not describe a multi-shard cluster; Kubernetes role labels remain hints. The tool may also read Sentinel views for topology context when Sentinel pods are selected or discovered.
+
+The report compares `INFO memory maxmemory` with the selected database container's Kubernetes memory limit when that limit is present, but it never changes a resource limit or Redis setting. Recommendations can include `SCAN` iteration, bounded collection reads, `UNLINK`, client pipelining, TTL review, eviction-policy trade-offs, defragmentation suitability, persistence/fork mitigation, replica-based backups, client ownership/backpressure, and cluster-health stabilization. All are advisory; the tool executes no remediation.

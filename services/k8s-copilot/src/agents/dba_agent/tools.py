@@ -52,6 +52,10 @@ _REDIS_CLIENT_OMEM_BYTES = 8 * 1024 * 1024
 _REDIS_CLIENT_LONG_AGE_SECONDS = 86400
 _REDIS_CLIENT_IDLE_SECONDS = 600
 _REDIS_CLIENT_HIGH_SUBSCRIPTIONS = 100
+_REDIS_REMEDIATION_MIN_SLOW_MS = 100.0
+_REDIS_REMEDIATION_FORK_USEC = 100_000
+_REDIS_REMEDIATION_EXPIRED_KEYS = 1_000
+_REDIS_REMEDIATION_TOP_COMMAND_COUNT = 10
 
 
 class SlowLogFileConfigError(ValueError):
@@ -100,6 +104,27 @@ class RedisSlowLogEntry:
     cli: str = ""
     role: str = ""
     topology: str = ""
+
+
+@dataclass(frozen=True)
+class RedisRemediation:
+    """One advisory Redis/Valkey change with its triggering measurements."""
+
+    category: str
+    title: str
+    severity: str
+    evidence: tuple[str, ...]
+    change: str
+    risk: str
+
+    def render(self) -> list[str]:
+        return [
+            f"- {self.severity} | {self.category} | {self.title}",
+            f"  - Evidence: {'; '.join(self.evidence)}",
+            f"  - Suggested change: {self.change}",
+            f"  - Risk/trade-off: {self.risk}",
+            "  - No change was applied.",
+        ]
 
 
 def _load_kubernetes_client() -> client.CoreV1Api:
@@ -2961,3 +2986,962 @@ def recommend_mysql_indexes(
     if existing_index_lines:
         recommendations += "\n\n**Existing indexes**\n" + "\n".join(existing_index_lines)
     return recommendations
+
+
+def _redis_memory_quantity(value: object) -> Optional[int]:
+    """Parse a Kubernetes memory quantity into bytes without relying on a shell."""
+    text = str(value or "").strip()
+    match = re.fullmatch(r"([0-9]+(?:\.[0-9]+)?)\s*([kmgtp]i?b?)", text, re.IGNORECASE)
+    if not match:
+        return None
+    number = float(match.group(1))
+    unit = match.group(2).lower()
+    multipliers = {
+        "": 1,
+        "b": 1,
+        "k": 1_000,
+        "kb": 1_000,
+        "ki": 1_024,
+        "kib": 1_024,
+        "m": 1_000_000,
+        "mb": 1_000_000,
+        "mi": 1_048_576,
+        "mib": 1_048_576,
+        "g": 1_000_000_000,
+        "gb": 1_000_000_000,
+        "gi": 1_073_741_824,
+        "gib": 1_073_741_824,
+        "t": 1_000_000_000_000,
+        "tb": 1_000_000_000_000,
+        "ti": 1_099_511_627_776,
+        "tib": 1_099_511_627_776,
+        "p": 1_000_000_000_000_000,
+        "pb": 1_000_000_000_000_000,
+        "pi": 1_125_899_906_842_624,
+        "pib": 1_125_899_906_842_624,
+    }
+    multiplier = multipliers.get(unit)
+    if multiplier is None:
+        return None
+    return int(number * multiplier)
+
+
+def _redis_container_memory_limit(
+    pod: client.V1Pod,
+    selected_container: Optional[str] = None,
+) -> tuple[Optional[int], str]:
+    """Return the database container's memory limit and its raw value."""
+    containers = list(getattr(pod.spec, "containers", None) or [])
+    if not containers:
+        return None, "absent (no containers)"
+    selected = None
+    if selected_container:
+        selected = next((item for item in containers if item.name == selected_container), None)
+    else:
+        matching = [
+            item
+            for item in containers
+            if "redis" in str(item.image or "").lower()
+            or "valkey" in str(item.image or "").lower()
+            or "redis" in str(item.name or "").lower()
+            or "valkey" in str(item.name or "").lower()
+        ]
+        selected = matching[0] if len(matching) == 1 else (containers[0] if len(containers) == 1 else None)
+    if selected is None:
+        return None, f"ambiguous across {len(containers)} containers"
+    limits = dict(getattr(getattr(selected, "resources", None), "limits", None) or {})
+    memory_value = next((value for name, value in limits.items() if str(name).lower() == "memory"), None)
+    label = selected.name or "database"
+    if memory_value is None:
+        return None, f"absent for container {label}"
+    return _redis_memory_quantity(memory_value), f"{memory_value} on container {label}"
+
+
+def _format_redis_bytes(value: Optional[float]) -> str:
+    if value is None:
+        return "unknown"
+    value = float(value)
+    units = ("B", "KiB", "MiB", "GiB", "TiB")
+    scaled = value
+    unit_index = 0
+    while scaled >= 1024 and unit_index < len(units) - 1:
+        scaled /= 1024
+        unit_index += 1
+    return f"{scaled:.1f}{units[unit_index]}"
+
+
+def _redis_command_tokens(command: str) -> list[str]:
+    try:
+        return shlex.split(command, posix=True)
+    except ValueError:
+        return command.split()
+
+
+def _redis_bigkey_match(command: str, findings: list[dict[str, Any]]) -> Optional[dict[str, Any]]:
+    tokens = _redis_command_tokens(command)
+    if len(tokens) < 2:
+        return None
+    key = tokens[1]
+    return next((finding for finding in findings if str(finding.get("key")) == key), None)
+
+
+def _redis_last_command_histogram(records: list[dict[str, Any]]) -> dict[str, int]:
+    histogram: dict[str, int] = {}
+    for record in records:
+        command = str(_client_record_value(record, "cmd") or "").strip().upper()
+        if command:
+            histogram[command] = histogram.get(command, 0) + 1
+    return histogram
+
+
+def _read_redis_remediation_bigkeys(
+    namespace: str,
+    pod_name: str,
+    cli: str,
+    container: Optional[str],
+    sample_interval_seconds: float,
+) -> tuple[list[dict[str, Any]], Optional[int], list[str]]:
+    """Run the existing SCAN-based CLI mode; this tool never issues manual SCAN or KEYS."""
+    errors: list[str] = []
+    try:
+        interval_text = f"{sample_interval_seconds:.3f}".rstrip("0").rstrip(".")
+        argv = [cli, "--bigkeys"]
+        if interval_text:
+            argv.extend(["-i", interval_text])
+        output = _pod_exec(
+            namespace,
+            pod_name,
+            argv,
+            container,
+            "redis_scan_based_key_analysis",
+            timeout_seconds=120,
+        )
+        findings, sampled = _parse_bigkeys_output(output)
+        return findings, sampled, errors
+    except Exception as exc:
+        errors.append(f"--bigkeys: {exc}")
+        return [], None, errors
+
+
+def _read_redis_remediation_evidence(
+    namespace: str,
+    pod_name: str,
+    cli: str,
+    context: dict[str, str],
+    container: Optional[str] = None,
+    port: Optional[int] = None,
+    include_bigkeys: bool = True,
+    sample_interval_seconds: float = 0.01,
+) -> dict[str, Any]:
+    """Collect existing diagnostic views into one evidence snapshot for recommendations."""
+    slowlog = _redis_slowlog_snapshot(namespace, pod_name, cli, context, container, port)
+    memory_evidence = _read_redis_evidence(namespace, pod_name, cli, context, container, port)
+    client_evidence = _read_redis_client_evidence(namespace, pod_name, cli, context, container, port)
+
+    metrics = memory_evidence["metrics"]
+    metrics.update(client_evidence["metrics"])
+    context["runtime_role"] = str(_redis_info_value(metrics, "role") or "unknown")
+
+    histories: dict[str, list[dict[str, Any]]] = {}
+    errors: list[str] = list(memory_evidence["errors"])
+    errors.extend(client_evidence["errors"])
+    if slowlog.get("error"):
+        errors.append(f"SLOWLOG: {slowlog['error']}")
+    for event_class in sorted(_REDIS_LATENCY_EVENT_CLASSES):
+        try:
+            histories[event_class] = _parse_latency_history(
+                _run_redis_command(namespace, pod_name, cli, ["LATENCY", "HISTORY", event_class], container, port)
+            )
+        except Exception as exc:
+            errors.append(f"LATENCY HISTORY {event_class}: {exc}")
+    doctor = ""
+    try:
+        doctor_value = _parse_redis_response(
+            _run_redis_command(namespace, pod_name, cli, ["LATENCY", "DOCTOR"], container, port)
+        )
+        doctor = doctor_value.strip() if isinstance(doctor_value, str) else str(doctor_value or "")
+    except Exception as exc:
+        errors.append(f"LATENCY DOCTOR: {exc}")
+    io_threads: Optional[int] = None
+    try:
+        io_threads_text = _parse_config_get_value(
+            _run_redis_command(
+                namespace,
+                pod_name,
+                cli,
+                ["CONFIG", "GET", "io-threads"],
+                container,
+                port,
+            ),
+            "io-threads",
+        )
+        io_threads = int(io_threads_text) if io_threads_text is not None else None
+    except Exception as exc:
+        errors.append(f"CONFIG GET io-threads: {exc}")
+
+    bigkeys: list[dict[str, Any]] = []
+    bigkeys_sampled: Optional[int] = None
+    if include_bigkeys:
+        bigkeys, bigkeys_sampled, bigkeys_errors = _read_redis_remediation_bigkeys(
+            namespace,
+            pod_name,
+            cli,
+            container,
+            sample_interval_seconds,
+        )
+        errors.extend(bigkeys_errors)
+
+    return {
+        "cli": cli,
+        "context": context,
+        "metrics": metrics,
+        "slowlog": slowlog,
+        "latency_histories": histories,
+        "doctor": doctor,
+        "io_threads": io_threads,
+        "bigkeys": bigkeys,
+        "bigkeys_sampled": bigkeys_sampled,
+        "client_records": client_evidence.get("records", []),
+        "buffer_limits": client_evidence.get("buffer_limits", {}),
+        "cluster_info": client_evidence.get("cluster_info", {}),
+        "cluster_mode": bool(client_evidence.get("cluster_mode")),
+        "cluster_id": client_evidence.get("cluster_id"),
+        "shards": client_evidence.get("shards", []),
+        "errors": errors,
+    }
+
+
+def _redis_remediation_command_recommendations(evidence: dict[str, Any]) -> list[RedisRemediation]:
+    recommendations: list[RedisRemediation] = []
+    slowlog = evidence.get("slowlog", {})
+    entries = list(slowlog.get("entries") or [])
+    grouped: dict[str, list[RedisSlowLogEntry]] = {}
+    for entry in entries:
+        grouped.setdefault(_redis_command_family(entry.command), []).append(entry)
+
+    def summary(entries_: list[RedisSlowLogEntry]) -> str:
+        maximum = max((entry.duration_ms for entry in entries_), default=0.0)
+        commands = ", ".join(f"`{entry.command}`" for entry in entries_[:3])
+        return f"SLOWLOG GET 25 returned {len(entries_)} entr(ies); max duration {maximum:.3f}ms; commands: {commands}"
+
+    keys_entries = grouped.get("KEYS", [])
+    if keys_entries:
+        recommendations.append(
+            RedisRemediation(
+                "command-pattern",
+                "Replace KEYS with cursor-paginated SCAN",
+                "high",
+                (
+                    summary(keys_entries),
+                    "The selected node received blocking full-keyspace iteration.",
+                ),
+                "Change callers to iterate with SCAN cursors, MATCH/COUNT bounds, retry-on-restart handling, and "
+                "inter-cursor throttling. Do not add a manual SCAN to this diagnostic tool.",
+                "SCAN is incremental but not a point-in-time snapshot and can span multiple round trips; "
+                "throttle it to avoid replacing one blocking command with sustained load.",
+            )
+        )
+
+    bigkeys = list(evidence.get("bigkeys") or [])
+    collection_families = {"HGETALL", "SMEMBERS", "LRANGE", "ZRANGE"}
+    for family in sorted(collection_families & set(grouped)):
+        entries_ = grouped[family]
+        matched = next((finding for entry in entries_ if (finding := _redis_bigkey_match(entry.command, bigkeys))), None)
+        if max(entry.duration_ms for entry in entries_) < _REDIS_REMEDIATION_MIN_SLOW_MS and matched is None:
+            continue
+        suffix = ""
+        if matched:
+            suffix = (
+                f"; matching {matched['key_type']} key `{matched['key']}` has "
+                f"{matched['size']} {matched['size_unit']}"
+            )
+        alternatives = []
+        if family in {"HGETALL", "SMEMBERS"}:
+            alternatives = ["HSCAN for hashes", "SSCAN for sets"]
+        elif family == "ZRANGE":
+            alternatives = ["ZRANGE with LIMIT", "ZSCAN for full iteration"]
+        else:
+            alternatives = ["LRANGE with explicit positive start/stop windows"]
+        recommendations.append(
+            RedisRemediation(
+                "command-pattern",
+                f"Bound {family} collection reads",
+                "high" if matched else "medium",
+                (summary(entries_), f"The command was {family} (arguments were observed in the slow log){suffix}."),
+                f"Replace or augment unbounded reads with {', '.join(alternatives)}; paginate by a workload-tested count.",
+                "Cursor iteration or paging adds code complexity and may see a moving dataset; too-small pages "
+                "increase round trips, so validate latency and client memory under real traffic.",
+            )
+        )
+
+    del_entries = grouped.get("DEL", [])
+    if del_entries:
+        matched = next((finding for entry in del_entries if (finding := _redis_bigkey_match(entry.command, bigkeys))), None)
+        if matched or max(entry.duration_ms for entry in del_entries) >= _REDIS_REMEDIATION_MIN_SLOW_MS:
+            match_text = ""
+            if matched:
+                match_text = (
+                    f"; matching {matched['key_type']} key `{matched['key']}` has "
+                    f"{matched['size']} {matched['size_unit']}"
+                )
+            recommendations.append(
+                RedisRemediation(
+                    "command-pattern",
+                    "Use UNLINK for large deletions",
+                    "high" if matched else "medium",
+                    (summary(del_entries), f"SLOWLOG GET 25 observed DEL command(s){match_text}."),
+                    "Change the deleting caller from DEL to UNLINK so value reclamation can occur in background work.",
+                    "UNLINK can still create blocking work under extreme conditions and delayed reclamation can keep "
+                    "resident memory high; verify replication and eviction behavior during a measured rollout.",
+                )
+            )
+
+    records = list(evidence.get("client_records") or [])
+    histogram = _redis_last_command_histogram(records)
+    if histogram:
+        family, count = max(histogram.items(), key=lambda item: item[1])
+        if count >= _REDIS_REMEDIATION_TOP_COMMAND_COUNT and count / sum(histogram.values()) >= 0.6:
+            recommendations.append(
+                RedisRemediation(
+                    "command-pattern",
+                    "Evaluate client-side pipelining or batching",
+                    "medium",
+                    (
+                        f"CLIENT LIST: {len(records)} records were parsed; last-command histogram was "
+                        f"{family}={count} of {sum(histogram.values())}.",
+                    ),
+                    "Group repeated independent operations into bounded client pipelines or multi-item commands, "
+                    "then confirm application semantics and retry behavior.",
+                    "Pipelines can improve round-trip cost but can also amplify failures, buffer output on the server, "
+                    "and reorder or complicate error handling; cap pipeline depth and test against real latency.",
+                )
+            )
+    return recommendations
+
+
+def _redis_remediation_memory_recommendations(evidence: dict[str, Any]) -> list[RedisRemediation]:
+    recommendations: list[RedisRemediation] = []
+    metrics = evidence.get("metrics", {})
+    used = _redis_number(_redis_info_value(metrics, "used_memory"))
+    used_human = _redis_info_value(metrics, "used_memory_human")
+    maxmemory = _redis_number(_redis_info_value(metrics, "maxmemory"))
+    policy = str(_redis_info_value(metrics, "maxmemory_policy") or "")
+    evicted = _redis_number(_redis_info_value(metrics, "evicted_keys"))
+    expired = _redis_number(_redis_info_value(metrics, "expired_keys"))
+    limit_bytes, limit_text = evidence.get("pod_memory_limit", (None, "absent"))
+    if maxmemory == 0:
+        guidance = (
+            "Set maxmemory to a load-tested value below the container limit, leaving room for fragmentation, "
+            "replication, copy-on-write, and server overhead. A common starting review range is 50-70%."
+        )
+        if limit_bytes:
+            guidance += f" The observed container limit is {_format_redis_bytes(limit_bytes)}."
+        recommendations.append(
+            RedisRemediation(
+                "memory",
+                "Right-size maxmemory against the pod limit",
+                "high",
+                (
+                    f"INFO memory maxmemory=0; used_memory={_format_redis_bytes(used)}"
+                    + (f" ({used_human})" if used_human else ""),
+                    f"Kubernetes container memory limit: {limit_text}.",
+                ),
+                guidance,
+                "A limit that is too low causes evictions or write failures; one that is too close to the pod limit "
+                "can trigger OOMKill during fragmentation or copy-on-write. Validate with peak traffic and persistence.",
+            )
+        )
+    elif maxmemory is not None and limit_bytes and maxmemory > limit_bytes * 0.8:
+        recommendations.append(
+            RedisRemediation(
+                "memory",
+                "Increase maxmemory-to-pod headroom",
+                "high",
+                (
+                    f"INFO memory maxmemory={_format_redis_bytes(maxmemory)}; "
+                    f"Kubernetes memory limit={_format_redis_bytes(limit_bytes)} ({limit_text}).",
+                ),
+                "After load testing, lower maxmemory or increase the container limit so fragmentation and fork "
+                "copy-on-write have headroom; prefer a measured 30-50% reserve rather than a universal constant.",
+                "Raising a container limit consumes cluster capacity; lowering maxmemory can cause earlier eviction "
+                "or write failures. Both changes can affect latency and availability.",
+            )
+        )
+
+    if (
+        maxmemory is not None
+        and maxmemory > 0
+        and used is not None
+        and used / maxmemory >= 0.9
+    ):
+        recommendations.append(
+            RedisRemediation(
+                "memory",
+                "Recover logical memory headroom",
+                "high",
+                (
+                    f"INFO memory used_memory={_format_redis_bytes(used)} is "
+                    f"{used / maxmemory * 100:.1f}% of maxmemory={_format_redis_bytes(maxmemory)}.",
+                ),
+                "Audit large/transient keys and TTL ownership before changing limits. Use the big-key evidence to "
+                "target oversized structures, then size maxmemory from peak demand.",
+                "Deleting or expiring keys changes application-visible data; adding capacity defers pressure and "
+                "can mask a leak. Validate ownership and rollback before changing either.",
+            )
+        )
+
+    if evicted is not None and evicted > 0:
+        policy_tradeoff = "with noeviction, failures rather than evictions are expected"
+        recommendations.append(
+            RedisRemediation(
+                "memory",
+                "Choose an intentional eviction policy",
+                "high" if policy == "noeviction" else "medium",
+                (
+                    f"INFO stats evicted_keys={int(evicted)}; INFO memory maxmemory_policy={policy or 'unavailable'}.",
+                ),
+                "Confirm which data may be evicted. If a cache can tolerate it, evaluate allkeys-lfu or allkeys-lru "
+                "with metrics; if durability is required, add capacity or move that data outside Redis. "
+                f"Note: {policy_tradeoff}.",
+                "Changing policy can silently discard hot or durable-looking data; allkeys-random has no recency "
+                "signal, and volatile policies skip keys without TTL. Test hit/miss and application behavior.",
+            )
+        )
+
+    if policy.startswith("volatile-") or (expired is not None and expired >= _REDIS_REMEDIATION_EXPIRED_KEYS):
+        policy_evidence = f"INFO memory maxmemory_policy={policy}" if policy else "maxmemory_policy unavailable"
+        expired_evidence = f"INFO stats expired_keys={int(expired)}" if expired is not None else "expired_keys unavailable"
+        recommendations.append(
+            RedisRemediation(
+                "memory",
+                "Audit TTL hygiene",
+                "medium",
+                (policy_evidence, expired_evidence),
+                "Inventory transient keys, assign deliberate TTL/JITTER where safe, and ensure durable keys are "
+                "excluded from volatile eviction paths.",
+                "TTLs change lifetime semantics; too short causes misses and repopulation, too long preserves "
+                "pressure. This snapshot does not directly measure the share of keys without TTL.",
+            )
+        )
+
+    if policy.startswith("allkeys-random"):
+        recommendations.append(
+            RedisRemediation(
+                "memory",
+                "Replace random eviction if recency matters",
+                "medium",
+                (f"INFO memory maxmemory_policy={policy}",),
+                "Consider allkeys-lru/allkeys-lfu after workload review, or isolate mutable data into another service.",
+                "LRU/LFU retain more bookkeeping and can still discard data; verify access patterns and cache semantics.",
+            )
+        )
+
+    fragmentation = _redis_number(_redis_info_value(metrics, "mem_fragmentation_ratio"))
+    if fragmentation is None:
+        fragmentation = _redis_number(_redis_info_value(metrics, "fragmentation"))
+    fragmentation_bytes = _redis_number(_redis_info_value(metrics, "fragmentation.bytes"))
+    allocator = str(_redis_info_value(metrics, "mem_allocator") or "")
+    defrag_running = _redis_number(_redis_info_value(metrics, "activedefrag_running"))
+    if fragmentation is not None and (fragmentation >= 1.5 or fragmentation < 1):
+        direction = "high" if fragmentation >= 1.5 else "low"
+        evidence_values = [f"fragmentation ratio={fragmentation:g}"]
+        if fragmentation_bytes is not None:
+            evidence_values.append(f"MEMORY STATS fragmentation.bytes={_format_redis_bytes(fragmentation_bytes)}")
+        if allocator:
+            evidence_values.append(f"mem_allocator={allocator}")
+        if defrag_running is not None:
+            evidence_values.append(f"activedefrag_running={int(defrag_running)}")
+        if direction == "high" and allocator.lower() == "jemalloc":
+            recommendations.append(
+                RedisRemediation(
+                    "memory",
+                    "Evaluate active defragmentation",
+                    "medium",
+                    tuple(evidence_values),
+                    "If the version and build support it, enable active defragmentation on one replica/canary with "
+                    "conservative CPU limits, then compare latency and RSS before fleet rollout.",
+                    "Active defragmentation can add CPU and event-loop work and may not pay off if allocation churn "
+                    "continues. It is not a substitute for right-sized data.",
+                )
+            )
+        else:
+            approach = (
+                "Do not rely on active defragmentation with this allocator; first review allocation churn, "
+                "container memory limits, node memory pressure, and swap behavior."
+                if direction == "high"
+                else "Investigate swapping, compressed/shared pages, or host memory pressure before tuning defragmentation."
+            )
+            recommendations.append(
+                RedisRemediation(
+                    "memory",
+                    "Investigate fragmentation evidence",
+                    "medium",
+                    tuple(evidence_values),
+                    approach,
+                    "Fragmentation diagnostics are point-in-time. Restarting or reallocating capacity can reduce RSS "
+                    "temporarily but may fail over traffic or lose an in-memory dataset if persistence is absent.",
+                )
+            )
+    return recommendations
+
+
+def _redis_remediation_persistence_recommendations(evidence: dict[str, Any]) -> list[RedisRemediation]:
+    recommendations: list[RedisRemediation] = []
+    metrics = evidence.get("metrics", {})
+    histories = evidence.get("latency_histories", {})
+    fork_usec = _redis_number(_redis_info_value(metrics, "latest_fork_usec"))
+    fork_events = histories.get("fork", [])
+    rdb_running = _redis_number(_redis_info_value(metrics, "rdb_bgsave_in_progress"))
+    aof_rewrite = _redis_number(_redis_info_value(metrics, "aof_rewrite_in_progress"))
+    persistence_trigger = bool(fork_events) or (
+        fork_usec is not None and fork_usec >= _REDIS_REMEDIATION_FORK_USEC
+    )
+    role = str(evidence.get("context", {}).get("runtime_role") or "unknown")
+    connected_replicas = _redis_number(_redis_info_value(metrics, "connected_slaves"))
+
+    if persistence_trigger:
+        evidence_values = []
+        if fork_usec is not None:
+            evidence_values.append(f"INFO persistence latest_fork_usec={int(fork_usec)}")
+        if fork_events:
+            evidence_values.append(f"LATENCY HISTORY fork: {len(fork_events)} event(s)")
+        recommendations.append(
+            RedisRemediation(
+                "persistence",
+                "Reduce persistence fork and copy-on-write impact",
+                "high",
+                tuple(evidence_values),
+                "Schedule persistence off peak, provide memory headroom above peak logical usage, and consider "
+                "taking backups from a replica or a managed persistence/backup facility rather than the primary.",
+                "Copy-on-write can consume additional RSS during fork; offloading backup work adds replica lag and "
+                "may produce a less current backup. Managed persistence changes operational and cost ownership.",
+            )
+        )
+
+    if rdb_running == 1 or aof_rewrite == 1:
+        current = []
+        if rdb_running == 1:
+            current.append("rdb_bgsave_in_progress=1")
+        if aof_rewrite == 1:
+            current.append("aof_rewrite_in_progress=1")
+        recommendations.append(
+            RedisRemediation(
+                "persistence",
+                "Validate work running during background saves",
+                "medium",
+                tuple(current),
+                "Do not stack heavy scans, rewrites, or deployments on top of a background save; wait for completion "
+                "and correlate any latency with the save window.",
+                "This is a snapshot, not a completed duration. Delayed work can affect freshness or release timing.",
+            )
+        )
+
+    aof_enabled = _redis_number(_redis_info_value(metrics, "aof_enabled"))
+    rdb_status = str(_redis_info_value(metrics, "rdb_last_bgsave_status") or "").lower()
+    aof_status = str(_redis_info_value(metrics, "aof_last_write_status") or "").lower()
+    if aof_enabled == 0:
+        recommendations.append(
+            RedisRemediation(
+                "persistence",
+                "Review the RDB recovery window",
+                "medium",
+                ("INFO persistence aof_enabled=0.",),
+                "If the acceptable data-loss window is shorter than the RDB save interval, evaluate AOF or a "
+                "managed persistence option; otherwise document that RDB-only loss window as accepted.",
+                "AOF generally narrows data loss but adds disk I/O/fsync latency, file-rewrite fork/COW cost, and "
+                "storage management. RDB is smaller/faster but loses changes since the last snapshot.",
+            )
+        )
+    if rdb_status and rdb_status not in {"ok", "none"}:
+        recommendations.append(
+            RedisRemediation(
+                "persistence",
+                "Resolve RDB save failures",
+                "high",
+                (f"INFO persistence rdb_last_bgsave_status={rdb_status}.",),
+                "Check disk space, permissions, and replica-side backup capacity; restore a known-good persistence "
+                "path before relying on snapshots.",
+                "Retrying without capacity can worsen latency; disabling persistence trades recoverability for load.",
+            )
+        )
+    if aof_enabled == 1 and aof_status and aof_status not in {"ok", "none"}:
+        recommendations.append(
+            RedisRemediation(
+                "persistence",
+                "Resolve AOF write or rewrite failures",
+                "high",
+                (f"INFO persistence aof_last_write_status={aof_status}.",),
+                "Check disk capacity, fsync health, and AOF rewrite headroom. Keep durability available before "
+                "changing fsync policy.",
+                "Relaxing fsync improves latency by accepting more data loss; rewriting under pressure can add "
+                "fork/COW and I/O overhead.",
+            )
+        )
+
+    if persistence_trigger:
+        if role in {"replica", "slave"}:
+            recommendations.append(
+                RedisRemediation(
+                    "persistence",
+                    "Prefer this replica for backup reads",
+                    "medium",
+                    (
+                        f"Runtime role was re-read as {role}.",
+                        *(evidence_values or ()),
+                    ),
+                    "Evaluate backups or persistence-heavy work from this replica after confirming lag, read load, "
+                    "and failure isolation.",
+                    "Backups can lag and consume replica CPU/network, reducing stale-read tolerance and failover "
+                    "warmness.",
+                )
+            )
+        else:
+            replica_evidence = (
+                f"INFO replication connected_slaves={int(connected_replicas)}."
+                if connected_replicas is not None
+                else "INFO replication connected_slaves unavailable."
+            )
+            recommendation_text = (
+                "Consider a replica-based backup path for these workloads."
+                if connected_replicas is not None and connected_replicas > 0
+                else "A replica currently appears unavailable from this evidence; do not create one implicitly as a "
+                "backup target without capacity and failover review."
+            )
+            recommendations.append(
+                RedisRemediation(
+                    "persistence",
+                    "Move backup pressure off the primary",
+                    "medium",
+                    (f"Runtime role was re-read as {role}.", replica_evidence, *(evidence_values or ())),
+                    recommendation_text,
+                    "Adding a replica costs memory, network, and failover complexity; it can also expose stale data "
+                    "during lag. A managed persistence option shifts that operational burden but may add cost and "
+                    "provider lock-in.",
+                )
+            )
+    return recommendations
+
+
+def _redis_remediation_client_recommendations(evidence: dict[str, Any]) -> list[RedisRemediation]:
+    recommendations: list[RedisRemediation] = []
+    records = list(evidence.get("client_records") or [])
+    metrics = evidence.get("metrics", {})
+    connected = _redis_number(_redis_info_value(metrics, "connected_clients"))
+    maxclients = _redis_number(_redis_info_value(metrics, "maxclients"))
+    blocked = _redis_number(_redis_info_value(metrics, "blocked_clients"))
+    buffer_limits = evidence.get("buffer_limits", {})
+
+    problematic = _client_findings(records)
+    buffer_group = next((group for group in problematic if group["max_qbuf"] >= _REDIS_CLIENT_QBUF_BYTES), None)
+    output_group = next((group for group in problematic if group["max_omem"] >= _REDIS_CLIENT_OMEM_BYTES), None)
+    if buffer_group:
+        recommendations.append(
+            RedisRemediation(
+                "client",
+                "Control input backpressure for offending clients",
+                "high",
+                (
+                    f"CLIENT LIST: connection {buffer_group['kind']} `{buffer_group['identity']}` reported "
+                    f"max qbuf={buffer_group['max_qbuf']} bytes.",
+                ),
+                "Find the owning service with CLIENT SETNAME, reduce request burst size, use bounded queues/backpressure, "
+                "and confirm the client consumes responses promptly. Do not kill clients from this tool.",
+                "Killing or throttling can interrupt work and lose in-flight context; relaxing input handling can "
+                "transfer pressure to the application queue.",
+            )
+        )
+    if output_group:
+        output_limits = []
+        hard_limit = None
+        for class_name in ("normal", "replica", "pubsub"):
+            value = buffer_limits.get(class_name)
+            if value:
+                output_limits.append(
+                    f"{class_name} hard={value['hard_limit']}, soft={value['soft_limit']}, "
+                    f"soft_seconds={value['soft_seconds']}"
+                )
+                if class_name == "normal":
+                    hard_limit = _redis_number(value["hard_limit"])
+        evidence_values = [
+            f"CLIENT LIST: connection {output_group['kind']} `{output_group['identity']}` reported "
+            f"max omem={output_group['max_omem']} bytes."
+        ]
+        if output_limits:
+            evidence_values.append(f"CONFIG GET client-output-buffer-limit: {'; '.join(output_limits)}.")
+        severity = "high" if hard_limit is None or output_group["max_omem"] >= hard_limit * 0.1 else "medium"
+        recommendations.append(
+            RedisRemediation(
+                "client",
+                "Fix slow consumers and output buffering",
+                severity,
+                tuple(evidence_values),
+                "Instrument the client, unblock reads, reduce oversized responses/fan-out, and enforce bounded "
+                "output. Treat buffer-limit changes as a last resort after finding the backpressure source.",
+                "Raising limits can increase server memory and delay failure detection; fixing the consumer can "
+                "change delivery semantics and requires error/retry handling.",
+            )
+        )
+
+    idle_records = [
+        record
+        for record in records
+        if (_redis_number(_client_record_value(record, "age")) or 0) >= _REDIS_CLIENT_LONG_AGE_SECONDS
+        and (_redis_number(_client_record_value(record, "idle")) or 0) >= _REDIS_CLIENT_IDLE_SECONDS
+    ]
+    if idle_records:
+        record = max(
+            idle_records,
+            key=lambda item: (
+                _redis_number(_client_record_value(item, "age")) or 0,
+                _redis_number(_client_record_value(item, "idle")) or 0,
+            ),
+        )
+        recommendations.append(
+            RedisRemediation(
+                "client",
+                "Fix idle or leaked connection pools",
+                "medium",
+                (
+                    "CLIENT LIST: id="
+                    f"{_client_record_value(record, 'id')} name={_client_record_value(record, 'name') or 'unnamed'} "
+                    f"age={int(_redis_number(_client_record_value(record, 'age')) or 0)}s "
+                    f"idle={int(_redis_number(_client_record_value(record, 'idle')) or 0)}s.",
+                ),
+                "Review pool min/idle/max settings, connection close paths, health checks, and deployment rolling "
+                "behavior; fix leaks at the owner rather than killing connections from diagnostics.",
+                "Aggressive idle closes can churn connections and lose prepared state; pool limits may mask an "
+                "upstream bottleneck.",
+            )
+        )
+
+    unnamed = sum(1 for record in records if not _client_record_value(record, "name"))
+    if unnamed:
+        recommendations.append(
+            RedisRemediation(
+                "client",
+                "Name client connections for ownership",
+                "low",
+                (f"CLIENT LIST: {unnamed} of {len(records)} parsed connection(s) have no name.",),
+                "Set stable CLIENT SETNAME values per service, pod, and deployment role in each client library.",
+                "Names are diagnostic metadata only, but highly cardinal names can make aggregate triage harder "
+                "and require client-library rollout.",
+            )
+        )
+
+    if blocked is not None and blocked > 0:
+        recommendations.append(
+            RedisRemediation(
+                "client",
+                "Confirm blocking-command consumers",
+                "medium",
+                (f"INFO clients blocked_clients={int(blocked)}.",),
+                "Map blocking clients to services and confirm BLPOP/BRPOP/XREAD-style behavior, timeouts, and "
+                "consumer concurrency are intended.",
+                "Removing blocking behavior can turn steady consumers into polling loops; adding consumers can "
+                "increase memory and contention.",
+            )
+        )
+
+    if connected is not None and maxclients is not None and maxclients > 0 and connected / maxclients >= 0.9:
+        recommendations.append(
+            RedisRemediation(
+                "client",
+                "Reduce connection churn or raise maxclients safely",
+                "high",
+                (
+                    f"INFO clients connected_clients={int(connected)}; maxclients={int(maxclients)} "
+                    f"({connected / maxclients * 100:.1f}% used).",
+                ),
+                "First tune pools, keepalive/idle close behavior, and fan-out per service. Only then evaluate a "
+                "tested maxclients increase and pod resource impact.",
+                "More file descriptors and memory increase resource use; pool changes can reduce concurrency and "
+                "queue work in clients.",
+            )
+        )
+    return recommendations
+
+
+def _redis_remediation_topology_recommendations(evidence: dict[str, Any]) -> list[RedisRemediation]:
+    recommendations: list[RedisRemediation] = []
+    cluster_info = evidence.get("cluster_info", {})
+    state = str(_redis_info_value(cluster_info, "cluster_state") or "").lower()
+    failed = _redis_number(_redis_info_value(cluster_info, "cluster_slots_fail"))
+    if state and state != "ok":
+        recommendations.append(
+            RedisRemediation(
+                "topology",
+                "Stabilize cluster health before performance tuning",
+                "high",
+                (
+                    f"CLUSTER INFO cluster_state={state}; cluster_slots_fail={int(failed) if failed is not None else 'unavailable'}.",
+                    "Do not attribute normal command latency to tuning while slot coverage is degraded.",
+                ),
+                "Diagnose failed/offline nodes and slot coverage with the cluster operator before command-pattern or "
+                "memory tuning.",
+                "Topology repair can move primaries and traffic; it must be coordinated to avoid failover storms "
+                "or client redirection errors.",
+            )
+        )
+    return recommendations
+
+
+def _redis_remediations_from_evidence(evidence: dict[str, Any]) -> list[RedisRemediation]:
+    recommendations: list[RedisRemediation] = []
+    recommendations.extend(_redis_remediation_command_recommendations(evidence))
+    recommendations.extend(_redis_remediation_memory_recommendations(evidence))
+    recommendations.extend(_redis_remediation_persistence_recommendations(evidence))
+    recommendations.extend(_redis_remediation_client_recommendations(evidence))
+    recommendations.extend(_redis_remediation_topology_recommendations(evidence))
+    return recommendations
+
+
+def _format_redis_remediation_evidence(evidence: dict[str, Any]) -> list[str]:
+    metrics = evidence.get("metrics", {})
+    limit_bytes, limit_text = evidence.get("pod_memory_limit", (None, "absent"))
+    sampled = evidence.get("bigkeys_sampled")
+    records = len(evidence.get("client_records") or [])
+    lines = [
+        "Evidence sources:",
+        "- SLOWLOG GET 25, SLOWLOG LEN, and CONFIG GET slowlog-max-len.",
+        "- INFO memory/stats/persistence/replication and MEMORY STATS.",
+        "- LATENCY HISTORY for known event classes plus LATENCY DOCTOR and CONFIG GET io-threads.",
+        "- CLIENT LIST, CLIENT ID, INFO clients, CONFIG GET client-output-buffer-limit, and cluster topology reads.",
+        f"- SCAN-based --bigkeys sampling: {'yes' if sampled is not None else 'not available'} "
+        f"(keys sampled: {sampled if sampled is not None else 'unknown'}).",
+        f"- Kubernetes memory limit: {limit_text} "
+        f"({_format_redis_bytes(limit_bytes) if limit_bytes is not None else 'unavailable'}).",
+        f"- CLIENT LIST records parsed: {records}.",
+    ]
+    cluster_info = evidence.get("cluster_info", {})
+    if cluster_info:
+        lines.append(
+            "- Cluster mode: "
+            f"{'yes' if evidence.get('cluster_mode') else 'no'}; cluster_state="
+            f"{_redis_info_value(cluster_info, 'cluster_state') or 'unavailable'}."
+        )
+    histories = evidence.get("latency_histories", {})
+    with_events = [name for name, events in histories.items() if events]
+    if with_events:
+        lines.append(f"- Latency histories with events: {', '.join(with_events)}.")
+    if evidence.get("errors"):
+        lines.extend(["Evidence gaps/errors:", *(f"- {error}" for error in evidence.get("errors", []))])
+    return lines
+
+
+def get_redis_remediation_recommendations(
+    namespace: Optional[str] = None,
+    pod: Optional[str] = None,
+    container: Optional[str] = None,
+    port: Optional[int] = None,
+    include_bigkeys: bool = True,
+    sample_interval_seconds: float = 0.01,
+) -> str:
+    """Produce evidence-linked, advisory Redis/Valkey remediation recommendations.
+
+    Uses only the existing read-only Redis diagnostics and the SCAN-based CLI
+    big-key mode. It never changes Redis/Valkey state or Kubernetes resources.
+    """
+    if pod and not namespace:
+        return "A namespace is required when pod is specified."
+    try:
+        interval = float(sample_interval_seconds)
+    except (TypeError, ValueError):
+        return "Invalid sample_interval_seconds: use a value between 0 and 1."
+    if interval < 0 or interval > 1:
+        return "Invalid sample_interval_seconds: use a value between 0 and 1."
+
+    try:
+        v1 = _load_kubernetes_client()
+        all_pods = _redis_pods_for_analysis(v1, namespace, pod)
+        pods = [candidate for candidate in all_pods if not _redis_pod_is_sentinel(candidate)]
+        sentinel_pods = [
+            candidate
+            for candidate in all_pods
+            if _redis_pod_is_sentinel(candidate) and (not pod or candidate.metadata.name == pod)
+        ]
+    except Exception as exc:
+        return f"Error discovering or reading Redis/Valkey pods: {exc}"
+    if not pods and not sentinel_pods:
+        return (
+            "No Redis, Valkey, or Sentinel pods found. Use find_database_pods first "
+            "to confirm the labels and namespace."
+        )
+
+    sections: list[str] = []
+    errors: list[str] = []
+    sentinel_sections: list[str] = []
+    for pod_item in pods:
+        context = _redis_result_context(pod_item, "")
+        label = f"{context['namespace']}/{context['pod']}"
+        try:
+            cli = _detect_redis_cli(context["namespace"], context["pod"], container)
+            evidence = _read_redis_remediation_evidence(
+                context["namespace"],
+                context["pod"],
+                cli,
+                context,
+                container,
+                port,
+                include_bigkeys,
+                interval,
+            )
+            evidence["pod_memory_limit"] = _redis_container_memory_limit(pod_item, container)
+            recommendations = _redis_remediations_from_evidence(evidence)
+            section = [
+                f"### {label} (CLI: {cli})",
+                f"- {_redis_context_label(context)}",
+                *_format_redis_remediation_evidence(evidence),
+                "",
+                "Evidence-linked recommendations:",
+            ]
+            if recommendations:
+                for recommendation in recommendations:
+                    section.extend(recommendation.render())
+            else:
+                section.append(
+                    "- No threshold-crossing recommendation was supported by this evidence. "
+                    "No change was applied."
+                )
+            section.extend(
+                [
+                    "",
+                    "All recommendations are advisory. The tool issued no remediation, mutation, or "
+                    "configuration change.",
+                    "No changes were made; this analysis is advisory only.",
+                    "",
+                ]
+            )
+            sections.append("\n".join(section))
+        except Exception as exc:
+            errors.append(f"{label}: {exc}")
+
+    for pod_item in sentinel_pods:
+        context = _redis_result_context(pod_item, "")
+        label = f"{context['namespace']}/{context['pod']}"
+        try:
+            cli = _detect_redis_cli(context["namespace"], context["pod"], container)
+            snapshot = _redis_sentinel_snapshot(context["namespace"], context["pod"], cli, container, port)
+            sentinel_sections.append(
+                "\n".join(
+                    [
+                        f"### Sentinel {label} (CLI: {cli})",
+                        f"- {_redis_context_label(context)}",
+                        *(_format_sentinel_snapshot(snapshot)),
+                        "",
+                    ]
+                )
+            )
+        except Exception as exc:
+            errors.append(f"{label}: {exc}")
+
+    result = [
+        "Redis/Valkey remediation recommendations (advisory only):",
+        "",
+        *"\n".join(sections).splitlines(),
+    ]
+    if sentinel_sections:
+        result.extend(["Sentinel topology evidence:", *"\n".join(sentinel_sections).splitlines()])
+    if errors:
+        result.extend(["Skipped pods/evidence errors:", *(f"- {error}" for error in errors), ""])
+    result.append("No changes were made; this analysis is advisory only.")
+    return "\n".join(result)
