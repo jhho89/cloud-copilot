@@ -73,6 +73,7 @@ Coordinates specialized sub-agents to solve complex troubleshooting workflows. U
 - `get_redis_memory_report()` - Report memory pressure, eviction policy, fragmentation, persistence, and fork/COW evidence
 - `analyze_redis_bigkeys()` - Analyze large keys on one pod with SCAN-based `--bigkeys` or `--memkeys`
 - `get_redis_latency_report()` - Correlate `LATENCY` events with slowlog, memory, persistence, command rate, and IO-thread evidence
+- `get_redis_client_report()` - Report client health, maxclients headroom, buffer pressure, replica lag, and topology
 
 Slow-query analysis reads the container's `stdout`/`stderr` by default. A read-only file mode is also available when an operator allowlists an absolute slow-log path; it uses a shell-free `tail` exec and emits audit metadata without SQL or credentials. See [docs/dba-rbac.md](../docs/dba-rbac.md) for RBAC, file prerequisites, and replica-selection guidance.
 
@@ -80,7 +81,9 @@ For query-plan analysis, the database agent runs a validated `EXPLAIN` statement
 
 Redis and Valkey slow-log analysis uses `valkey-cli` when available, otherwise `redis-cli`, through direct argv pod/exec. It runs only `SLOWLOG GET`, `SLOWLOG LEN`, and `CONFIG GET slowlog-max-len`; destructive and maintenance commands are blocked. Passwords must already be available in the container environment (`REDISCLI_AUTH` or `VALKEYCLI_AUTH`) or via a mounted CLI configuration, never as command-line arguments.
 
-Redis and Valkey memory reports use the same CLI path with only `INFO memory`, `INFO stats`, `INFO persistence`, `INFO replication`, and `MEMORY STATS`. Latency reports add `LATENCY HISTORY` for selected event classes, `LATENCY DOCTOR`, `SLOWLOG`, and `CONFIG GET io-threads`. Big-key analysis requires one namespace/pod and invokes only `valkey-cli`/`redis-cli --bigkeys` or `--memkeys` (which use `SCAN` internally); it never runs `KEYS`, a manual `SCAN`, `DEBUG`, or a mutation command. All reports re-read `role` at execution time, label evidence by namespace/pod/role, and leave every recommendation unapplied.
+Redis and Valkey memory reports use the same CLI path with only `INFO memory`, `INFO stats`, `INFO persistence`, `INFO replication`, and `MEMORY STATS`. Latency and client reports add `LATENCY HISTORY`, `LATENCY DOCTOR`, `SLOWLOG`, `CONFIG GET io-threads`, `CLIENT LIST`, `CLIENT ID`, `INFO clients`, `CONFIG GET client-output-buffer-limit`, selected `CLUSTER` topology commands, and selected `SENTINEL` views. Big-key analysis requires one namespace/pod and invokes only `valkey-cli`/`redis-cli --bigkeys` or `--memkeys` (which use `SCAN` internally); it never runs `KEYS`, a manual `SCAN`, `DEBUG`, or a mutation command. All reports re-read `role` at execution time, label evidence by namespace/pod/role, and leave every recommendation unapplied.
+
+The client report groups buffer-heavy, long-idle, subscription-heavy, MONITOR, and blocked clients by connection name or address, explains likely application-side causes, and surfaces replica lag/backlog headroom, Sentinel quorum and failover state, and cluster shard layout. Cluster mode still requires per-node/per-master evidence; the report explicitly calls out that fan-out rather than treating one shard as the cluster.
 
 ---
 
