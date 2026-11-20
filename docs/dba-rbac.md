@@ -104,10 +104,18 @@ Memory reports run the same known CLI with these allowlisted commands:
 - `INFO replication`
 - `MEMORY STATS`
 
-Latency reports additionally allow `LATENCY HISTORY` for `command`, `expire-cycle`, `eviction-cycle`, `eviction-del`, `fork`, `aof-fsync`, and `rdb-save`, plus `LATENCY DOCTOR` and `CONFIG GET io-threads`. They correlate those events with slow-log, memory, command-rate, and persistence evidence. `io-threads` is context, not proof of causation.
+Latency and client reports additionally allow `LATENCY HISTORY` for `command`, `expire-cycle`, `eviction-cycle`, `eviction-del`, `fork`, `aof-fsync`, and `rdb-save`, plus `LATENCY DOCTOR`, `CONFIG GET io-threads`, `CLIENT LIST`, `CLIENT ID`, `INFO clients`, `CONFIG GET client-output-buffer-limit`, `CLUSTER INFO`, `CLUSTER MYID`, `CLUSTER SHARDS`, `CLUSTER NODES`, `SENTINEL MASTERS`, `SENTINEL REPLICAS <name>`, and `SENTINEL SENTINELS <name>`. Latency reports correlate those events with slow-log, memory, command-rate, and persistence evidence. `io-threads` is context, not proof of causation.
 
 Big-key analysis requires one namespace and pod. It invokes `valkey-cli --bigkeys` or `--memkeys` (preferring Valkey), falling back to `redis-cli`; the CLI uses `SCAN` internally. The agent does not issue `KEYS`, a manual `SCAN`, `DEBUG`, or any mutation command. The exec timeout is bounded and the CLI is throttled with `-i 0.01` by default. Because the analyzer iterates the keyspace, use it on a selected node and avoid simultaneous scans of every replica.
 
 The tools re-read `INFO replication` at execution time. Reports label runtime role explicitly (including `unknown` when unavailable) and preserve namespace/pod attribution. Recommendations remain advisory; no memory setting, eviction policy, persistence setting, or key is changed.
+
+## Redis/Valkey client and topology mode
+
+`get_redis_client_report` uses the client and topology commands above. It reports `maxclients` headroom, blocked clients, and subscription counts from `INFO clients`; groups offending connections by `CLIENT SETNAME` (or address for unnamed clients); flags large `qbuf`, `omem`, long-lived/idle connections, and clients stuck in `MONITOR`; and explains likely application-side causes such as slow consumers, leaked pools, pub/sub backpressure, or accidental MONITOR use.
+
+Topology is always observed at report execution time. `INFO replication` supplies runtime role, replica offsets, backlog size/use/headroom, and `master_replid`; `CLUSTER INFO`, `CLUSTER MYID`, and `CLUSTER SHARDS` identify cluster state, shard slots, and the current pod's node role. Sentinel pods are discovered from Redis/Valkey-related image, container name, pod name, or label text containing `sentinel`; `SENTINEL MASTERS`, `SENTINEL REPLICAS`, and `SENTINEL SENTINELS` provide each Sentinel's view of the current master, quorum, replica state, and peer Sentinels.
+
+For cluster mode, client evidence is per node. A single shard's report does not describe the whole dataset or connection population; every shard master must be examined when a cluster-wide view is required, which increases pod/exec fan-out with shard count. Kubernetes labels remain hints, not authoritative role evidence. Reports explicitly mark missing, denied, or malformed topology data and remain advisory-only.
 
 The shared pod/exec wrapper uses fixed argv, no stdin, no TTY, enabled stderr, a bounded request timeout, and the same audit event as MySQL file mode. The audit record does not include Redis commands, output, or credentials.

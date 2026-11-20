@@ -37,6 +37,7 @@ _BLOCKED_REDIS_COMMANDS = {
     "SHUTDOWN",
 }
 _REDIS_INFO_SECTIONS = {"memory", "stats", "persistence", "replication"}
+_REDIS_CLIENT_INFO_SECTIONS = {"clients", "replication"}
 _REDIS_LATENCY_EVENT_CLASSES = {
     "command",
     "expire-cycle",
@@ -46,6 +47,11 @@ _REDIS_LATENCY_EVENT_CLASSES = {
     "aof-fsync",
     "rdb-save",
 }
+_REDIS_CLIENT_QBUF_BYTES = 1024 * 1024
+_REDIS_CLIENT_OMEM_BYTES = 8 * 1024 * 1024
+_REDIS_CLIENT_LONG_AGE_SECONDS = 86400
+_REDIS_CLIENT_IDLE_SECONDS = 600
+_REDIS_CLIENT_HIGH_SUBSCRIPTIONS = 100
 
 
 class SlowLogFileConfigError(ValueError):
@@ -610,6 +616,27 @@ def _validate_redis_command(command: object) -> list[str]:
         raise RedisCommandBlockedError(
             "Blocked Redis command. CONFIG SET and other mutations are not permitted."
         )
+    if operation == "CLIENT" and len(tokens) > 1 and tokens[1].upper() not in {"LIST", "ID"}:
+        raise RedisCommandBlockedError(
+            "Blocked Redis command. Only CLIENT LIST and CLIENT ID are permitted."
+        )
+    if operation == "CLUSTER" and len(tokens) > 1 and tokens[1].upper() not in {
+        "INFO",
+        "MYID",
+        "SHARDS",
+        "NODES",
+    }:
+        raise RedisCommandBlockedError(
+            "Blocked Redis command. Only selected CLUSTER read-only commands are permitted."
+        )
+    if operation == "SENTINEL" and len(tokens) > 1 and tokens[1].upper() not in {
+        "MASTERS",
+        "REPLICAS",
+        "SENTINELS",
+    }:
+        raise RedisCommandBlockedError(
+            "Blocked Redis command. Only selected SENTINEL read-only commands are permitted."
+        )
     if operation == "SLOWLOG" and len(tokens) > 1 and tokens[1].upper() not in {"GET", "LEN"}:
         raise RedisCommandBlockedError(
             "Blocked Redis command. SLOWLOG RESET is not permitted."
@@ -641,14 +668,29 @@ def _validate_redis_command(command: object) -> list[str]:
         operation == "CONFIG"
         and len(tokens) == 3
         and tokens[1].upper() == "GET"
-        and tokens[2].lower() in {"slowlog-max-len", "io-threads"}
+        and tokens[2].lower() in {"slowlog-max-len", "io-threads", "client-output-buffer-limit"}
     ):
         return tokens
+    if operation == "CLIENT" and len(tokens) == 2 and tokens[1].upper() in {"LIST", "ID"}:
+        return tokens
+    if operation == "INFO" and len(tokens) == 2 and tokens[1].lower() in _REDIS_CLIENT_INFO_SECTIONS:
+        return tokens
+    if operation == "CLUSTER" and len(tokens) == 2 and tokens[1].upper() in {"INFO", "MYID", "SHARDS", "NODES"}:
+        return tokens
+    if operation == "SENTINEL":
+        if len(tokens) == 2 and tokens[1].upper() == "MASTERS":
+            return tokens
+        if (
+            len(tokens) == 3
+            and tokens[1].upper() in {"REPLICAS", "SENTINELS"}
+            and re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", tokens[2])
+        ):
+            return tokens
 
     raise RedisCommandNotAllowlistedError(
         "Redis command not allowlisted. This tool permits only SLOWLOG GET, "
-        "SLOWLOG LEN, selected INFO/MEMORY STATS/LATENCY diagnostics, and "
-        "CONFIG GET slowlog-max-len or io-threads."
+        "SLOWLOG LEN, selected INFO/MEMORY/LATENCY/CLIENT/CLUSTER/SENTINEL "
+        "diagnostics, and selected CONFIG GET parameters."
     )
 
 
@@ -901,6 +943,7 @@ def _redis_pods_for_analysis(
     v1: client.CoreV1Api,
     namespace: Optional[str],
     pod: Optional[str],
+    include_sentinels: bool = True,
 ) -> list[client.V1Pod]:
     if pod:
         return [v1.read_namespaced_pod(name=pod, namespace=namespace)]
@@ -908,12 +951,20 @@ def _redis_pods_for_analysis(
         pod_list = v1.list_namespaced_pod(namespace=namespace)
     else:
         pod_list = v1.list_pod_for_all_namespaces()
-    return [
+    candidates = [
         candidate
         for candidate in pod_list.items
         if _pod_matches_database_type(candidate, "redis")
         or _pod_matches_database_type(candidate, "valkey")
     ]
+    return candidates if include_sentinels else [pod for pod in candidates if not _redis_pod_is_sentinel(pod)]
+
+
+def _redis_pod_is_sentinel(pod: client.V1Pod) -> bool:
+    identity = _pod_identity(pod)
+    return "sentinel" in identity and (
+        "redis" in identity or "valkey" in identity
+    )
 
 
 def _parse_info_sections(output: str) -> dict[str, Any]:
@@ -1018,6 +1069,173 @@ def _read_redis_evidence(
         "cli": cli,
         "context": context,
     }
+
+
+def _read_redis_client_evidence(
+    namespace: str,
+    pod_name: str,
+    cli: str,
+    context: dict[str, str],
+    container: Optional[str] = None,
+    port: Optional[int] = None,
+) -> dict[str, Any]:
+    """Collect client, buffer, replication, and cluster evidence at report time."""
+    metrics: dict[str, Any] = {}
+    errors: list[str] = []
+
+    for section in ("clients", "replication"):
+        try:
+            section_fields = _parse_info_sections(
+                _run_redis_command(namespace, pod_name, cli, ["INFO", section], container, port)
+            )
+            metrics.update(section_fields)
+        except Exception as exc:
+            errors.append(f"INFO {section}: {exc}")
+
+    buffer_limits: dict[str, dict[str, int]] = {}
+    buffer_error = ""
+    try:
+        output = _run_redis_command(
+            namespace,
+            pod_name,
+            cli,
+            ["CONFIG", "GET", "client-output-buffer-limit"],
+            container,
+            port,
+        )
+        buffer_limits, buffer_error = _parse_output_buffer_limit(output)
+        if buffer_error:
+            errors.append(buffer_error)
+    except Exception as exc:
+        buffer_error = str(exc)
+        errors.append(f"CONFIG GET client-output-buffer-limit: {exc}")
+
+    records: list[dict[str, Any]] = []
+    client_list_error = ""
+    try:
+        records, client_list_error = _parse_client_list(
+            _run_redis_command(namespace, pod_name, cli, ["CLIENT", "LIST"], container, port)
+        )
+        if client_list_error:
+            errors.append(client_list_error)
+    except Exception as exc:
+        client_list_error = str(exc)
+        errors.append(f"CLIENT LIST: {exc}")
+
+    client_id: Optional[int] = None
+    try:
+        client_id = _parse_integer_response(
+            _run_redis_command(namespace, pod_name, cli, ["CLIENT", "ID"], container, port)
+        )
+    except Exception as exc:
+        errors.append(f"CLIENT ID: {exc}")
+
+    cluster_info: dict[str, Any] = {}
+    cluster_error = ""
+    try:
+        cluster_info = _parse_cluster_info(
+            _run_redis_command(namespace, pod_name, cli, ["CLUSTER", "INFO"], container, port)
+        )
+    except Exception as exc:
+        cluster_error = str(exc)
+        errors.append(f"CLUSTER INFO: {exc}")
+
+    cluster_mode = _redis_number(_redis_info_value(cluster_info, "cluster_enabled")) == 1
+    cluster_id: Optional[str] = None
+    if cluster_mode:
+        try:
+            cluster_id = _parse_cluster_id(
+                _run_redis_command(namespace, pod_name, cli, ["CLUSTER", "MYID"], container, port)
+            )
+        except Exception as exc:
+            errors.append(f"CLUSTER MYID: {exc}")
+
+    shards: list[dict[str, Any]] = []
+    shards_error = ""
+    if cluster_mode:
+        try:
+            shards, shards_error = _parse_cluster_shards(
+                _run_redis_command(namespace, pod_name, cli, ["CLUSTER", "SHARDS"], container, port)
+            )
+            if shards_error:
+                errors.append(shards_error)
+        except Exception as exc:
+            shards_error = str(exc)
+            errors.append(f"CLUSTER SHARDS: {exc}")
+
+    runtime_role = _redis_info_value(metrics, "role")
+    context["runtime_role"] = str(runtime_role) if runtime_role else "unknown"
+    return {
+        "metrics": metrics,
+        "records": records,
+        "client_list_error": client_list_error,
+        "client_id": client_id,
+        "buffer_limits": buffer_limits,
+        "cluster_info": cluster_info,
+        "cluster_mode": cluster_mode,
+        "cluster_id": cluster_id,
+        "shards": shards,
+        "errors": errors,
+        "context": context,
+    }
+
+
+def _redis_replication_findings(metrics: dict[str, Any], runtime_role: str) -> list[str]:
+    findings: list[str] = []
+    if runtime_role in {"replica", "slave", "replica-of", "follower"}:
+        link_status = str(_redis_info_value(metrics, "master_link_status") or "").lower()
+        if link_status and link_status != "up":
+            findings.append(f"master_link_status={link_status}; the replica is not currently replicating.")
+        sync = _redis_number(_redis_info_value(metrics, "master_sync_in_progress"))
+        if sync == 1:
+            findings.append("master_sync_in_progress=1; a resync is currently underway.")
+
+    master_offset = _redis_number(_redis_info_value(metrics, "master_repl_offset"))
+    replica_offset = _redis_number(
+        _redis_info_value(metrics, "slave_repl_offset")
+        if _redis_info_value(metrics, "slave_repl_offset") is not None
+        else _redis_info_value(metrics, "slave_read_repl_offset")
+    )
+    if master_offset is not None and replica_offset is not None:
+        lag_bytes = max(0, int(master_offset - replica_offset))
+        findings.append(f"replication lag evidence: {lag_bytes} bytes between master and replica offsets.")
+        if lag_bytes >= 1024 * 1024:
+            findings.append("Replica lag exceeds 1 MiB; inspect disk/network and command throughput.")
+
+    last_io = _redis_number(_redis_info_value(metrics, "master_last_io_seconds_ago"))
+    if last_io is not None and last_io >= 30:
+        findings.append(
+            f"master_last_io_seconds_ago={int(last_io)}; replication heartbeat has not been seen recently."
+        )
+
+    backlog_size = _redis_number(_redis_info_value(metrics, "repl_backlog_size"))
+    backlog_len = _redis_number(_redis_info_value(metrics, "repl_backlog_histlen"))
+    backlog_active = _redis_number(_redis_info_value(metrics, "repl_backlog_active"))
+    if backlog_size is not None:
+        if backlog_active == 0:
+            findings.append(
+                "The replication backlog is inactive; a reconnecting replica may require a full resync."
+            )
+        else:
+            if backlog_len is not None:
+                headroom = max(0, int(backlog_size - backlog_len))
+                findings.append(
+                    f"Replication backlog: size={int(backlog_size)}, used={int(backlog_len)}, headroom={headroom} bytes."
+                )
+                if backlog_len >= backlog_size:
+                    findings.append(
+                        "The replication backlog is full; an offline replica can miss its partial-sync window "
+                        "and require an expensive full resync."
+                    )
+                elif headroom <= backlog_size * 0.1:
+                    findings.append("Replication backlog headroom is at or below 10%.")
+
+    replid = _redis_info_value(metrics, "master_replid")
+    if replid:
+        findings.append(f"master_replid={replid}.")
+    else:
+        findings.append("master_replid is unavailable; replication identity consistency cannot be assessed here.")
+    return findings
 
 
 def _format_redis_evidence(metrics: dict[str, Any], evidence_errors: list[str]) -> list[str]:
@@ -1392,6 +1610,338 @@ def get_redis_memory_report(
     return "\n".join(result)
 
 
+def _redis_sentinel_snapshot(
+    namespace: str,
+    pod_name: str,
+    cli: str,
+    container: Optional[str] = None,
+    port: Optional[int] = None,
+) -> dict[str, Any]:
+    """Read a Sentinel's masters, their replicas, and peer Sentinels."""
+    errors: list[str] = []
+    masters: list[dict[str, Any]] = []
+    try:
+        masters = _redis_records_from_payload(
+            _parse_redis_response(
+                _run_redis_command(namespace, pod_name, cli, ["SENTINEL", "MASTERS"], container, port)
+            )
+        )
+    except Exception as exc:
+        errors.append(f"SENTINEL MASTERS: {exc}")
+
+    replicas: list[dict[str, Any]] = []
+    peers: list[dict[str, Any]] = []
+    for master in masters:
+        name = _format_redis_value(_sentinel_value(master, "name")).strip()
+        if not name:
+            continue
+        for command, destination in (
+            (["SENTINEL", "REPLICAS", name], replicas),
+            (["SENTINEL", "SENTINELS", name], peers),
+        ):
+            try:
+                destination.extend(
+                    _redis_records_from_payload(
+                        _parse_redis_response(
+                            _run_redis_command(namespace, pod_name, cli, command, container, port)
+                        )
+                    )
+                )
+            except Exception as exc:
+                errors.append(f"{command[0]} {command[1]} {name}: {exc}")
+    return {"masters": masters, "replicas": replicas, "peers": peers, "errors": errors}
+
+
+def _format_sentinel_snapshot(snapshot: dict[str, Any]) -> list[str]:
+    lines = ["Sentinel topology evidence:"]
+    if not snapshot["masters"] and not snapshot["errors"]:
+        lines.append("- No Sentinel masters were returned.")
+    for master in snapshot["masters"]:
+        name = _format_redis_value(_sentinel_value(master, "name")) or "unknown"
+        ip = _format_redis_value(_sentinel_value(master, "ip")) or "unknown"
+        port = _format_redis_value(_sentinel_value(master, "port")) or "unknown"
+        flags = _sentinel_flags(master)
+        state = "primary" if "master" in flags else ",".join(sorted(flags)) or "unknown"
+        quorum = _redis_number(_sentinel_value(master, "quorum"))
+        other_sentinels = _redis_number(_sentinel_value(master, "num-other-sentinels"))
+        replicas_count = _redis_number(_sentinel_value(master, "num-slaves"))
+        lines.append(
+            f"- Master `{name}`: {state} at {ip}:{port}; quorum={quorum if quorum is not None else 'unknown'}; "
+            f"other_sentinels={other_sentinels if other_sentinels is not None else 'unknown'}; "
+            f"replicas={replicas_count if replicas_count is not None else 'unknown'}"
+        )
+        if "sdown" in flags or "odown" in flags:
+            lines.append(f"  - Subjective/objective failure flags are present: {','.join(sorted(flags))}.")
+        if quorum is not None and other_sentinels is not None:
+            needed_others = max(0, int(quorum) - 1)
+            if other_sentinels < needed_others:
+                lines.append(
+                    f"  - Only {int(other_sentinels)} other Sentinel(s) are visible; quorum {int(quorum)} is not currently reachable."
+                )
+            else:
+                lines.append(f"  - Quorum {int(quorum)} appears reachable from this Sentinel's view.")
+        if "failover-in-progress" in flags:
+            lines.append("  - A failover is currently in progress.")
+    if snapshot["replicas"]:
+        lines.append("- Sentinel replica observations:")
+        for replica in snapshot["replicas"][:20]:
+            name = _format_redis_value(_sentinel_value(replica, "name")) or "unknown"
+            address = f"{_format_redis_value(_sentinel_value(replica, 'ip'))}:{_format_redis_value(_sentinel_value(replica, 'port'))}"
+            flags = _sentinel_flags(replica)
+            lines.append(f"  - `{name}` at {address}: {','.join(sorted(flags)) or 'unknown'}")
+            if "sdown" in flags or "odown" in flags or "disconnected" in flags:
+                lines.append("    - Failure or disconnect flag is present; this can lead to failover.")
+    if snapshot["peers"]:
+        lines.append(f"- Peer Sentinel observations: {len(snapshot['peers'])} sentinel(s) returned.")
+    if snapshot["errors"]:
+        lines.extend(["- Sentinel evidence errors:", *(f"  - {error}" for error in snapshot["errors"])])
+    return lines
+
+
+def _format_cluster_shards(evidence: dict[str, Any]) -> list[str]:
+    cluster_info = evidence["cluster_info"]
+    shards = evidence.get("shards", [])
+    lines = ["Cluster topology evidence:"]
+    state = _redis_info_value(cluster_info, "cluster_state")
+    assigned = _redis_number(_redis_info_value(cluster_info, "cluster_slots_assigned"))
+    failed = _redis_number(_redis_info_value(cluster_info, "cluster_slots_fail"))
+    known = _redis_number(_redis_info_value(cluster_info, "cluster_known_nodes"))
+    size = _redis_number(_redis_info_value(cluster_info, "cluster_size"))
+    lines.append(
+        f"- CLUSTER INFO: cluster_state={state or 'unknown'}, assigned_slots={assigned if assigned is not None else 'unknown'}, "
+        f"failed_slots={failed if failed is not None else 'unknown'}, known_nodes={known if known is not None else 'unknown'}, "
+        f"cluster_size={size if size is not None else 'unknown'}"
+    )
+    lines.append(f"- CLUSTER MYID: {evidence.get('cluster_id') or 'unknown'} (current pod node ID).")
+    if state and str(state).lower() != "ok":
+        lines.append(f"- cluster_state={state}; this cluster is not fully healthy.")
+    if failed and failed > 0:
+        lines.append(f"- {int(failed)} slot(s) are marked failed.")
+    if evidence.get("cluster_id"):
+        attributed = [
+            (shard_index, node)
+            for shard_index, shard in enumerate(shards, 1)
+            for node in shard["nodes"]
+            if str(node.get("node-id") or node.get("id") or "") == evidence["cluster_id"]
+        ]
+        if attributed:
+            shard_index, node = attributed[0]
+            lines.append(
+                f"- Current pod is attributed to shard {shard_index} as {node.get('role') or 'unknown'}."
+            )
+    if shards:
+        lines.append("- CLUSTER SHARDS layout:")
+        for shard_index, shard in enumerate(shards, 1):
+            slots = ", ".join(f"{start}-{end}" if start != end else str(start) for start, end in shard["slots"])
+            node_parts = []
+            for node in shard["nodes"]:
+                role = str(node.get("role") or "unknown")
+                node_id = str(node.get("node-id") or node.get("id") or "unknown")
+                marker = " <-- this pod" if evidence.get("cluster_id") and node_id == evidence["cluster_id"] else ""
+                node_parts.append(f"{node_id} ({role}, {node.get('endpoint') or 'endpoint unknown'}){marker}")
+            lines.append(f"  - Shard {shard_index}: slots={slots or 'unknown'}; nodes: {'; '.join(node_parts)}")
+        lines.append(
+            "- Per-shard scanning note: this report is bounded to the node(s) discovered; "
+            "cluster client health and keyspace-dependent behavior require checking every shard master."
+        )
+    return lines
+
+
+def _redis_client_report_section(
+    pod_item: client.V1Pod,
+    evidence: dict[str, Any],
+    cli: str,
+) -> str:
+    context = evidence["context"]
+    metrics = evidence["metrics"]
+    label = f"{context['namespace']}/{context['pod']}"
+    section = [f"### {label} (CLI: {cli})", f"- {_redis_context_label(context)}"]
+    section.append("- Runtime role was re-read from INFO replication during this report.")
+    section.append(f"- Runtime role: {context.get('runtime_role') or 'unknown'}")
+    section.append(f"- Cluster mode: {'yes' if evidence.get('cluster_mode') else 'no or unavailable'}")
+
+    connected = _redis_number(_redis_info_value(metrics, "connected_clients"))
+    maxclients = _redis_number(_redis_info_value(metrics, "maxclients"))
+    blocked = _redis_number(_redis_info_value(metrics, "blocked_clients"))
+    section.extend(["", "Connection evidence (INFO clients/CLIENT LIST):"])
+    section.append(f"- connected_clients: {connected if connected is not None else 'unavailable'}")
+    section.append(f"- maxclients: {maxclients if maxclients is not None else 'unavailable'}")
+    if connected is not None and maxclients and maxclients > 0:
+        used_ratio = connected / maxclients
+        headroom = int(maxclients - connected)
+        section.append(f"- maxclients headroom: {headroom} connections ({used_ratio * 100:.1f}% used)")
+        if used_ratio >= 0.9:
+            section.append("- WARNING: maxclients headroom is at or below 10%; connection churn or a leak may exhaust it.")
+    else:
+        section.append("- maxclients headroom: unavailable; both connected_clients and maxclients are needed.")
+    section.append(f"- blocked_clients: {blocked if blocked is not None else 'unavailable'}")
+    section.append(f"- CLIENT LIST records parsed: {len(evidence.get('records', []))}")
+    section.append(f"- CLIENT ID: {evidence.get('client_id') if evidence.get('client_id') is not None else 'unavailable'}")
+
+    findings = _client_findings(evidence.get("records", []))
+    unnamed = sum(1 for record in evidence.get("records", []) if not _client_record_value(record, "name"))
+    monitor_count = sum(1 for record in evidence.get("records", []) if "O" in str(_client_record_value(record, "flags") or "").upper())
+    subscription_total = sum(
+        sum(int(_redis_number(_client_record_value(record, field)) or 0) for field in ("sub", "psub", "ssub"))
+        for record in evidence.get("records", [])
+    )
+    section.append(f"- Unnamed connections: {unnamed}")
+    section.append(f"- Clients in MONITOR mode: {monitor_count}")
+    section.append(f"- Total subscriptions across clients: {subscription_total}")
+    if evidence.get("errors"):
+        section.extend(["Evidence errors:", *(f"- {error}" for error in evidence.get("errors", []))])
+
+    buffer_limits = evidence.get("buffer_limits", {})
+    if buffer_limits:
+        section.extend(["", "client-output-buffer-limit configuration:"])
+        for client_class in sorted(buffer_limits):
+            value = buffer_limits[client_class]
+            section.append(
+                f"- {client_class}: hard={value['hard_limit']}, soft={value['soft_limit']}, soft_seconds={value['soft_seconds']}"
+            )
+
+    section.extend(["", "Replication evidence and health:"])
+    replication_lines = _redis_replication_findings(metrics, context.get("runtime_role") or "unknown")
+    section.extend(f"- {line}" for line in replication_lines)
+
+    if evidence.get("cluster_mode"):
+        section.extend([""])
+        section.extend(_format_cluster_shards(evidence))
+
+    section.extend(["", "Offending client groups (ranked by buffer/impact):"])
+    if findings:
+        for index, group in enumerate(findings, 1):
+            identity = f"{group['kind']} `{group['identity']}`"
+            section.append(
+                f"- {index}. {identity}: {len(group['ids'])} connection(s); "
+                f"max qbuf={group['max_qbuf']}, omem={group['max_omem']}, age={group['max_age']}s, idle={group['max_idle']}s."
+            )
+            section.append(f"  - IDs: {', '.join(group['ids'][:10])}{'...' if len(group['ids']) > 10 else ''}")
+            if group["names"]:
+                section.append(f"  - Name(s): {', '.join(sorted(group['names']))}.")
+            for reason in group["reasons"]:
+                section.append(f"  - {reason}.")
+    else:
+        section.append("- No individual client crossed the configured qbuf, omem, long-idle, subscription, MONITOR, or blocked thresholds.")
+
+    section.extend(
+        [
+            "",
+            "Likely application-side causes to investigate:",
+            "- Large qbuf/omem often means a slow consumer, oversized pub/sub fan-out, network/backpressure, "
+            "or a client that is not reading responses.",
+            "- Long-lived idle connections often point to leaked pools or missing keepalive/idle close policy.",
+            "- Use `CLIENT SETNAME` per service and release channel (for example, orders-worker) so address-only evidence maps to an owner.",
+            "- MONITOR can consume CPU and add latency; it should not be left enabled by an application or debug process.",
+            "- Blocked clients can be normal for BLPOP/BRPOP/XREAD-style consumers, but unexpected blocking can stall worker capacity.",
+        ]
+    )
+    section.extend(
+        [
+            "",
+            "Recommendations are advisory and evidence-linked; they have not been applied.",
+            "No changes were made; this analysis is advisory only.",
+            "",
+        ]
+    )
+    return "\n".join(section)
+
+
+def get_redis_client_report(
+    namespace: Optional[str] = None,
+    pod: Optional[str] = None,
+    container: Optional[str] = None,
+    port: Optional[int] = None,
+) -> str:
+    """Report Redis/Valkey client health and topology-aware role evidence.
+
+    Uses only read-only CLIENT, INFO, CONFIG GET, CLUSTER, and SENTINEL
+    diagnostics. Roles are read again while the report runs; findings are not
+    inferred from Kubernetes role labels.
+    """
+    if pod and not namespace:
+        return "A namespace is required when pod is specified."
+    try:
+        v1 = _load_kubernetes_client()
+        all_pods = _redis_pods_for_analysis(v1, namespace, pod)
+        pods = [candidate for candidate in all_pods if not _redis_pod_is_sentinel(candidate)]
+        sentinel_pods = [
+            candidate
+            for candidate in all_pods
+            if _redis_pod_is_sentinel(candidate) and (not pod or candidate.metadata.name == pod)
+        ]
+    except Exception as exc:
+        return f"Error discovering or reading Redis/Valkey pods: {exc}"
+    if not pods and not sentinel_pods:
+        return (
+            "No Redis, Valkey, or Sentinel pods found. Use find_database_pods first "
+            "to confirm the labels and namespace."
+        )
+
+    sections: list[str] = []
+    errors: list[str] = []
+    server_evidence: list[tuple[str, dict[str, Any]]] = []
+    for pod_item in pods:
+        context = _redis_result_context(pod_item, "")
+        label = f"{context['namespace']}/{context['pod']}"
+        try:
+            cli = _detect_redis_cli(context["namespace"], context["pod"], container)
+            evidence = _read_redis_client_evidence(
+                context["namespace"], context["pod"], cli, context, container, port
+            )
+            server_evidence.append((label, evidence))
+            sections.append(_redis_client_report_section(pod_item, evidence, cli))
+        except Exception as exc:
+            errors.append(f"{label}: {exc}")
+
+    sentinel_sections: list[str] = []
+    for pod_item in sentinel_pods:
+        context = _redis_result_context(pod_item, "")
+        label = f"{context['namespace']}/{context['pod']}"
+        try:
+            cli = _detect_redis_cli(context["namespace"], context["pod"], container)
+            snapshot = _redis_sentinel_snapshot(context["namespace"], context["pod"], cli, container, port)
+            sentinel_sections.append(
+                "\n".join(
+                    [
+                        f"### Sentinel {label} (CLI: {cli})",
+                        f"- {_redis_context_label(context)}",
+                        *(_format_sentinel_snapshot(snapshot)),
+                        "",
+                    ]
+                )
+            )
+        except Exception as exc:
+            errors.append(f"{label}: {exc}")
+
+    result = [f"Redis/Valkey client and topology analysis: {len(sections)} node(s) reported.", ""]
+    result.extend("\n".join(sections).splitlines())
+    if sentinel_sections:
+        result.extend(["Sentinel-managed topology:", *"\n".join(sentinel_sections).splitlines()])
+
+    replication_ids = [
+        str(_redis_info_value(evidence.get("metrics", {}), "master_replid"))
+        for _, evidence in server_evidence
+        if _redis_info_value(evidence.get("metrics", {}), "master_replid")
+    ]
+    if replication_ids and len(set(replication_ids)) > 1:
+        if any(evidence.get("cluster_mode") for _, evidence in server_evidence):
+            note = (
+                "Distinct master_replid values were observed. In cluster mode this can be expected across shards; "
+                "compare within each shard's primary/replica set."
+            )
+        else:
+            note = "Multiple master_replid values were observed in a non-cluster layout; investigate replication identity or failover history."
+        result.extend(["Replication identity notes:", f"- {note}", ""])
+    elif replication_ids:
+        result.extend(["Replication identity notes:", f"- master_replid values observed: {', '.join(sorted(set(replication_ids)))}.", ""])
+
+    if errors:
+        result.extend(["Skipped pods:", *(f"- {error}" for error in errors), ""])
+    result.append("No changes were made; this analysis is advisory only.")
+    return "\n".join(result)
+
+
 def _parse_config_get_value(output: str, name: str) -> Optional[str]:
     payload = _parse_redis_response(output)
     wanted = name.lower()
@@ -1410,6 +1960,271 @@ def _parse_config_get_value(output: str, name: str) -> Optional[str]:
                 ):
                     return _format_redis_value(pair[1])
     return None
+
+
+def _redis_record_from_value(value: Any) -> Optional[dict[str, Any]]:
+    """Normalize a Redis map or alternating RESP key/value record."""
+    if isinstance(value, dict):
+        return dict(value)
+    if not isinstance(value, (list, tuple)) or not value:
+        return None
+    if all(isinstance(item, (list, tuple)) and len(item) == 2 for item in value):
+        return {_format_redis_value(item[0]): item[1] for item in value}
+    if len(value) % 2 == 0 and not any(
+        isinstance(item, (list, tuple, dict)) for item in value
+    ):
+        return {_format_redis_value(value[index]): value[index + 1] for index in range(0, len(value), 2)}
+    return None
+
+
+def _redis_records_from_payload(payload: Any) -> list[dict[str, Any]]:
+    """Normalize a list of maps/RESP records from CLIENT LIST or Sentinel."""
+    if payload is None:
+        return []
+    if isinstance(payload, dict):
+        return [payload]
+    if not isinstance(payload, (list, tuple)):
+        return []
+    if not payload:
+        return []
+    records = [_redis_record_from_value(item) for item in payload]
+    if all(record is not None for record in records):
+        return records
+    single = _redis_record_from_value(payload)
+    return [single] if single else []
+
+
+def _parse_client_list(output: str) -> tuple[list[dict[str, Any]], Optional[str]]:
+    """Parse CLIENT LIST JSON, RESP bulk output, or newline key/value rows."""
+    try:
+        payload = _parse_redis_response(output)
+        records = _redis_records_from_payload(payload)
+    except Exception as exc:
+        return [], f"CLIENT LIST response could not be parsed: {exc}"
+    if records:
+        return records, None
+
+    text = _format_redis_value(payload)
+    records = []
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        try:
+            parts = shlex.split(line, posix=True)
+        except ValueError as exc:
+            return [], f"CLIENT LIST response could not be parsed: {exc}"
+        record: dict[str, Any] = {}
+        for part in parts:
+            if "=" not in part:
+                return [], "CLIENT LIST response is missing a key=value field."
+            key, value = part.split("=", 1)
+            record[key.strip().lower()] = value
+        if record:
+            records.append(record)
+    if not records:
+        return [], "CLIENT LIST response was empty or malformed."
+    return records, None
+
+
+def _client_record_value(record: dict[str, Any], name: str) -> Any:
+    for key, value in record.items():
+        if str(key).lower() == name:
+            return value
+    return None
+
+
+def _parse_output_buffer_limit(output: str) -> tuple[dict[str, dict[str, int]], Optional[str]]:
+    value = _parse_config_get_value(output, "client-output-buffer-limit")
+    if value is None:
+        return {}, "client-output-buffer-limit is unavailable."
+    if not isinstance(value, str):
+        value = _format_redis_value(value)
+    try:
+        parts = [int(part) for part in value.split()]
+    except (TypeError, ValueError):
+        return {}, f"client-output-buffer-limit response was malformed: {value}"
+    if len(parts) < 3 or len(parts) % 3:
+        return {}, f"client-output-buffer-limit response was malformed: {value}"
+    limits = {
+        parts[index].lower(): {
+            "hard_limit": parts[index + 1],
+            "soft_limit": parts[index + 2],
+            "soft_seconds": parts[index + 3],
+        }
+        for index in range(0, len(parts), 3)
+    }
+    return limits, None
+
+
+def _client_findings(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    grouped: dict[tuple[str, str], dict[str, Any]] = {}
+    for record in records:
+        name = str(_client_record_value(record, "name") or "")
+        address = str(_client_record_value(record, "addr") or "unknown")
+        key = (name, "name") if name else (address, "address")
+        group = grouped.setdefault(
+            key,
+            {
+                "identity": name or address,
+                "kind": "connection-name" if name else "address",
+                "addresses": set(),
+                "names": set(),
+                "ids": [],
+                "max_qbuf": 0,
+                "max_omem": 0,
+                "max_age": 0,
+                "max_idle": 0,
+                "subscriptions": 0,
+                "monitor": False,
+                "blocked": False,
+                "unnamed": False,
+            },
+        )
+        group["addresses"].add(address)
+        if name:
+            group["names"].add(name)
+        else:
+            group["unnamed"] = True
+        group["ids"].append(str(_client_record_value(record, "id") or "unknown"))
+
+        for source, field in (
+            ("qbuf", "max_qbuf"),
+            ("omem", "max_omem"),
+            ("age", "max_age"),
+            ("idle", "max_idle"),
+        ):
+            number = _redis_number(_client_record_value(record, source))
+            if number is not None:
+                group[field] = max(int(group[field]), int(number))
+
+        subs = sum(
+            int(_redis_number(_client_record_value(record, field)) or 0)
+            for field in ("sub", "psub", "ssub")
+            if _redis_number(_client_record_value(record, field)) is not None
+        )
+        group["subscriptions"] = max(int(group["subscriptions"]), subs)
+        flags = str(_client_record_value(record, "flags") or "").upper()
+        group["monitor"] = group["monitor"] or "O" in flags
+        group["blocked"] = group["blocked"] or "B" in flags
+
+    findings: list[dict[str, Any]] = []
+    for group in grouped.values():
+        reasons: list[str] = []
+        if group["max_qbuf"] >= _REDIS_CLIENT_QBUF_BYTES:
+            reasons.append(
+                f"qbuf reached {group['max_qbuf']} bytes; input is arriving faster than commands are processed"
+            )
+        if group["max_omem"] >= _REDIS_CLIENT_OMEM_BYTES:
+            reasons.append(
+                f"omem reached {group['max_omem']} bytes; output is queued faster than the client reads it"
+            )
+        if group["max_age"] >= _REDIS_CLIENT_LONG_AGE_SECONDS and group["max_idle"] >= _REDIS_CLIENT_IDLE_SECONDS:
+            reasons.append(
+                f"a connection is {group['max_age']}s old with up to {group['max_idle']}s idle"
+            )
+        if group["subscriptions"] >= _REDIS_CLIENT_HIGH_SUBSCRIPTIONS:
+            reasons.append(f"up to {group['subscriptions']} channel/pattern subscriptions")
+        if group["monitor"]:
+            reasons.append("a client is stuck in MONITOR mode")
+        if group["blocked"]:
+            reasons.append("a client is blocked in a blocking command")
+        if group["unnamed"]:
+            reasons.append("one or more connections have no CLIENT SETNAME")
+        if reasons:
+            impact = (
+                group["max_omem"] * 2
+                + group["max_qbuf"]
+                + (1000000 if group["monitor"] else 0)
+                + (500000 if group["blocked"] else 0)
+                + group["subscriptions"] * 100
+                + group["max_idle"]
+            )
+            findings.append({**group, "reasons": reasons, "impact": impact})
+    findings.sort(key=lambda item: (item["impact"], len(item["ids"])), reverse=True)
+    return findings
+
+
+def _parse_cluster_info(output: str) -> dict[str, Any]:
+    return _parse_info_sections(output)
+
+
+def _parse_cluster_id(output: str) -> Optional[str]:
+    payload = _parse_redis_response(output)
+    if payload is None:
+        return None
+    value = _format_redis_value(payload).strip().strip('"')
+    return value or None
+
+
+def _parse_cluster_slots(value: Any) -> list[tuple[int, int]]:
+    numbers = value if isinstance(value, (list, tuple)) else []
+    flat: list[int] = []
+    for item in numbers:
+        number = _redis_number(item)
+        if number is not None:
+            flat.append(int(number))
+    return [(flat[index], flat[index + 1]) for index in range(0, len(flat) - 1, 2)]
+
+
+def _parse_cluster_shards(output: str) -> tuple[list[dict[str, Any]], Optional[str]]:
+    try:
+        payload = _parse_redis_response(output)
+        shards = _redis_records_from_payload(payload)
+    except Exception as exc:
+        return [], f"CLUSTER SHARDS response could not be parsed: {exc}"
+    if not shards:
+        return [], "CLUSTER SHARDS response was empty or malformed."
+    normalized = []
+    for shard in shards:
+        nodes = shard.get("nodes", [])
+        if not isinstance(nodes, (list, tuple)):
+            nodes = [nodes]
+        parsed_nodes = []
+        for node in nodes:
+            parsed = _redis_record_from_value(node)
+            if parsed:
+                endpoint = parsed.get("endpoint")
+                port = parsed.get("port")
+                if isinstance(endpoint, (list, tuple)):
+                    endpoint_text = _format_redis_value(endpoint[:1]) if endpoint else ""
+                else:
+                    endpoint_text = _format_redis_value(endpoint)
+                parsed["endpoint"] = f"{endpoint_text}:{port}" if endpoint_text else ""
+                parsed_nodes.append(parsed)
+        slots = _parse_cluster_slots(shard.get("slots", []))
+        normalized.append({"slots": slots, "nodes": parsed_nodes})
+    if not any(shard["nodes"] for shard in normalized):
+        return [], "CLUSTER SHARDS response contained no usable node records."
+    return normalized, None
+
+
+def _parse_cluster_nodes(output: str) -> tuple[list[dict[str, str]], Optional[str]]:
+    text = _format_redis_value(_parse_redis_response(output))
+    nodes = []
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        fields = line.split()
+        if len(fields) < 8:
+            return [], "CLUSTER NODES response was malformed."
+        flags = set(fields[2].split(","))
+        role = "master" if "master" in flags else "replica" if "slave" in flags else "unknown"
+        nodes.append({"node_id": fields[0], "endpoint": fields[1], "role": role})
+    if not nodes:
+        return [], "CLUSTER NODES response was empty."
+    return nodes, None
+
+
+def _sentinel_value(record: dict[str, Any], name: str) -> Any:
+    for key, value in record.items():
+        if str(key).lower() == name:
+            return value
+    return None
+
+
+def _sentinel_flags(record: dict[str, Any]) -> set[str]:
+    raw = _format_redis_value(_sentinel_value(record, "flags") or "")
+    return {part.strip().lower() for part in raw.split(",") if part.strip()}
 
 
 def _parse_config_get_max_len(output: str) -> Optional[int]:

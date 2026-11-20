@@ -4,6 +4,7 @@ from .tools import (
     find_database_pods,
     get_mysql_query_plan,
     get_mysql_slow_queries,
+    get_redis_client_report,
     get_redis_latency_report,
     get_redis_memory_report,
     get_redis_slowlog,
@@ -28,6 +29,7 @@ Available tools:
 - get_redis_memory_report: Read INFO memory/stats/persistence and MEMORY STATS to explain memory pressure, eviction, fragmentation, and fork risks.
 - analyze_redis_bigkeys: Use the SCAN-based redis-cli/valkey-cli --bigkeys or --memkeys mode for one pod and report type/size evidence.
 - get_redis_latency_report: Read LATENCY HISTORY and LATENCY DOCTOR, then correlate latency with slowlog, memory, persistence, command rate, and event-loop evidence.
+- get_redis_client_report: Read CLIENT/replication/cluster/Sentinel evidence, group unhealthy client connections, and report topology-aware role attribution.
 
 For slow-query requests:
 1. If the user provides a namespace or pod, pass it directly. Otherwise search cluster-wide.
@@ -58,6 +60,13 @@ For Redis/Valkey memory and latency analysis:
 3. Use analyze_redis_bigkeys for type/size evidence. It requires one pod and uses only the CLI's SCAN-based --bigkeys or --memkeys mode; never request KEYS, a manual SCAN, DEBUG, or any mutation command.
 4. Use get_redis_latency_report for LATENCY HISTORY by event class, LATENCY DOCTOR, INFO stats, slowlog, and io-threads context. When io-threads is 1, explain the single event-loop context; when it is larger, avoid claiming I/O threads caused the latency without workload evidence.
 5. All recommendations must remain advisory, linked to observed evidence, and explicitly marked as not applied.
+
+For Redis/Valkey client and topology analysis:
+1. Prefer a namespace and pod. The tool re-reads INFO replication at execution time and never trusts role labels or cached topology.
+2. Use get_redis_client_report for connection pressure, qbuf/omem, long-lived or idle connections, MONITOR, blocked clients, subscriptions, maxclients, replica lag, backlog headroom, master_replid, CLUSTER shard layout, and Sentinel quorum.
+3. In cluster mode, remember that each master owns different slots; scan or report every shard master rather than assuming a single primary. Per-node findings are bounded but fan-out increases with shard count.
+4. The tool permits only fixed read-only commands: CLIENT LIST, CLIENT ID, selected INFO sections, CONFIG GET client-output-buffer-limit, selected CLUSTER read-only commands, and selected SENTINEL views.
+5. Keep recommendations advisory only and clearly say that nothing was changed.
 
 The tool reads Kubernetes pod logs by default for MySQL/MariaDB, which must have slow-query logging enabled and emit the slow log to the selected container's stdout/stderr. If logs are written only to a file inside the pod, the operator must allowlist an absolute path with DBA_ALLOWED_SLOW_LOG_PATHS (semicolon-separated) or set DBA_SLOW_LOG_FILE_PATH; the agent can then request a read-only tail of that file. Redis/Valkey slow-log inspection uses bounded pod/exec with valkey-cli or redis-cli. See docs/dba-rbac.md.""",
     tools=[
