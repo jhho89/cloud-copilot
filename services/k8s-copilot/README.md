@@ -70,12 +70,17 @@ Coordinates specialized sub-agents to solve complex troubleshooting workflows. U
 - `get_mysql_query_plan()` - Run `EXPLAIN` for a single read-only MySQL statement
 - `recommend_mysql_indexes()` - Analyze a MySQL query plan and suggest indexes without applying them
 - `get_redis_slowlog()` - Analyze Redis/Valkey `SLOWLOG` entries and command families
+- `get_redis_memory_report()` - Report memory pressure, eviction policy, fragmentation, persistence, and fork/COW evidence
+- `analyze_redis_bigkeys()` - Analyze large keys on one pod with SCAN-based `--bigkeys` or `--memkeys`
+- `get_redis_latency_report()` - Correlate `LATENCY` events with slowlog, memory, persistence, command rate, and IO-thread evidence
 
 Slow-query analysis reads the container's `stdout`/`stderr` by default. A read-only file mode is also available when an operator allowlists an absolute slow-log path; it uses a shell-free `tail` exec and emits audit metadata without SQL or credentials. See [docs/dba-rbac.md](../docs/dba-rbac.md) for RBAC, file prerequisites, and replica-selection guidance.
 
 For query-plan analysis, the database agent runs a validated `EXPLAIN` statement inside the MySQL/MariaDB pod and can use the result plus `SHOW INDEX` output to recommend indexes. It does not create or alter indexes.
 
 Redis and Valkey slow-log analysis uses `valkey-cli` when available, otherwise `redis-cli`, through direct argv pod/exec. It runs only `SLOWLOG GET`, `SLOWLOG LEN`, and `CONFIG GET slowlog-max-len`; destructive and maintenance commands are blocked. Passwords must already be available in the container environment (`REDISCLI_AUTH` or `VALKEYCLI_AUTH`) or via a mounted CLI configuration, never as command-line arguments.
+
+Redis and Valkey memory reports use the same CLI path with only `INFO memory`, `INFO stats`, `INFO persistence`, `INFO replication`, and `MEMORY STATS`. Latency reports add `LATENCY HISTORY` for selected event classes, `LATENCY DOCTOR`, `SLOWLOG`, and `CONFIG GET io-threads`. Big-key analysis requires one namespace/pod and invokes only `valkey-cli`/`redis-cli --bigkeys` or `--memkeys` (which use `SCAN` internally); it never runs `KEYS`, a manual `SCAN`, `DEBUG`, or a mutation command. All reports re-read `role` at execution time, label evidence by namespace/pod/role, and leave every recommendation unapplied.
 
 ---
 

@@ -1,8 +1,11 @@
 from google.adk.agents.llm_agent import Agent
 from .tools import (
+    analyze_redis_bigkeys,
     find_database_pods,
     get_mysql_query_plan,
     get_mysql_slow_queries,
+    get_redis_latency_report,
+    get_redis_memory_report,
     get_redis_slowlog,
     recommend_mysql_indexes,
 )
@@ -13,7 +16,7 @@ load_dotenv()
 DbaAgent = Agent(
     model="gemini-3.8-flash",
     name="dba_agent",
-    description="Database operations agent that inspects MySQL, MariaDB, Redis, and Valkey pods, analyzes slow queries, explains queries, and recommends indexes",
+    description="Database operations agent that inspects MySQL, MariaDB, Redis, and Valkey pods, analyzes slow queries and Redis memory/latency evidence, explains queries, and recommends indexes",
     instruction="""You are a database operations agent for MySQL, MariaDB, Redis, and Valkey databases running in Kubernetes.
 
 Available tools:
@@ -22,6 +25,9 @@ Available tools:
 - get_mysql_query_plan: Run EXPLAIN for one read-only SQL statement.
 - recommend_mysql_indexes: Analyze a query plan and existing indexes, then suggest indexes without applying them.
 - get_redis_slowlog: Read Redis/Valkey SLOWLOG data and report slow command families without changing configuration.
+- get_redis_memory_report: Read INFO memory/stats/persistence and MEMORY STATS to explain memory pressure, eviction, fragmentation, and fork risks.
+- analyze_redis_bigkeys: Use the SCAN-based redis-cli/valkey-cli --bigkeys or --memkeys mode for one pod and report type/size evidence.
+- get_redis_latency_report: Read LATENCY HISTORY and LATENCY DOCTOR, then correlate latency with slowlog, memory, persistence, command rate, and event-loop evidence.
 
 For slow-query requests:
 1. If the user provides a namespace or pod, pass it directly. Otherwise search cluster-wide.
@@ -46,6 +52,13 @@ For Redis and Valkey slow logs:
 4. Treat saturated slow logs as evidence that older entries may have been evicted. Compare SLOWLOG LEN with slowlog-max-len and say so explicitly.
 5. Keep recommendations advisory only and clearly say that nothing was changed.
 
+For Redis/Valkey memory and latency analysis:
+1. Prefer a namespace and pod. Every report re-reads the node's role from INFO replication and labels findings by namespace, pod, and role.
+2. Use get_redis_memory_report for maxmemory, eviction, fragmentation, allocator, persistence, and fork/COW evidence. It uses only INFO and MEMORY STATS.
+3. Use analyze_redis_bigkeys for type/size evidence. It requires one pod and uses only the CLI's SCAN-based --bigkeys or --memkeys mode; never request KEYS, a manual SCAN, DEBUG, or any mutation command.
+4. Use get_redis_latency_report for LATENCY HISTORY by event class, LATENCY DOCTOR, INFO stats, slowlog, and io-threads context. When io-threads is 1, explain the single event-loop context; when it is larger, avoid claiming I/O threads caused the latency without workload evidence.
+5. All recommendations must remain advisory, linked to observed evidence, and explicitly marked as not applied.
+
 The tool reads Kubernetes pod logs by default for MySQL/MariaDB, which must have slow-query logging enabled and emit the slow log to the selected container's stdout/stderr. If logs are written only to a file inside the pod, the operator must allowlist an absolute path with DBA_ALLOWED_SLOW_LOG_PATHS (semicolon-separated) or set DBA_SLOW_LOG_FILE_PATH; the agent can then request a read-only tail of that file. Redis/Valkey slow-log inspection uses bounded pod/exec with valkey-cli or redis-cli. See docs/dba-rbac.md.""",
     tools=[
         find_database_pods,
@@ -53,6 +66,9 @@ The tool reads Kubernetes pod logs by default for MySQL/MariaDB, which must have
         get_mysql_query_plan,
         recommend_mysql_indexes,
         get_redis_slowlog,
+        get_redis_memory_report,
+        analyze_redis_bigkeys,
+        get_redis_latency_report,
     ],
 )
 
