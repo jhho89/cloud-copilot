@@ -74,6 +74,9 @@ Coordinates specialized sub-agents to solve complex troubleshooting workflows. U
 - `analyze_redis_bigkeys()` - Analyze large keys on one pod with SCAN-based `--bigkeys` or `--memkeys`
 - `get_redis_latency_report()` - Correlate `LATENCY` events with slowlog, memory, persistence, command rate, and IO-thread evidence
 - `get_redis_client_report()` - Report client health, maxclients headroom, buffer pressure, replica lag, and topology
+- `get_redis_metrics_trends()` - Report metrics-backed hit rate, memory, eviction, client, and ops/sec trends when a Redis exporter/monitoring pipeline is discoverable
+- `get_redis_snapshot_diff()` - Compare two read-only INFO snapshots taken a bounded number of minutes apart
+- `get_redis_remediation_recommendations()` - Correlate read-only diagnostics into evidence-linked advisory changes
 
 Slow-query analysis reads the container's `stdout`/`stderr` by default. A read-only file mode is also available when an operator allowlists an absolute slow-log path; it uses a shell-free `tail` exec and emits audit metadata without SQL or credentials. See [docs/dba-rbac.md](../docs/dba-rbac.md) for RBAC, file prerequisites, and replica-selection guidance.
 
@@ -84,6 +87,8 @@ Redis and Valkey slow-log analysis uses `valkey-cli` when available, otherwise `
 Redis and Valkey memory reports use the same CLI path with only `INFO memory`, `INFO stats`, `INFO persistence`, `INFO replication`, and `MEMORY STATS`. Latency and client reports add `LATENCY HISTORY`, `LATENCY DOCTOR`, `SLOWLOG`, `CONFIG GET io-threads`, `CLIENT LIST`, `CLIENT ID`, `INFO clients`, `CONFIG GET client-output-buffer-limit`, selected `CLUSTER` topology commands, and selected `SENTINEL` views. Big-key analysis requires one namespace/pod and invokes only `valkey-cli`/`redis-cli --bigkeys` or `--memkeys` (which use `SCAN` internally); it never runs `KEYS`, a manual `SCAN`, `DEBUG`, or a mutation command. All reports re-read `role` at execution time, label evidence by namespace/pod/role, and leave every recommendation unapplied.
 
 The client report groups buffer-heavy, long-idle, subscription-heavy, MONITOR, and blocked clients by connection name or address, explains likely application-side causes, and surfaces replica lag/backlog headroom, Sentinel quorum and failover state, and cluster shard layout. Cluster mode still requires per-node/per-master evidence; the report explicitly calls out that fan-out rather than treating one shard as the cluster.
+
+Redis/Valkey trends prefer metrics. The trend tool can use an existing Google Managed Prometheus/GKE pipeline or a `redis_exporter`/`valkey-exporter` sidecar with scrape annotations; it does not use pod/exec as a trend fallback. A separate snapshot diff makes two read-only INFO reads a bounded number of minutes apart and reports memory, fragmentation, eviction, hit/miss, client, and ops deltas without storing credentials or raw output. Redis/Valkey tools preserve Markdown by default and support `output_mode="json"` with a stable envelope. See [docs/redis-valkey-dba.md](docs/redis-valkey-dba.md).
 
 ---
 
@@ -100,7 +105,7 @@ The client report groups buffer-heavy, long-idle, subscription-heavy, MONITOR, a
 │                  6 AI Agents (Gemini 3.8 Flash)               │
 │ kubernetes_copilot | diagnostic | investigator | dba |       │
 │ remediation                                                  │
-│ 21 tools total across all specialized agents                 │
+│ read-only diagnostic tools across specialized agents         │
 └────────────────────────┬─────────────────────────────────────┘
                          │
          ┌───────────────┼───────────────┐
@@ -169,6 +174,8 @@ Select an agent and ask questions:
 - "Explain this SQL query and recommend indexes"
 - "What indexes should I add for this SELECT query?"
 - "Show Redis slow commands in the cache namespace"
+- "Show Redis hit-rate and eviction trends for cache/cache-0"
+- "Compare Redis memory and fragmentation five minutes apart"
 
 ---
 

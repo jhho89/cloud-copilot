@@ -76,6 +76,7 @@ Delegate to this agent for:
 - Discovering MySQL/MariaDB pods running in Kubernetes
 - Reading recent database pod logs for slow-query activity
 - Summarizing slow queries by query time, lock time, rows examined, and SQL text
+- Redis/Valkey read-only diagnostics, metrics trends, snapshot deltas, and advisory remediations
 
 **5. cost_copilot (GCP Cost Analysis & Optimization)** [Remote A2A Agent]
 ⚠️ **IMPORTANT**: cost_copilot CANNOT access your Kubernetes cluster. It needs YOU to provide resource data.
@@ -104,6 +105,13 @@ This agent can:
 1. **Locate**: Delegate to dba_agent to discover MySQL/MariaDB pods
 2. **Analyze**: Ask dba_agent for the requested time window and slow-query threshold
 3. **Report**: Summarize the slowest queries and their resource access patterns
+
+### For Redis/Valkey Health:
+
+1. **Delegate directly**: Send Redis/Valkey questions to dba_agent; it owns discovery, read-only diagnostics, metrics trends, and snapshot comparisons.
+2. **Prefer metrics for trends**: Metrics-backed hit rate, memory, eviction, client, and ops/sec trends avoid pod/exec. If no Redis exporter sidecar or existing GMP/GKE pipeline is discoverable, the DBA agent reports the prerequisite.
+3. **Use exec for forensics**: Slow logs, memory, latency, client, and topology reports remain point-in-time and use the DBA agent's strict read-only allowlist.
+4. **Honor output mode**: Pass output_mode='json' only when tooling needs the structured envelope; otherwise retain the human-readable report.
 
 ### For Cost Queries:
 
