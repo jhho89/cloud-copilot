@@ -1,6 +1,6 @@
 # DBA agent read-only access
 
-The DBA agent is diagnostic-only. It does not execute application SQL, create or alter database objects, mutate pods, or restart workloads. For MySQL/MariaDB, `EXPLAIN` is the only query execution supported and destructive statements are rejected before execution. For Redis/Valkey, only the explicit slow-log commands below are allowed.
+The DBA agent is diagnostic-only. It does not execute application SQL, create or alter database objects, mutate pods, or restart workloads. For MySQL/MariaDB, `EXPLAIN` is the only query execution supported and destructive statements are rejected before execution. For Redis/Valkey, only the explicit read-only diagnostic commands below are allowed.
 
 ## Kubernetes RBAC
 
@@ -93,5 +93,21 @@ The blocked-command layer explicitly rejects `KEYS`, `DEBUG`, `CONFIG SET`, `LAT
 Password authentication must already be present in the selected container. Prefer `REDISCLI_AUTH` or `VALKEYCLI_AUTH` populated from a Kubernetes Secret, or mount a read-only CLI configuration if ACL or transport settings require one. The tool does not accept passwords, usernames, or authentication tokens as arguments and does not add credentials to argv. Pod environment values are inherited by `valkey-cli`/`redis-cli`; the tool itself does not read them.
 
 Redis/Valkey analysis performs four bounded pod/exec calls per selected pod: CLI detection with `--version`, `SLOWLOG GET`, `SLOWLOG LEN`, and `CONFIG GET slowlog-max-len`. Output is parsed as CLI JSON or RESP arrays, filtered by duration, sorted by total duration, and grouped by command family. Each entry is labeled with its pod and known role/topology. If `SLOWLOG LEN` equals `slowlog-max-len`, the report states that the slow log is saturated and older entries may have been evicted. All findings are advisory only; the tool changes no Redis or Valkey state.
+
+## Redis/Valkey memory, big-key, and latency mode
+
+Memory reports run the same known CLI with these allowlisted commands:
+
+- `INFO memory`
+- `INFO stats`
+- `INFO persistence`
+- `INFO replication`
+- `MEMORY STATS`
+
+Latency reports additionally allow `LATENCY HISTORY` for `command`, `expire-cycle`, `eviction-cycle`, `eviction-del`, `fork`, `aof-fsync`, and `rdb-save`, plus `LATENCY DOCTOR` and `CONFIG GET io-threads`. They correlate those events with slow-log, memory, command-rate, and persistence evidence. `io-threads` is context, not proof of causation.
+
+Big-key analysis requires one namespace and pod. It invokes `valkey-cli --bigkeys` or `--memkeys` (preferring Valkey), falling back to `redis-cli`; the CLI uses `SCAN` internally. The agent does not issue `KEYS`, a manual `SCAN`, `DEBUG`, or any mutation command. The exec timeout is bounded and the CLI is throttled with `-i 0.01` by default. Because the analyzer iterates the keyspace, use it on a selected node and avoid simultaneous scans of every replica.
+
+The tools re-read `INFO replication` at execution time. Reports label runtime role explicitly (including `unknown` when unavailable) and preserve namespace/pod attribution. Recommendations remain advisory; no memory setting, eviction policy, persistence setting, or key is changed.
 
 The shared pod/exec wrapper uses fixed argv, no stdin, no TTY, enabled stderr, a bounded request timeout, and the same audit event as MySQL file mode. The audit record does not include Redis commands, output, or credentials.

@@ -36,6 +36,16 @@ _BLOCKED_REDIS_COMMANDS = {
     "CLIENT KILL",
     "SHUTDOWN",
 }
+_REDIS_INFO_SECTIONS = {"memory", "stats", "persistence", "replication"}
+_REDIS_LATENCY_EVENT_CLASSES = {
+    "command",
+    "expire-cycle",
+    "eviction-cycle",
+    "eviction-del",
+    "fork",
+    "aof-fsync",
+    "rdb-save",
+}
 
 
 class SlowLogFileConfigError(ValueError):
@@ -594,7 +604,7 @@ def _validate_redis_command(command: object) -> list[str]:
     operation_key = " ".join(tokens[:2]).upper() if len(tokens) > 1 else operation
     if operation_key in _BLOCKED_REDIS_COMMANDS or operation in _BLOCKED_REDIS_COMMANDS:
         raise RedisCommandBlockedError(
-            "Blocked Redis command. This tool permits only the read-only slow-log commands."
+            "Blocked Redis command. This tool permits only selected read-only diagnostics."
         )
     if operation == "CONFIG" and len(tokens) > 1 and tokens[1].upper() != "GET":
         raise RedisCommandBlockedError(
@@ -615,17 +625,30 @@ def _validate_redis_command(command: object) -> list[str]:
         if requested_count < 1 or requested_count > 128:
             raise ValueError("SLOWLOG GET count must be between 1 and 128.")
         return tokens
+    if operation == "INFO" and (len(tokens) == 1 or (
+        len(tokens) == 2 and tokens[1].lower() in _REDIS_INFO_SECTIONS
+    )):
+        return tokens
+    if operation == "MEMORY" and len(tokens) == 2 and tokens[1].upper() == "STATS":
+        return tokens
+    if operation == "LATENCY" and len(tokens) == 2 and tokens[1].upper() == "DOCTOR":
+        return tokens
+    if operation == "LATENCY" and len(tokens) == 3 and tokens[1].upper() == "HISTORY":
+        event = tokens[2].lower()
+        if event in _REDIS_LATENCY_EVENT_CLASSES and re.fullmatch(r"[a-z0-9_-]+", event):
+            return tokens
     if (
         operation == "CONFIG"
         and len(tokens) == 3
         and tokens[1].upper() == "GET"
-        and tokens[2].lower() == "slowlog-max-len"
+        and tokens[2].lower() in {"slowlog-max-len", "io-threads"}
     ):
         return tokens
 
     raise RedisCommandNotAllowlistedError(
         "Redis command not allowlisted. This tool permits only SLOWLOG GET, "
-        "SLOWLOG LEN, and CONFIG GET slowlog-max-len."
+        "SLOWLOG LEN, selected INFO/MEMORY STATS/LATENCY diagnostics, and "
+        "CONFIG GET slowlog-max-len or io-threads."
     )
 
 
@@ -844,37 +867,6 @@ def _parse_integer_response(output: str) -> Optional[int]:
         return None
 
 
-def _parse_config_get_max_len(output: str) -> Optional[int]:
-    payload = _parse_redis_response(output)
-    if isinstance(payload, list):
-        if len(payload) == 2 and _format_redis_value(payload[0]).lower() == "slowlog-max-len":
-            candidate = payload[1]
-        elif payload and isinstance(payload[0], (list, tuple)):
-            for pair in payload:
-                if (
-                    isinstance(pair, (list, tuple))
-                    and len(pair) == 2
-                    and _format_redis_value(pair[0]).lower() == "slowlog-max-len"
-                ):
-                    candidate = pair[1]
-                    break
-            else:
-                return None
-        else:
-            return None
-        try:
-            return int(candidate)
-        except (TypeError, ValueError):
-            return None
-    if isinstance(payload, dict):
-        candidate = payload.get("slowlog-max-len")
-        try:
-            return int(candidate) if candidate is not None else None
-        except (TypeError, ValueError):
-            return None
-    return None
-
-
 def _redis_result_context(pod: client.V1Pod, cli: str) -> dict[str, str]:
     topology = _redis_topology_hints(pod)
     return {
@@ -889,8 +881,10 @@ def _redis_result_context(pod: client.V1Pod, cli: str) -> dict[str, str]:
 def _redis_context_label(context: dict[str, str]) -> str:
     label = f"{context['namespace']}/{context['pod']}"
     descriptors = []
+    if "runtime_role" in context:
+        descriptors.append(f"runtime-role={context.get('runtime_role') or 'unknown'}")
     if context.get("role"):
-        descriptors.append(f"role={context['role']}")
+        descriptors.append(f"metadata-role={context['role']}")
     if context.get("topology"):
         descriptors.append(context["topology"])
     if descriptors:
@@ -901,6 +895,805 @@ def _redis_context_label(context: dict[str, str]) -> str:
 def _redis_command_family(command: str) -> str:
     match = re.match(r"([A-Za-z]+)", command.strip())
     return match.group(1).upper() if match else "UNKNOWN"
+
+
+def _redis_pods_for_analysis(
+    v1: client.CoreV1Api,
+    namespace: Optional[str],
+    pod: Optional[str],
+) -> list[client.V1Pod]:
+    if pod:
+        return [v1.read_namespaced_pod(name=pod, namespace=namespace)]
+    if namespace:
+        pod_list = v1.list_namespaced_pod(namespace=namespace)
+    else:
+        pod_list = v1.list_pod_for_all_namespaces()
+    return [
+        candidate
+        for candidate in pod_list.items
+        if _pod_matches_database_type(candidate, "redis")
+        or _pod_matches_database_type(candidate, "valkey")
+    ]
+
+
+def _parse_info_sections(output: str) -> dict[str, Any]:
+    """Normalize JSON/RESP INFO output into a case-insensitive flat map."""
+    payload = _parse_redis_response(output)
+    fields: dict[str, Any] = {}
+
+    def collect(source: Any, section: Optional[str] = None) -> None:
+        if isinstance(source, dict):
+            for key, value in source.items():
+                key_text = _format_redis_value(key).lstrip("#").strip()
+                if isinstance(value, dict):
+                    collect(value, section)
+                else:
+                    fields[f"{section}:{key_text}".lower() if section else key_text.lower()] = value
+            return
+        if isinstance(source, (list, tuple)):
+            for item in source:
+                collect(item, section)
+            return
+        if isinstance(source, bytes):
+            source = source.decode("utf-8", errors="replace")
+        if not isinstance(source, str):
+            return
+        for line in source.splitlines():
+            if not line or line.startswith("#"):
+                continue
+            if ":" not in line:
+                continue
+            key, value = line.split(":", 1)
+            fields[key.strip().lower()] = value.strip()
+
+    collect(payload)
+    return fields
+
+
+def _redis_info_value(metrics: dict[str, Any], name: str) -> Any:
+    return metrics.get(name.lower())
+
+
+def _redis_number(value: Any) -> Optional[float]:
+    if isinstance(value, bool):
+        return float(value)
+    if isinstance(value, (int, float)):
+        return float(value)
+    if not isinstance(value, str):
+        return None
+    try:
+        return float(value.strip())
+    except ValueError:
+        return None
+
+
+def _read_redis_evidence(
+    namespace: str,
+    pod_name: str,
+    cli: str,
+    context: dict[str, str],
+    container: Optional[str] = None,
+    port: Optional[int] = None,
+) -> dict[str, Any]:
+    """Collect read-only INFO/MEMORY evidence and re-read runtime role."""
+    metrics: dict[str, Any] = {}
+    errors: list[str] = []
+    for section in ("memory", "stats", "persistence", "replication"):
+        try:
+            section_fields = _parse_info_sections(
+                _run_redis_command(
+                    namespace,
+                    pod_name,
+                    cli,
+                    ["INFO", section],
+                    container,
+                    port,
+                )
+            )
+            metrics.update(section_fields)
+        except Exception as exc:
+            errors.append(f"INFO {section}: {exc}")
+
+    try:
+        metrics.update(
+            _parse_info_sections(
+                _run_redis_command(
+                    namespace,
+                    pod_name,
+                    cli,
+                    ["MEMORY", "STATS"],
+                    container,
+                    port,
+                )
+            )
+        )
+    except Exception as exc:
+        errors.append(f"MEMORY STATS: {exc}")
+
+    runtime_role = _redis_info_value(metrics, "role")
+    context["runtime_role"] = str(runtime_role) if runtime_role else "unknown"
+    return {
+        "metrics": metrics,
+        "errors": errors,
+        "cli": cli,
+        "context": context,
+    }
+
+
+def _format_redis_evidence(metrics: dict[str, Any], evidence_errors: list[str]) -> list[str]:
+    memory_names = (
+        "used_memory_human",
+        "used_memory",
+        "maxmemory",
+        "maxmemory_human",
+        "maxmemory_policy",
+        "mem_fragmentation_ratio",
+        "mem_allocator",
+        "activedefrag_running",
+        "total_system_memory",
+    )
+    lines = ["Memory evidence (INFO memory):"]
+    shown = 0
+    for name in memory_names:
+        value = _redis_info_value(metrics, name)
+        if value is not None:
+            lines.append(f"- {name}: {value}")
+            shown += 1
+    if not shown:
+        lines.append("- unavailable")
+
+    stats_names = ("evicted_keys", "keyspace_misses", "keyspace_hits", "instantaneous_ops_per_sec")
+    lines.append("Command and keyspace evidence (INFO stats):")
+    shown = 0
+    for name in stats_names:
+        value = _redis_info_value(metrics, name)
+        if value is not None:
+            lines.append(f"- {name}: {value}")
+            shown += 1
+    if not shown:
+        lines.append("- unavailable")
+
+    persistence_names = (
+        "loading",
+        "rdb_bgsave_in_progress",
+        "rdb_last_bgsave_status",
+        "aof_enabled",
+        "aof_rewrite_in_progress",
+        "aof_last_bgrewrite_status",
+        "aof_last_write_status",
+        "latest_fork_usec",
+    )
+    lines.append("Persistence evidence (INFO persistence):")
+    shown = 0
+    for name in persistence_names:
+        value = _redis_info_value(metrics, name)
+        if value is not None:
+            lines.append(f"- {name}: {value}")
+            shown += 1
+    if not shown:
+        lines.append("- unavailable")
+
+    memory_stat_names = ("dataset.bytes", "fragmentation", "fragmentation.bytes", "keys.count")
+    lines.append("MEMORY STATS:")
+    shown = 0
+    for name in memory_stat_names:
+        value = _redis_info_value(metrics, name)
+        if value is not None:
+            lines.append(f"- {name}: {value}")
+            shown += 1
+    if not shown:
+        lines.append("- unavailable")
+    if evidence_errors:
+        lines.extend(["Unavailable/error responses: ", *(f"- {error}" for error in evidence_errors)])
+    return lines
+
+
+def _redis_memory_findings(metrics: dict[str, Any]) -> list[str]:
+    findings: list[str] = []
+    used = _redis_number(_redis_info_value(metrics, "used_memory"))
+    maxmemory = _redis_number(_redis_info_value(metrics, "maxmemory"))
+    policy = _redis_info_value(metrics, "maxmemory_policy")
+    policy_text = str(policy) if policy is not None else None
+    evicted = _redis_number(_redis_info_value(metrics, "evicted_keys"))
+
+    if maxmemory == 0:
+        findings.append(
+            "maxmemory=0 means the instance has no in-process limit; without a container "
+            "limit and eviction policy that safely applies, writes can drive unbounded memory growth."
+        )
+    elif maxmemory is not None and used is not None and maxmemory > 0:
+        ratio = used / maxmemory
+        state = "at or above" if ratio >= 1 else "approaching" if ratio >= 0.9 else "within"
+        findings.append(
+            f"used_memory is {ratio * 100:.1f}% of maxmemory ({state} the configured limit)."
+        )
+
+    if policy_text:
+        if policy_text == "noeviction":
+            findings.append(
+                "With noeviction, once the limit is reached writes fail instead of evicting data; "
+                "that can surface as application write errors before memory stops growing."
+            )
+        elif policy_text.startswith("volatile-"):
+            findings.append(
+                f"Policy {policy_text} considers only keys with an expiry; keys without TTL can still "
+                "prevent effective eviction and drive writes toward failure."
+            )
+        elif policy_text.startswith("allkeys-random"):
+            findings.append(
+                f"Policy {policy_text} evicts without recency evidence and can discard hot data."
+            )
+        elif policy_text.startswith("allkeys-"):
+            findings.append(
+                f"Policy {policy_text} can evict any key under pressure; confirm callers tolerate that."
+            )
+
+    if evicted is not None and evicted > 0:
+        findings.append(
+            f"evicted_keys={int(evicted)} is direct evidence that eviction has occurred; "
+            "check whether misses or missing values followed it."
+        )
+
+    fragmentation = _redis_number(_redis_info_value(metrics, "mem_fragmentation_ratio"))
+    if fragmentation is not None:
+        if fragmentation >= 1.5:
+            findings.append(
+                f"mem_fragmentation_ratio={fragmentation:g} is high; resident memory is materially "
+                "above logical used_memory, so deleting keys may not immediately return RSS."
+            )
+        elif fragmentation < 1:
+            findings.append(
+                f"mem_fragmentation_ratio={fragmentation:g} is below 1; resident memory is lower than "
+                "logical usage, which can indicate swapping or compressed/shared pages and should be checked."
+            )
+    allocator = _redis_info_value(metrics, "mem_allocator")
+    defrag_running = _redis_number(_redis_info_value(metrics, "activedefrag_running"))
+    if allocator and str(allocator).lower() != "jemalloc":
+        findings.append(
+            f"mem_allocator={allocator} does not provide the same active-defrag behavior as jemalloc."
+        )
+    if defrag_running == 1:
+        findings.append("activedefrag_running=1 shows active defragmentation is currently running.")
+
+    fork_usec = _redis_number(_redis_info_value(metrics, "latest_fork_usec"))
+    if fork_usec is not None and fork_usec > 0:
+        findings.append(
+            f"latest_fork_usec={int(fork_usec)} ({fork_usec / 1000:.1f}ms) shows fork cost; "
+            "copy-on-write can also spike resident memory during persistence."
+        )
+    rdb_running = _redis_number(_redis_info_value(metrics, "rdb_bgsave_in_progress"))
+    aof_rewrite = _redis_number(_redis_info_value(metrics, "aof_rewrite_in_progress"))
+    if rdb_running == 1 or aof_rewrite == 1:
+        findings.append(
+            "A background save or AOF rewrite is in progress; expect possible fork and "
+            "copy-on-write memory overhead until it finishes."
+        )
+    return findings
+
+
+def _parse_bigkeys_output(output: str) -> tuple[list[dict[str, Any]], Optional[int]]:
+    """Parse redis-cli --bigkeys/--memkeys summaries without running a scan."""
+    findings: dict[str, dict[str, Any]] = {}
+    pattern = re.compile(
+        r"(?im)Biggest\s+([a-z]+)\s+(?:(?:seen|found)(?:\s+so far)?|so far)\s+"
+        r"'(.*)'\s+has\s+(\d+)\s+(bytes|items|members|fields|elements|entries)"
+    )
+    for match in pattern.finditer(output):
+        key_type = match.group(1).lower()
+        size = int(match.group(3))
+        current = findings.get(key_type)
+        if current is None or size > int(current["size"]):
+            findings[key_type] = {
+                "key_type": key_type,
+                "key": match.group(2),
+                "size": size,
+                "size_unit": match.group(4).lower(),
+            }
+
+    sampled_match = re.search(r"(?im)Sampled\s+(\d+)\s+keys", output)
+    sampled = int(sampled_match.group(1)) if sampled_match else None
+    return list(findings.values()), sampled
+
+
+def analyze_redis_bigkeys(
+    namespace: Optional[str] = None,
+    pod: Optional[str] = None,
+    mode: str = "bigkeys",
+    container: Optional[str] = None,
+    port: Optional[int] = None,
+    sample_interval_seconds: float = 0.01,
+) -> str:
+    """Analyze large keys with redis-cli/valkey-cli SCAN-based --bigkeys/--memkeys.
+
+    This never invokes `KEYS`, a manual `SCAN`, `DEBUG`, or a mutation command.
+    A namespace and pod are required to keep the O(N) SCAN bounded to one node.
+    """
+    if not namespace or not pod:
+        return (
+            "A namespace and pod are required for big-key analysis so the O(N) "
+            "SCAN-based CLI remains bounded to a single node."
+        )
+    if mode not in {"bigkeys", "memkeys"}:
+        return "Invalid mode: use 'bigkeys' or 'memkeys'."
+    try:
+        interval = float(sample_interval_seconds)
+    except (TypeError, ValueError):
+        return "Invalid sample_interval_seconds: use a non-negative number of seconds."
+    if interval < 0 or interval > 1:
+        return "Invalid sample_interval_seconds: use a value between 0 and 1."
+
+    try:
+        v1 = _load_kubernetes_client()
+        pod_item = v1.read_namespaced_pod(name=pod, namespace=namespace)
+        context = _redis_result_context(pod_item, "")
+        cli = _detect_redis_cli(namespace, pod, container)
+        role_error = ""
+        try:
+            replication = _parse_info_sections(
+                _run_redis_command(namespace, pod, cli, ["INFO", "replication"], container, port)
+            )
+            runtime_role = _redis_info_value(replication, "role")
+            context["runtime_role"] = str(runtime_role) if runtime_role else "unknown"
+        except Exception as exc:
+            context["runtime_role"] = "unknown"
+            role_error = str(exc)
+
+        interval_text = f"{interval:.3f}".rstrip("0").rstrip(".")
+        argv = [cli, f"--{mode}"]
+        if interval_text:
+            argv.extend(["-i", interval_text])
+        output = _pod_exec(
+            namespace,
+            pod,
+            argv,
+            container,
+            "redis_scan_based_key_analysis",
+            timeout_seconds=120,
+        )
+        findings, sampled = _parse_bigkeys_output(output)
+    except Exception as exc:
+        return f"Error analyzing Redis/Valkey big keys in {namespace}/{pod}: {exc}"
+
+    result = [
+        f"Redis/Valkey big-key analysis ({mode}; SCAN-based) for {_redis_context_label(context)}:",
+        f"- CLI: {cli}",
+        f"- Runtime role: {context.get('runtime_role') or 'unknown'}",
+        *(
+            [f"- Role evidence unavailable: {role_error}"]
+            if context.get("runtime_role") == "unknown" and role_error
+            else []
+        ),
+        f"- Keys sampled by the CLI: {sampled if sampled is not None else 'unknown'}",
+        "- Method: the CLI performed its own SCAN-based sampling; no KEYS, manual SCAN, "
+        "DEBUG, or mutation command was issued.",
+        "",
+    ]
+    if not findings:
+        result.extend(
+            [
+                "No type/size summaries were parsed from the CLI output.",
+                "Raw CLI evidence (truncated):",
+                "```text",
+                output.strip()[-4000:],
+                "```",
+            ]
+        )
+    else:
+        findings.sort(key=lambda finding: (int(finding["size"]), finding["key_type"]), reverse=True)
+        result.extend(["Type/size evidence:", ""])
+        for finding in findings:
+            result.append(
+                f"- {finding['key_type']}: key `{finding['key']}` has "
+                f"{finding['size']} {finding['size_unit']}"
+            )
+
+    result.extend(
+        [
+            "",
+            "O(N) risk notes:",
+            "- The analyzer itself iterates the keyspace and can add load on a large dataset.",
+            "- Large lists, sets, sorted sets, hashes, and streams can turn type-specific reads, "
+            "deletes, or expire work into O(N) or multi-key operations.",
+            "- Size alone does not prove a problem; compare with access patterns before changing data.",
+            "",
+            "Recommendations are advisory only. No KEYS, manual SCAN, DEBUG, or mutation command was used.",
+            "No changes were made; this analysis is advisory only.",
+        ]
+    )
+    return "\n".join(result)
+
+
+def get_redis_memory_report(
+    namespace: Optional[str] = None,
+    pod: Optional[str] = None,
+    container: Optional[str] = None,
+    port: Optional[int] = None,
+) -> str:
+    """Report Redis/Valkey memory, eviction, fragmentation, and fork evidence.
+
+    Uses only `INFO memory`, `INFO stats`, `INFO persistence`,
+    `INFO replication`, and `MEMORY STATS`; recommendations are advisory.
+    """
+    if pod and not namespace:
+        return "A namespace is required when pod is specified."
+    try:
+        v1 = _load_kubernetes_client()
+        pods = _redis_pods_for_analysis(v1, namespace, pod)
+    except Exception as exc:
+        return f"Error discovering or reading Redis/Valkey pods: {exc}"
+    if not pods:
+        return (
+            "No Redis or Valkey pods found. Use find_database_pods first "
+            "to confirm the labels and namespace."
+        )
+
+    sections: list[str] = []
+    errors: list[str] = []
+    for pod_item in pods:
+        context = _redis_result_context(pod_item, "")
+        label = f"{context['namespace']}/{context['pod']}"
+        try:
+            cli = _detect_redis_cli(context["namespace"], context["pod"], container)
+            evidence = _read_redis_evidence(
+                context["namespace"],
+                context["pod"],
+                cli,
+                context,
+                container,
+                port,
+            )
+            metrics = evidence["metrics"]
+            evidence_errors = evidence["errors"]
+            has_memory_evidence = any(
+                name in metrics
+                for name in (
+                    "used_memory_human",
+                    "used_memory",
+                    "maxmemory",
+                    "maxmemory_policy",
+                    "mem_fragmentation_ratio",
+                    "dataset.bytes",
+                    "fragmentation",
+                )
+            )
+            section = [f"### {label} (CLI: {cli})", f"- {_redis_context_label(context)}"]
+            section.extend(_format_redis_evidence(metrics, evidence_errors))
+            if has_memory_evidence:
+                section.extend(["", "Evidence interpretation:"])
+                findings = _redis_memory_findings(metrics)
+                if findings:
+                    section.extend(f"- {finding}" for finding in findings)
+                else:
+                    section.append("- No pressure, eviction, fragmentation, or persistence threshold was crossed.")
+            else:
+                section.extend(
+                    [
+                        "",
+                        "Evidence interpretation: memory evidence is unavailable, so pressure and "
+                        "eviction behavior cannot be assessed.",
+                    ]
+                )
+            section.extend(
+                [
+                    "",
+                    "Recommendations are advisory and evidence-linked; they have not been applied.",
+                    "",
+                ]
+            )
+            sections.append("\n".join(section))
+        except Exception as exc:
+            errors.append(f"{label}: {exc}")
+
+    result = [f"Redis/Valkey memory analysis: {len(sections)} pod(s) reported.", ""]
+    result.extend("\n".join(sections).splitlines())
+    if errors:
+        result.extend(["Skipped pods:", *(f"- {error}" for error in errors), ""])
+    result.append("No changes were made; this analysis is advisory only.")
+    return "\n".join(result)
+
+
+def _parse_config_get_value(output: str, name: str) -> Optional[str]:
+    payload = _parse_redis_response(output)
+    wanted = name.lower()
+    if isinstance(payload, dict):
+        candidate = payload.get(wanted) or payload.get(name)
+        return _format_redis_value(candidate) if candidate is not None else None
+    if isinstance(payload, list):
+        if len(payload) == 2 and _format_redis_value(payload[0]).lower() == wanted:
+            return _format_redis_value(payload[1])
+        if payload and isinstance(payload[0], (list, tuple)):
+            for pair in payload:
+                if (
+                    isinstance(pair, (list, tuple))
+                    and len(pair) == 2
+                    and _format_redis_value(pair[0]).lower() == wanted
+                ):
+                    return _format_redis_value(pair[1])
+    return None
+
+
+def _parse_config_get_max_len(output: str) -> Optional[int]:
+    value = _parse_config_get_value(output, "slowlog-max-len")
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _parse_latency_history(output: str) -> list[dict[str, Any]]:
+    payload = _parse_redis_response(output)
+    if not payload:
+        return []
+    if isinstance(payload, list) and len(payload) == 2 and not any(
+        isinstance(value, list) for value in payload
+    ):
+        payload = [payload]
+    if not isinstance(payload, list):
+        return []
+    events = []
+    for entry in payload:
+        if not isinstance(entry, (list, tuple)) or len(entry) < 2:
+            continue
+        try:
+            timestamp = int(_format_redis_value(entry[0]))
+            duration_ms = float(_format_redis_value(entry[1]))
+        except (TypeError, ValueError):
+            continue
+        events.append({"timestamp": timestamp, "duration_ms": duration_ms})
+    return events
+
+
+def _redis_slowlog_snapshot(
+    namespace: str,
+    pod_name: str,
+    cli: str,
+    context: dict[str, str],
+    container: Optional[str] = None,
+    port: Optional[int] = None,
+) -> dict[str, Any]:
+    try:
+        raw_entries = _parse_slowlog_entries(
+            _run_redis_command(
+                namespace,
+                pod_name,
+                cli,
+                ["SLOWLOG", "GET", "25"],
+                container,
+                port,
+            )
+        )
+        entries = [
+            parsed
+            for parsed in (_parse_slowlog_entry(entry, context) for entry in raw_entries)
+            if parsed is not None
+        ]
+        slowlog_len = _parse_integer_response(
+            _run_redis_command(namespace, pod_name, cli, ["SLOWLOG", "LEN"], container, port)
+        )
+        max_len = _parse_config_get_max_len(
+            _run_redis_command(
+                namespace,
+                pod_name,
+                cli,
+                ["CONFIG", "GET", "slowlog-max-len"],
+                container,
+                port,
+            )
+        )
+        saturated = slowlog_len is not None and max_len is not None and max_len > 0 and slowlog_len == max_len
+        return {"entries": entries, "length": slowlog_len, "max_len": max_len, "saturated": saturated, "error": None}
+    except Exception as exc:
+        return {"entries": [], "length": None, "max_len": None, "saturated": False, "error": str(exc)}
+
+
+def _redis_latency_correlations(
+    histories: dict[str, list[dict[str, Any]]],
+    metrics: dict[str, Any],
+    slowlog: dict[str, Any],
+) -> list[str]:
+    correlations: list[str] = []
+    def event_count(event: str) -> int:
+        return len(histories.get(event, []))
+
+    fork_usec = _redis_number(_redis_info_value(metrics, "latest_fork_usec"))
+    if event_count("fork"):
+        context = f" and latest_fork_usec={int(fork_usec)}" if fork_usec is not None else ""
+        correlations.append(f"Fork history is present{context}; compare with save/rewrite timing before attribution.")
+    evicted = _redis_number(_redis_info_value(metrics, "evicted_keys"))
+    maxmemory = _redis_number(_redis_info_value(metrics, "maxmemory"))
+    if event_count("eviction-cycle") or event_count("eviction-del"):
+        if evicted is not None and evicted > 0 and maxmemory == 0:
+            correlations.append("Eviction history plus evicted_keys>0 suggests pressure despite maxmemory=0 (a cluster-limit case).")
+        elif evicted is not None and evicted > 0:
+            correlations.append("Eviction history and evicted_keys>0 align with a memory-pressure/eviction path.")
+        else:
+            correlations.append("Eviction history exists, but current evicted_keys does not prove it was recent.")
+    expired = _redis_number(_redis_info_value(metrics, "expired_keys"))
+    if event_count("expire-cycle"):
+        if expired is not None:
+            correlations.append(
+                f"Expire-cycle history is present while INFO stats reports expired_keys={int(expired)}."
+            )
+        else:
+            correlations.append("Expire-cycle history is present, but expired_keys evidence is unavailable.")
+    ops = _redis_number(_redis_info_value(metrics, "instantaneous_ops_per_sec"))
+    if event_count("command"):
+        if ops is not None:
+            correlations.append(
+                f"Command latency history is present at instantaneous_ops_per_sec={ops:g}."
+            )
+        else:
+            correlations.append("Command latency history is present, but the current command rate is unavailable.")
+    if (event_count("rdb-save") or event_count("aof-fsync")) and slowlog.get("entries"):
+        families = sorted({_redis_command_family(entry.command) for entry in slowlog["entries"]})
+        correlations.append(
+            "Persistence latency history and slow-log families "
+            f"({', '.join(families)}) are both present; compare timestamps before attributing command delay."
+        )
+    return correlations
+
+
+def get_redis_latency_report(
+    namespace: Optional[str] = None,
+    pod: Optional[str] = None,
+    container: Optional[str] = None,
+    port: Optional[int] = None,
+) -> str:
+    """Correlate LATENCY evidence with memory, persistence, command, and slowlog data."""
+    if pod and not namespace:
+        return "A namespace is required when pod is specified."
+    try:
+        v1 = _load_kubernetes_client()
+        pods = _redis_pods_for_analysis(v1, namespace, pod)
+    except Exception as exc:
+        return f"Error discovering or reading Redis/Valkey pods: {exc}"
+    if not pods:
+        return (
+            "No Redis or Valkey pods found. Use find_database_pods first "
+            "to confirm the labels and namespace."
+        )
+
+    sections: list[str] = []
+    errors: list[str] = []
+    for pod_item in pods:
+        context = _redis_result_context(pod_item, "")
+        label = f"{context['namespace']}/{context['pod']}"
+        try:
+            cli = _detect_redis_cli(context["namespace"], context["pod"], container)
+            evidence = _read_redis_evidence(
+                context["namespace"], context["pod"], cli, context, container, port
+            )
+            metrics = evidence["metrics"]
+            histories: dict[str, list[dict[str, Any]]] = {}
+            latency_errors: list[str] = []
+            for event_class in sorted(_REDIS_LATENCY_EVENT_CLASSES):
+                try:
+                    histories[event_class] = _parse_latency_history(
+                        _run_redis_command(
+                            context["namespace"],
+                            context["pod"],
+                            cli,
+                            ["LATENCY", "HISTORY", event_class],
+                            container,
+                            port,
+                        )
+                    )
+                except Exception as exc:
+                    latency_errors.append(f"LATENCY HISTORY {event_class}: {exc}")
+            try:
+                doctor_output = _run_redis_command(
+                    context["namespace"], context["pod"], cli, ["LATENCY", "DOCTOR"], container, port
+                )
+                doctor_value = _parse_redis_response(doctor_output)
+                doctor = doctor_value.strip() if isinstance(doctor_value, str) else str(doctor_value or "")
+            except Exception as exc:
+                doctor = ""
+                latency_errors.append(f"LATENCY DOCTOR: {exc}")
+            try:
+                io_threads_output = _run_redis_command(
+                    context["namespace"], context["pod"], cli, ["CONFIG", "GET", "io-threads"], container, port
+                )
+                io_threads_text = _parse_config_get_value(io_threads_output, "io-threads")
+                io_threads = int(io_threads_text) if io_threads_text is not None else None
+                io_threads_error = ""
+            except Exception as exc:
+                io_threads = None
+                io_threads_error = str(exc)
+
+            slowlog = _redis_slowlog_snapshot(
+                context["namespace"], context["pod"], cli, context, container, port
+            )
+            if slowlog.get("error"):
+                latency_errors.append(f"SLOWLOG: {slowlog['error']}")
+
+            section = [f"### {label} (CLI: {cli})", f"- {_redis_context_label(context)}"]
+            section.extend(_format_redis_evidence(metrics, evidence["errors"]))
+            section.extend(["", "LATENCY HISTORY evidence:"])
+            has_events = False
+            for event_class in sorted(_REDIS_LATENCY_EVENT_CLASSES):
+                events = histories.get(event_class, [])
+                if events:
+                    has_events = True
+                    latest = max(events, key=lambda item: item["timestamp"])
+                    logged_at = datetime.fromtimestamp(latest["timestamp"], timezone.utc).isoformat()
+                    section.append(
+                        f"- {event_class}: {len(events)} event(s); latest {latest['duration_ms']:.3f}ms at {logged_at}"
+                    )
+                else:
+                    section.append(f"- {event_class}: no events")
+            if not has_events:
+                section.append("- No latency events were recorded in the queried classes.")
+            section.extend(["", "LATENCY DOCTOR evidence:"])
+            if doctor:
+                section.extend(["```text", doctor, "```"])
+            else:
+                section.append("- unavailable or empty")
+            if latency_errors:
+                section.extend(["Latency evidence errors:", *(f"- {error}" for error in latency_errors)])
+
+            section.extend(["", "Slow-log correlation:"])
+            if slowlog.get("error"):
+                section.append(f"- unavailable: {slowlog['error']}")
+            else:
+                entries = slowlog["entries"]
+                section.append(f"- {len(entries)} slow-log entr(ies); length/max: {slowlog['length']}/{slowlog['max_len']}")
+                if slowlog.get("saturated"):
+                    section.append("- Slow log is saturated; older entries may have been evicted.")
+                if entries:
+                    family_summary: dict[str, dict[str, float]] = {}
+                    for entry in entries:
+                        family = _redis_command_family(entry.command)
+                        summary = family_summary.setdefault(family, {"count": 0, "total_ms": 0.0})
+                        summary["count"] += 1
+                        summary["total_ms"] += entry.duration_ms
+                    ordered = sorted(family_summary.items(), key=lambda item: item[1]["total_ms"], reverse=True)
+                    section.append(
+                        "- Families: "
+                        + ", ".join(
+                            f"{name} ({data['count']} entries, {data['total_ms']:.3f}ms)"
+                            for name, data in ordered
+                        )
+                    )
+
+            section.extend(["", "Event-loop and Valkey IO-thread context:"])
+            if io_threads is None:
+                if io_threads_error:
+                    section.append(f"- io-threads: unavailable ({io_threads_error})")
+                else:
+                    section.append("- io-threads: unavailable")
+            elif io_threads <= 1:
+                section.append("- io-threads=1: client I/O and command execution share one event loop.")
+            else:
+                section.append(
+                    f"- io-threads={io_threads}: I/O may be distributed, but command work and event-loop "
+                    "attribution still require workload evidence; this value does not prove a cause."
+                )
+
+            correlations = _redis_latency_correlations(histories, metrics, slowlog)
+            section.extend(["", "Evidence-linked correlations:"])
+            if correlations:
+                section.extend(f"- {item}" for item in correlations)
+            else:
+                section.append("- None proven by the available evidence.")
+            section.extend(
+                [
+                    "",
+                    "Recommendations are advisory and evidence-linked; they have not been applied.",
+                    "No changes were made; this analysis is advisory only.",
+                    "",
+                ]
+            )
+            sections.append("\n".join(section))
+        except Exception as exc:
+            errors.append(f"{label}: {exc}")
+
+    result = [f"Redis/Valkey latency forensics: {len(sections)} pod(s) reported.", ""]
+    result.extend("\n".join(sections).splitlines())
+    if errors:
+        result.extend(["Skipped pods:", *(f"- {error}" for error in errors), ""])
+    return "\n".join(result)
 
 
 def get_redis_slowlog(
