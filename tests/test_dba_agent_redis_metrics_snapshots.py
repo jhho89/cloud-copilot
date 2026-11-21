@@ -105,7 +105,8 @@ def test_monitoring_series_normalizes_labels_and_sorts_samples(monkeypatch) -> N
             return [descriptor, other]
 
         def list_time_series(self, request):
-            assert request["filter"] == 'metric.type = "prometheus.googleapis.com/redis_memory_used_bytes/gauge"'
+            assert request["filter"].startswith('metric.type = "prometheus.googleapis.com/redis_memory_used_bytes/gauge" AND ')
+            assert 'one_of("cache")' in request["filter"]
             return [wrong_target, series]
 
     monkeypatch.setattr(idle_metrics, "load_cloud_monitoring_client", lambda: MonitoringClient())

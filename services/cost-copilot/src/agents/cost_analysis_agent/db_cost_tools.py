@@ -100,16 +100,24 @@ def parse_idle_assessment(raw: str | dict[str, Any]) -> dict[str, Any]:
         prefix = f"data.workloads[{index}]"
         if not isinstance(workload, dict):
             raise IdleAssessmentError(f"{prefix} must be an object")
-        for field in ("namespace", "pod", "db_type", "node_name", "controller_name", "controller_type", "classification"):
+        for field in ("namespace", "pod", "db_type", "classification"):
             _require_text(workload.get(field), f"{prefix}.{field}")
+        # An unscheduled or bare pod legitimately has no node or controller.
+        for field in ("node_name", "controller_name", "controller_type"):
+            if not isinstance(workload.get(field), str):
+                raise IdleAssessmentError(f"{prefix}.{field} must be a string")
         metrics = workload.get("metrics")
         if not isinstance(metrics, dict):
             raise IdleAssessmentError(f"{prefix}.metrics must be an object")
-        _require_number(metrics.get("p95_work_per_second"), f"{prefix}.metrics.p95_work_per_second")
-        _require_number(metrics.get("mean_active_threads"), f"{prefix}.metrics.mean_active_threads")
-        for field in ("p95_cpu_fraction", "zero_work_hour_ratio"):
-            _require_number(metrics.get(field), f"{prefix}.metrics.{field}", 0.0)
-            if float(metrics[field]) > 1.0:
+        # DBA emits null for evidence it could not collect (no exporter, or no
+        # thread metric for Redis); the key itself must still be present.
+        for field in ("p95_work_per_second", "mean_active_threads", "p95_cpu_fraction", "zero_work_hour_ratio"):
+            if field not in metrics:
+                raise IdleAssessmentError(f"{prefix}.metrics.{field} is required")
+            if metrics[field] is None:
+                continue
+            _require_number(metrics[field], f"{prefix}.metrics.{field}", 0.0)
+            if field in {"p95_cpu_fraction", "zero_work_hour_ratio"} and float(metrics[field]) > 1.0:
                 raise IdleAssessmentError(f"{prefix}.metrics.{field} must be between 0 and 1")
         if not isinstance(workload.get("risks", []), list):
             raise IdleAssessmentError(f"{prefix}.risks must be an array")
@@ -179,23 +187,44 @@ def _monthly(amount: float, days: int) -> float:
     return round(amount * _month_factor(days), 6)
 
 
+def _cluster_pin(metadata: dict[str, Any]) -> dict[str, str]:
+    kubernetes = metadata.get("kubernetes")
+    if not isinstance(kubernetes, dict):
+        return {}
+    return {
+        key: kubernetes[key]
+        for key in ("cluster", "cluster_location")
+        if isinstance(kubernetes.get(key), str) and kubernetes[key].strip()
+    }
+
+
 def _match_workload_rows(
-    rows: list[dict[str, Any]], workload: dict[str, Any], project_id: str
+    rows: list[dict[str, Any]], workload: dict[str, Any], project_id: str, metadata: dict[str, Any] | None = None
 ) -> list[dict[str, Any]]:
     workload_names = {workload["controller_name"], workload["pod"]}
+    pin = _cluster_pin(metadata or {})
     return [
         row
         for row in rows
         if row.get("project") == project_id
         and _is_labeled(row.get("cluster"))
+        and all(row.get(key) == value for key, value in pin.items())
         and row.get("namespace") == workload["namespace"]
         and row.get("workload") in workload_names
         and row.get("workload_type") == workload["controller_type"]
     ]
 
 
+def _spans_multiple_clusters(rows: list[dict[str, Any]]) -> bool:
+    return len({(row.get("cluster"), row.get("cluster_location")) for row in rows}) > 1
+
+
 def _attribution_from_rows(
-    rows: list[dict[str, Any]], workload: dict[str, Any], project_id: str, days: int
+    rows: list[dict[str, Any]],
+    workload: dict[str, Any],
+    project_id: str,
+    days: int,
+    metadata: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     if not rows:
         return {
@@ -205,7 +234,16 @@ def _attribution_from_rows(
         }
 
     currencies = sorted({str(row.get("currency")) for row in rows if row.get("currency")})
-    workload_rows = _match_workload_rows(rows, workload, project_id)
+    workload_rows = _match_workload_rows(rows, workload, project_id, metadata)
+    if _spans_multiple_clusters(workload_rows):
+        return {
+            "status": "unavailable",
+            "reason": (
+                "workload name matches billing rows in more than one GKE cluster; "
+                "set DBA_GKE_CLUSTER_NAME and DBA_GKE_CLUSTER_LOCATION so costs are not summed across clusters"
+            ),
+            "currencies": currencies,
+        }
     if not workload_rows:
         return {
             "status": "unavailable",
@@ -295,13 +333,32 @@ def _nested(metadata: dict[str, Any], workload: dict[str, Any], key: str) -> dic
     return next((value for value in candidates if isinstance(value, dict)), {})
 
 
+def _cost_review_eligible(workload: dict[str, Any]) -> bool:
+    """Prefer DBA's explicit flag; the evidence string depends on a configurable annotation name."""
+    flag = workload.get("cost_review_eligible")
+    if isinstance(flag, bool):
+        return flag
+    return workload.get("eligibility_evidence") == ELIGIBILITY_EVIDENCE
+
+
+def _zero_work_ratio(workload: dict[str, Any]) -> float:
+    value = workload["metrics"].get("zero_work_hour_ratio")
+    return float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else 0.0
+
+
+def _workload_node_pool(workload: dict[str, Any]) -> Any:
+    kubernetes = workload.get("kubernetes")
+    if isinstance(kubernetes, dict) and kubernetes.get("node_pool"):
+        return kubernetes["node_pool"]
+    return workload.get("node_pool")
+
+
 def _approved_idle_hours(workload: dict[str, Any], metadata: dict[str, Any]) -> float | None:
     for source in (_nested(metadata, workload, "cost_review"), workload):
         if "approved_idle_hours" in source:
             return min(MONTH_HOURS, max(0.0, _require_number(source["approved_idle_hours"], "approved_idle_hours")))
-    if workload.get("eligibility_evidence") == ELIGIBILITY_EVIDENCE:
-        ratio = float(workload["metrics"]["zero_work_hour_ratio"])
-        return MONTH_HOURS * ratio
+    if _cost_review_eligible(workload):
+        return MONTH_HOURS * _zero_work_ratio(workload)
     return None
 
 
@@ -324,7 +381,7 @@ def _autopilot_scenario(compute: dict[str, Any], workload: dict[str, Any], metad
     ratio = approved / MONTH_HOURS
     currency = compute["monthly_cost"]["currency"]
     savings = round(compute["monthly_cost"]["amount"] * ratio, 6)
-    zero_ratio = float(workload["metrics"]["zero_work_hour_ratio"])
+    zero_ratio = _zero_work_ratio(workload)
     return {
         "name": "autopilot_idle_scale_down",
         "status": "estimate" if zero_ratio >= 0.99 else "conditional",
@@ -381,19 +438,22 @@ def _standard_scenario(compute: dict[str, Any], workload: dict[str, Any], metada
 
     node_cost = _amount(evidence.get("node_monthly_cost"))
     currency = _currency_or_empty(compute)
-    if node_cost is None:
+    node_pool = _workload_node_pool(workload)
+    if node_cost is None and _is_labeled(node_pool):
+        pin = _cluster_pin(metadata)
         pool_rows = [
             row
             for row in rows
             if row.get("project") == metadata["project_id"]
-            and row.get("node_pool") == workload.get("node_pool")
+            and row.get("node_pool") == node_pool
             and row.get("currency") == currency
+            and all(row.get(key) == value for key, value in pin.items())
         ]
         pool_total = sum(_amount(row.get("total_cost")) or 0.0 for row in pool_rows)
         node_count = evidence.get("node_count")
-        if isinstance(node_count, int) and not isinstance(node_count, bool) and node_count > 0:
-            node_cost = pool_total / node_count
-    if node_cost is None:
+        if pool_total > 0 and isinstance(node_count, int) and not isinstance(node_count, bool) and node_count > 0:
+            node_cost = _monthly(pool_total, days) / node_count
+    if node_cost is None or node_cost <= 0:
         return {
             "name": "node_consolidation",
             "status": "requires_evidence",
@@ -423,7 +483,9 @@ def _schedule_scenario(compute: dict[str, Any], workload: dict[str, Any], metada
         missing.append("approved off-hours")
     if not schedule:
         missing.append("scheduled_shutdown evidence")
-    if compute["status"] != "available" or approved is None:
+    if compute["status"] != "available" or approved is None or not schedule:
+        # An estimate without a schedule would present off-hours as planned
+        # when nobody has defined them.
         return {
             "name": "scheduled_shutdown",
             "status": "requires_evidence",
@@ -468,7 +530,9 @@ def _schedule_scenario(compute: dict[str, Any], workload: dict[str, Any], metada
     }
 
 
-def _decommission_scenario(compute: dict[str, Any], workload: dict[str, Any]) -> dict[str, Any]:
+def _decommission_scenario(
+    compute: dict[str, Any], workload: dict[str, Any], distribution: Any, node_scenario: dict[str, Any] | None
+) -> dict[str, Any]:
     if compute["status"] != "available":
         return {
             "name": "permanent_decommission",
@@ -476,11 +540,31 @@ def _decommission_scenario(compute: dict[str, Any], workload: dict[str, Any]) ->
             "monthly_savings": {"currency": "", "amount": 0.0},
             "missing_evidence": ["compute attribution"],
         }
-    review = workload.get("eligibility_evidence") == ELIGIBILITY_EVIDENCE
+    if distribution == "Standard":
+        # Attributed Standard compute is a share of nodes that stay allocated
+        # unless the node-consolidation evidence says a node can be removed.
+        if node_scenario is None or node_scenario.get("status") != "estimate":
+            return {
+                "name": "permanent_decommission",
+                "status": "requires_evidence",
+                "monthly_savings": {"currency": "", "amount": 0.0},
+                "missing_evidence": ["node_pool_consolidation evidence for removable nodes"],
+                "note": "Standard GKE compute is not savings unless a node can be removed.",
+            }
+        savings = copy.deepcopy(node_scenario["monthly_savings"])
+    elif distribution == "Autopilot":
+        savings = copy.deepcopy(compute["monthly_cost"])
+    else:
+        return {
+            "name": "permanent_decommission",
+            "status": "requires_evidence",
+            "monthly_savings": {"currency": "", "amount": 0.0},
+            "missing_evidence": ["kubernetes.distribution (Autopilot or Standard)"],
+        }
     return {
         "name": "permanent_decommission",
-        "status": "requires_approval" if not review else "estimate",
-        "monthly_savings": compute["monthly_cost"],
+        "status": "requires_approval" if not _cost_review_eligible(workload) else "estimate",
+        "monthly_savings": savings,
         "note": "Only marginal compute is savings. Persistent storage, backups, snapshots, load balancers, and static IPs remain.",
     }
 
@@ -490,7 +574,10 @@ def _confidence(attribution: dict[str, Any], missing_metrics: list[str], scenari
         return "unavailable"
     if days < 7 or attribution.get("status") == "partial" or missing_metrics:
         return "low"
-    if any(scenario.get("status") in {"requires_evidence", "requires_approval", "no_savings"} for scenario in scenarios):
+    if any(
+        scenario.get("status") in {"requires_evidence", "requires_approval", "no_savings", "not_recommended"}
+        for scenario in scenarios
+    ):
         return "medium"
     if days >= 14:
         return "high"
@@ -512,26 +599,40 @@ def _model_workload(
     """Model one workload in isolation so currency and attribution stay separate."""
     metadata = envelope["metadata"]
     project_id = metadata["project_id"]
-    attribution = _attribution_from_rows(rows, workload, project_id, days)
-    workload_rows = _match_workload_rows(rows, workload, project_id)
+    attribution = _attribution_from_rows(rows, workload, project_id, days, metadata)
+    workload_rows = _match_workload_rows(rows, workload, project_id, metadata)
+    if _spans_multiple_clusters(workload_rows):
+        workload_rows = []
     compute = _compute_cost(workload_rows, days)
     protected = _protected_costs(workload_rows, days)
 
     distribution = metadata.get("kubernetes", {}).get("distribution") if isinstance(metadata.get("kubernetes"), dict) else None
     scenarios: list[dict[str, Any]] = []
-    if distribution == "Autopilot":
-        scenarios.append(_autopilot_scenario(compute, workload, metadata, days))
-    elif distribution == "Standard":
-        scenarios.append(_standard_scenario(compute, workload, metadata, rows, days))
-    else:
+    primary: dict[str, Any] | None = None
+    if workload["classification"] != "candidate":
+        # Savings are modeled only for workloads DBA judged safe to review.
         scenarios.append({
-            "name": "workload_attribution",
-            "status": "requires_evidence",
+            "name": "not_a_candidate",
+            "status": "not_recommended",
             "monthly_savings": {"currency": "", "amount": 0.0},
-            "missing_evidence": ["kubernetes.distribution (Autopilot or Standard)"],
+            "missing_evidence": [],
+            "note": f"DBA classified this workload as {workload['classification']}; no savings are modeled.",
         })
-    scenarios.append(_schedule_scenario(compute, workload, metadata, days))
-    scenarios.append(_decommission_scenario(compute, workload))
+    else:
+        if distribution == "Autopilot":
+            primary = _autopilot_scenario(compute, workload, metadata, days)
+        elif distribution == "Standard":
+            primary = _standard_scenario(compute, workload, metadata, rows, days)
+        else:
+            primary = {
+                "name": "workload_attribution",
+                "status": "requires_evidence",
+                "monthly_savings": {"currency": "", "amount": 0.0},
+                "missing_evidence": ["kubernetes.distribution (Autopilot or Standard)"],
+            }
+        scenarios.append(primary)
+        scenarios.append(_schedule_scenario(compute, workload, metadata, days))
+        scenarios.append(_decommission_scenario(compute, workload, distribution, primary if distribution == "Standard" else None))
 
     missing_evidence = _merge_missing_evidence(scenarios)
     if attribution["status"] == "unavailable":

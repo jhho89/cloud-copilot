@@ -336,3 +336,117 @@ def test_billing_client_uses_application_default_credentials(monkeypatch):
     monkeypatch.setattr(billing.bigquery, "Client", fake_client)
     billing.get_billing_client()
     assert created == {"arguments": ("billing-project", None)}
+
+
+# --- Regression tests for review blockers -----------------------------------
+
+
+def _envelope(**workload_overrides):
+    envelope = deepcopy(ENVELOPE)
+    envelope["data"]["workloads"][0].update(workload_overrides)
+    return envelope
+
+
+def _scenario(result, name):
+    return next(item for item in result["remediation_scenarios"] if item["name"] == name)
+
+
+def test_null_metrics_and_bare_pods_are_accepted():
+    envelope = _envelope(controller_name="", controller_type="", node_name="")
+    envelope["data"]["workloads"][0]["metrics"].update(
+        p95_work_per_second=None, mean_active_threads=None, p95_cpu_fraction=None, zero_work_hour_ratio=None
+    )
+    parse_idle_assessment(envelope)
+    result = build_idle_cost_result(envelope, [_row()], 30)
+    assert result["workloads"][0]["billing_attribution"]["status"] == "unavailable"
+
+
+def test_missing_metric_key_is_still_rejected():
+    envelope = _envelope()
+    del envelope["data"]["workloads"][0]["metrics"]["p95_cpu_fraction"]
+    with pytest.raises(db_cost_tools.IdleAssessmentError):
+        parse_idle_assessment(envelope)
+
+
+def test_explicit_eligibility_flag_is_honoured_over_evidence_string():
+    envelope = _envelope(eligibility_evidence="annotation=eligible", cost_review_eligible=True)
+    envelope["metadata"]["kubernetes"] = {"distribution": "Autopilot"}
+    result = build_idle_cost_result(envelope, [_row(service="Kubernetes Engine", sku="Autopilot Pod mCPU", cost=100.0)], 30)
+    assert _scenario(result, "autopilot_idle_scale_down")["status"] == "estimate"
+    assert _scenario(result, "permanent_decommission")["status"] == "estimate"
+    envelope["data"]["workloads"][0]["cost_review_eligible"] = False
+    result = build_idle_cost_result(envelope, [_row(service="Kubernetes Engine", sku="Autopilot Pod mCPU", cost=100.0)], 30)
+    assert _scenario(result, "autopilot_idle_scale_down")["status"] == "requires_evidence"
+
+
+def test_standard_node_pool_is_read_from_the_dba_kubernetes_block():
+    envelope = _envelope(kubernetes={"node_pool": "pool-1"})
+    del envelope["metadata"]["node_pool_consolidation"]["node_monthly_cost"]
+    envelope["metadata"]["node_pool_consolidation"]["node_count"] = 2
+    result = build_idle_cost_result(envelope, [_row(cost=200.0)], 30)
+    scenario = _scenario(result, "node_consolidation")
+    assert scenario["status"] == "estimate"
+    assert scenario["monthly_savings"]["amount"] == 100.0
+
+
+def test_standard_node_cost_without_pool_rows_requires_evidence_not_zero():
+    envelope = _envelope(kubernetes={"node_pool": "unknown-pool"})
+    del envelope["metadata"]["node_pool_consolidation"]["node_monthly_cost"]
+    envelope["metadata"]["node_pool_consolidation"]["node_count"] = 2
+    result = build_idle_cost_result(envelope, [_row(cost=200.0)], 30)
+    assert _scenario(result, "node_consolidation")["status"] == "requires_evidence"
+
+
+@pytest.mark.parametrize("classification", ["active", "blocked"])
+def test_non_candidates_get_no_savings_scenarios(classification):
+    result = build_idle_cost_result(_envelope(classification=classification), [_row()], 30)
+    scenarios = result["workloads"][0]["remediation_scenarios"]
+    assert [item["status"] for item in scenarios] == ["not_recommended"]
+    assert scenarios[0]["monthly_savings"]["amount"] == 0.0
+    assert result["workloads"][0]["confidence"] != "high"
+
+
+def test_standard_decommission_is_only_savings_when_a_node_can_be_removed():
+    envelope = _envelope()
+    result = build_idle_cost_result(envelope, [_row(cost=20.0)], 30)
+    assert _scenario(result, "permanent_decommission")["status"] in {"estimate", "requires_approval"}
+    assert _scenario(result, "permanent_decommission")["monthly_savings"]["amount"] == 50.0
+    envelope["metadata"]["node_pool_consolidation"]["other_non_daemonset_workloads"] = 3
+    result = build_idle_cost_result(envelope, [_row(cost=20.0)], 30)
+    decommission = _scenario(result, "permanent_decommission")
+    assert decommission["status"] == "requires_evidence"
+    assert decommission["monthly_savings"]["amount"] == 0.0
+
+
+def test_decommission_requires_known_distribution():
+    envelope = _envelope()
+    del envelope["metadata"]["kubernetes"]
+    result = build_idle_cost_result(envelope, [_row()], 30)
+    assert _scenario(result, "permanent_decommission")["status"] == "requires_evidence"
+
+
+def test_scheduled_shutdown_needs_schedule_evidence():
+    envelope = _envelope()
+    del envelope["metadata"]["scheduled_shutdown"]
+    result = build_idle_cost_result(envelope, [_row()], 30)
+    scenario = _scenario(result, "scheduled_shutdown")
+    assert scenario["status"] == "requires_evidence"
+    assert "scheduled_shutdown evidence" in scenario["missing_evidence"]
+
+
+def test_same_workload_in_two_clusters_is_not_summed():
+    rows = [_row(cluster="prod-cluster", cost=20.0), _row(cluster="staging-cluster", cost=30.0)]
+    result = build_idle_cost_result(_envelope(), rows, 30)
+    workload = result["workloads"][0]
+    assert workload["billing_attribution"]["status"] == "unavailable"
+    assert "more than one GKE cluster" in workload["billing_attribution"]["detail"]["reason"]
+    assert workload["compute_cost"]["status"] == "unavailable"
+
+
+def test_cluster_pin_selects_one_cluster():
+    envelope = _envelope()
+    envelope["metadata"]["kubernetes"].update(cluster="staging-cluster", cluster_location="us-central1")
+    rows = [_row(cluster="prod-cluster", cost=20.0), _row(cluster="staging-cluster", cost=30.0)]
+    workload = build_idle_cost_result(envelope, rows, 30)["workloads"][0]
+    assert workload["billing_attribution"]["status"] == "available"
+    assert workload["observed_cost"]["amount"] == 30.0

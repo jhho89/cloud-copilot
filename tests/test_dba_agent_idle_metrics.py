@@ -25,6 +25,13 @@ from cost_analysis_agent import db_cost_tools  # noqa: E402
 END_TIME = datetime(2026, 1, 3, 12, 0, tzinfo=timezone.utc)
 
 
+@pytest.fixture(autouse=True)
+def _short_window_and_no_baseline(monkeypatch):
+    # The production minimum window is 7 days; the fixtures only carry 2 days of samples.
+    monkeypatch.setenv("DBA_IDLE_ASSESSMENT_MIN_DAYS", "1")
+    monkeypatch.setenv("DBA_IDLE_MIN_DATA_COVERAGE", "0")
+
+
 def _timestamp(day: int, hour: int, minute: int = 0) -> datetime:
     return datetime(2026, 1, day, hour, minute, tzinfo=timezone.utc)
 
@@ -52,7 +59,7 @@ def _database_profile_pod(
     persistent: bool = False,
     owner: str = "platform-data",
     environment: str = "staging",
-    role: str = "",
+    role: str = "primary",
     pod_name: str | None = None,
 ) -> SimpleNamespace:
     images = {"mysql": "mysql:8.0", "mariadb": "mariadb:11", "redis": "redis:7", "valkey": "valkey/valkey:8.0"}
@@ -264,8 +271,9 @@ def _assessment_fixtures(
     persistent: bool = False,
     owner: str = "platform-data",
     environment: str = "staging",
-    role: str = "",
+    role: str = "primary",
     with_backup: bool = True,
+    backup_active: bool = False,
     series: dict[str, list[SimpleNamespace]] | None = None,
 ):
     pod = _database_profile_pod(
@@ -283,7 +291,10 @@ def _assessment_fixtures(
         backup = SimpleNamespace(
             metadata=SimpleNamespace(name=f"{db_type}-backup", namespace="database", labels={}),
             spec=SimpleNamespace(schedule="0 2 * * *"),
-            status=SimpleNamespace(last_schedule_time=END_TIME - timedelta(hours=2)),
+            status=SimpleNamespace(
+                last_schedule_time=END_TIME - timedelta(hours=2),
+                active=[SimpleNamespace(name=f"{db_type}-backup-123")] if backup_active else [],
+            ),
         )
     profile_series = series if series is not None else _profile_series(db_type)
     monitoring = FakeMonitoringApi({**profile_series, **_gke_series()})
@@ -555,6 +566,7 @@ def test_not_eligible_and_active_backup_block_candidate(monkeypatch) -> None:
         eligible=False,
         role="primary",
         persistent=True,
+        backup_active=True,
     )
 
     workload = payload["data"]["workloads"][0]
@@ -616,3 +628,240 @@ def test_assessment_only_reads_kubernetes_and_cloud_monitoring() -> None:
     assert not any(term in source for term in forbidden)
     signature = inspect.signature(idle_metrics.collect_database_idle_assessment)
     assert not any(name in {"credential", "password", "token", "secret"} for name in signature.parameters)
+
+
+# --- Regression tests for review blockers -----------------------------------
+
+
+def _pod(name="mysql-0", namespace="database", labels=None, containers=None, owner=("StatefulSet", "mysql")):
+    return SimpleNamespace(
+        metadata=SimpleNamespace(
+            name=name,
+            namespace=namespace,
+            labels=labels or {},
+            annotations={},
+            owner_references=[SimpleNamespace(kind=owner[0], name=owner[1], controller=True)],
+        ),
+        spec=SimpleNamespace(
+            node_name="n1",
+            containers=containers
+            or [SimpleNamespace(name="database", image="mysql:8"), SimpleNamespace(name="metrics", image="prom/mysqld-exporter")],
+            volumes=[],
+        ),
+    )
+
+
+def test_database_containers_excludes_exporter_sidecar() -> None:
+    pod = _pod(containers=[SimpleNamespace(name="metrics", image="prom/mysqld-exporter"), SimpleNamespace(name="database", image="mysql:8")])
+    assert [container.name for container in idle_metrics._database_containers(pod, "mysql")] == ["database"]
+
+
+def test_exporter_only_pod_is_not_a_database_workload() -> None:
+    pod = _pod(name="mysql-exporter-abc", containers=[SimpleNamespace(name="exporter", image="prom/mysqld-exporter")])
+    assert not idle_metrics._matches_profile(pod, "mysql")
+    assert idle_metrics._matches_profile(_pod(), "mysql")
+
+
+def test_metric_labels_require_matching_namespace_and_pod() -> None:
+    targets = [("a", "mysql-0")]
+    assert idle_metrics.metric_matches_target({"namespace": "a", "pod": "mysql-0"}, targets)
+    assert not idle_metrics.metric_matches_target({"namespace": "b", "pod": "mysql-0"}, targets)
+    assert not idle_metrics.metric_matches_target({"pod": "mysql-0"}, targets)
+
+
+def test_exporter_sidecar_series_are_attributed_to_the_pod(monkeypatch) -> None:
+    series = _profile_series("mysql")
+    for entries in series.values():
+        entries[0].metric.labels["container"] = "metrics"
+    raw, payload = _run_assessment(monkeypatch, "mysql", series=series)
+    workload = payload["data"]["workloads"][0]
+    assert workload["metrics_prerequisite"] == "none"
+    assert workload["classification"] == "candidate"
+
+
+def test_only_highest_priority_alias_is_used_per_logical_metric(monkeypatch) -> None:
+    queries = "prometheus.googleapis.com/mysql_global_status_queries/counter"
+    questions = "prometheus.googleapis.com/mysql_global_status_questions/counter"
+    points_a = [_point(_timestamp(1, hour, minute), 1000 + hour * 60 + minute) for hour in range(3) for minute in (0, 30)]
+    points_b = [_point(_timestamp(1, hour, minute), 900 + hour * 60 + minute) for hour in range(3) for minute in (0, 30)]
+    monitoring = FakeMonitoringApi(
+        {queries: [_series("database", "mysql-0", points=points_a)], questions: [_series("database", "mysql-0", points=points_b)]}
+    )
+    monkeypatch.setattr(idle_metrics, "load_cloud_monitoring_client", lambda: monitoring)
+    profile = idle_metrics.DATABASE_PROFILES["mysql"]
+    metrics = idle_metrics.read_monitoring_series(
+        "p", _timestamp(1, 0), _timestamp(2, 0), [("database", "mysql-0")], profile.aliases, profile.kinds
+    )
+    assert metrics["work_total"]["metric_type"] == queries
+    assert monitoring.series_calls == 1
+    assert idle_metrics.aggregate_hourly(metrics["work_total"], _timestamp(1, 0), _timestamp(2, 0))["restarts"] == 0
+
+
+def test_counter_series_with_distinct_labels_do_not_look_like_resets() -> None:
+    samples = []
+    for minute in range(0, 60, 10):
+        samples.append(idle_metrics.MetricSample(_timestamp(1, 0, minute), 1000 + minute, {"command": "select"}))
+        samples.append(idle_metrics.MetricSample(_timestamp(1, 0, minute), 10 + minute, {"command": "insert"}))
+    samples.sort(key=lambda sample: sample.timestamp)
+    aggregate = idle_metrics.aggregate_hourly({"kind": "counter", "samples": samples}, _timestamp(1, 0), _timestamp(1, 1))
+    assert aggregate["restarts"] == 0
+    assert aggregate["values"] == [pytest.approx(2 * 10 / 600)]
+
+
+def test_proto_plus_unset_value_is_not_read_as_zero() -> None:
+    monitoring_v3 = pytest.importorskip("google.cloud.monitoring_v3")
+    interval = {"end_time": _timestamp(1, 0)}
+    int_point = monitoring_v3.Point({"interval": interval, "value": {"int64_value": 7}})
+    empty_point = monitoring_v3.Point({"interval": interval})
+    assert [sample.value for sample in idle_metrics.parse_metric_samples([int_point])] == [7.0]
+    assert idle_metrics.parse_metric_samples([empty_point]) == []
+
+
+def test_sparse_window_is_blocked_not_candidate() -> None:
+    profile = idle_metrics.DATABASE_PROFILES["mysql"]
+    metrics = {key: {"samples": [1]} for key in profile.required_metrics}
+    thresholds = {**idle_metrics.classification_thresholds(), "min_data_coverage": 0.8}
+    work = {"p95": 0.0, "zero_work_hour_ratio": 1.0, "restarts": 0, "hours_with_data": 2, "data_gaps": 334}
+    classification, reasons = idle_metrics._classification(profile, metrics, work, 1.0, 0.0, thresholds, [])
+    assert classification == "blocked"
+    assert any("coverage" in reason for reason in reasons)
+
+
+def test_missing_cpu_evidence_blocks_candidacy() -> None:
+    profile = idle_metrics.DATABASE_PROFILES["redis"]
+    metrics = {key: {"samples": [1]} for key in profile.required_metrics}
+    work = {"p95": 0.0, "zero_work_hour_ratio": 1.0, "restarts": 0}
+    classification, reasons = idle_metrics._classification(profile, metrics, work, None, None, idle_metrics.classification_thresholds(), [])
+    assert classification == "blocked"
+    assert any("CPU" in reason for reason in reasons)
+
+
+def test_mysql_threads_running_baseline_of_one_is_not_activity() -> None:
+    profile = idle_metrics.DATABASE_PROFILES["mysql"]
+    metrics = {key: {"samples": [1]} for key in profile.required_metrics}
+    work = {"p95": 0.0, "zero_work_hour_ratio": 1.0, "restarts": 0}
+    thresholds = idle_metrics.classification_thresholds()
+    idle, _ = idle_metrics._classification(profile, metrics, work, 1.0, 0.0, thresholds, [])
+    busy, _ = idle_metrics._classification(profile, metrics, work, 3.0, 0.0, thresholds, [])
+    assert idle == "candidate"
+    assert busy == "active"
+
+
+def test_exporter_baseline_is_subtracted_from_work_rate(monkeypatch) -> None:
+    profile = idle_metrics.DATABASE_PROFILES["redis"]
+    samples = [idle_metrics.MetricSample(_timestamp(1, minute // 60, minute % 60), 0.3 * minute * 60) for minute in range(0, 240, 10)]
+    metrics = {"work_total": {"kind": "counter", "samples": samples}}
+    start, end = _timestamp(1, 0), _timestamp(1, 4)
+    assert idle_metrics._work_evidence(metrics, profile, start, end)["zero_work_hour_ratio"] == 0.0
+    assert idle_metrics._work_evidence(metrics, profile, start, end, baseline=0.3)["zero_work_hour_ratio"] == 1.0
+
+
+def test_unlabeled_role_blocks_but_labeled_primary_with_backup_can_be_candidate(monkeypatch) -> None:
+    _, unlabeled = _run_assessment(monkeypatch, "mysql", role="")
+    assert unlabeled["data"]["workloads"][0]["classification"] == "blocked"
+    assert "role_unknown" in unlabeled["data"]["workloads"][0]["risks"]
+    _, primary = _run_assessment(monkeypatch, "mysql", role="primary")
+    assert primary["data"]["workloads"][0]["classification"] == "candidate"
+
+
+def test_backup_cronjobs_must_belong_to_the_database() -> None:
+    profile = idle_metrics.DATABASE_PROFILES["mysql"]
+
+    def cron(name, suspend=False, active=0):
+        return SimpleNamespace(
+            metadata=SimpleNamespace(name=name, namespace="database", labels={}),
+            spec=SimpleNamespace(schedule="0 2 * * *", suspend=suspend),
+            status=SimpleNamespace(last_schedule_time=None, active=[object()] * active),
+        )
+
+    labels = {"app.kubernetes.io/name": "orders-db"}
+    other_database = cron("postgres-backup")
+    evidence, known, active = idle_metrics._backup_evidence([other_database], "database", labels, "primary", profile, "orders-db")
+    assert (evidence["cronjobs"], known, active) == ([], False, False)
+    suspended = cron("orders-db-backup", suspend=True)
+    _, known, _ = idle_metrics._backup_evidence([suspended], "database", labels, "primary", profile, "orders-db")
+    assert known is False
+    running = cron("orders-db-backup", active=1)
+    _, known, active = idle_metrics._backup_evidence([running], "database", labels, "primary", profile, "orders-db")
+    assert (known, active) == (True, True)
+
+
+def test_owner_ignores_helm_managed_by_and_environment_uses_whole_tokens() -> None:
+    pod = _pod(labels={"app.kubernetes.io/managed-by": "Helm"})
+    assert idle_metrics._owner_and_environment(pod, {}, "payments")[0] == ""
+    assert idle_metrics._owner_and_environment(pod, {}, "latest-orders")[1] == ""
+    assert idle_metrics._owner_and_environment(pod, {}, "backstage")[1] == ""
+    assert idle_metrics._owner_and_environment(pod, {}, "orders-staging")[1] == "non-production"
+    assert idle_metrics._owner_and_environment(pod, {}, "orders-prod")[1] == "production"
+    assert idle_metrics._owner_and_environment(_pod(labels={"env": "PRD"}), {}, "payments")[1] == "production"
+    risks = idle_metrics._risk_fields(idle_metrics.DATABASE_PROFILES["mysql"], "payments", "t", "prod", "primary", False, True, 0, "annotation", "eligible")
+    assert "production_environment" in risks
+
+
+def test_deployment_pods_report_the_deployment_not_the_replicaset() -> None:
+    pod = _pod(labels={"pod-template-hash": "7d9f8c6b5"}, owner=("ReplicaSet", "redis-7d9f8c6b5"))
+    assert idle_metrics._controller_context(pod) == ("Deployment", "redis")
+    assert idle_metrics._controller_context(_pod(owner=("StatefulSet", "mysql"))) == ("StatefulSet", "mysql")
+
+
+def test_no_matching_pods_is_not_reported_as_missing_exporter(monkeypatch) -> None:
+    monkeypatch.setattr(idle_metrics, "_load_kubernetes_client", lambda: FakeCoreApi([]))
+    monkeypatch.setattr(idle_metrics, "load_cloud_monitoring_client", lambda: FakeMonitoringApi({}))
+    monkeypatch.setattr(idle_metrics.client, "BatchV1Api", lambda: FakeBatchApi([]))
+    payload = json.loads(idle_metrics.collect_database_idle_assessment("mysql", namespace="database", days=2, project_id="p"))
+    assert payload["metadata"]["metrics_prerequisite"] == "none"
+    assert payload["data"]["workloads"] == []
+
+
+def test_missing_metrics_are_reported_per_workload(monkeypatch) -> None:
+    pods = [_database_profile_pod("mysql", True, pod_name="mysql-0"), _database_profile_pod("mysql", True, pod_name="mysql-1")]
+    series = _profile_series("mysql")  # only mysql-0 has series
+    monitoring = FakeMonitoringApi({**series, **_gke_series()})
+    monkeypatch.setattr(idle_metrics, "_load_kubernetes_client", lambda: FakeCoreApi(pods))
+    monkeypatch.setattr(idle_metrics, "load_cloud_monitoring_client", lambda: monitoring)
+    monkeypatch.setattr(idle_metrics.client, "BatchV1Api", lambda: FakeBatchApi([]))
+    payload = json.loads(idle_metrics.collect_database_idle_assessment("mysql", namespace="database", days=2, project_id="p"))
+    first, second = payload["data"]["workloads"]
+    assert first["missing_metrics"] == []
+    assert set(second["missing_metrics"]) == {"work_total", "active_threads", "connected_clients"}
+    assert second["metrics_prerequisite"] == "missing_exporter"
+    assert second["recommendation"].startswith("Install or enable an existing mysqld_exporter")
+    assert payload["metadata"]["metrics_prerequisite"] == "none"
+
+
+def test_kubernetes_metrics_are_filtered_per_workload(monkeypatch) -> None:
+    pods = [_database_profile_pod("mysql", True, pod_name="mysql-0"), _database_profile_pod("mysql", True, pod_name="mysql-1")]
+    series = {**_profile_series_for_pods("mysql", ["mysql-0", "mysql-1"]), **_gke_series()}  # GKE series: mysql-0 only
+    monkeypatch.setattr(idle_metrics, "_load_kubernetes_client", lambda: FakeCoreApi(pods))
+    monkeypatch.setattr(idle_metrics, "load_cloud_monitoring_client", lambda: FakeMonitoringApi(series))
+    monkeypatch.setattr(idle_metrics.client, "BatchV1Api", lambda: FakeBatchApi([]))
+    payload = json.loads(idle_metrics.collect_database_idle_assessment("mysql", namespace="database", days=2, project_id="p"))
+    first, second = payload["data"]["workloads"]
+    assert first["metrics"]["p95_cpu_fraction"] == 0.01
+    assert second["metrics"]["p95_cpu_fraction"] is None
+    assert second["classification"] == "blocked"
+
+
+def test_real_dba_output_flows_through_cost_with_savings(monkeypatch) -> None:
+    monkeypatch.setenv("DBA_GKE_DISTRIBUTION", "autopilot")
+    raw, payload = _run_assessment(monkeypatch, "mysql")
+    workload = payload["data"]["workloads"][0]
+    assert workload["cost_review_eligible"] is True
+    assert payload["metadata"]["kubernetes"] == {"distribution": "Autopilot"}
+    row = {
+        "cluster": "c", "cluster_location": "l", "namespace": "database", "workload": "mysql", "workload_type": "StatefulSet",
+        "node_pool": "db-pool", "project": "example-project", "service": "Kubernetes Engine", "sku": "Autopilot Pod mCPU",
+        "currency": "USD", "total_cost": 100.0,
+    }
+    result = db_cost_tools.build_idle_cost_result(db_cost_tools.parse_idle_assessment(raw), [row], 30)
+    autopilot = next(item for item in result["remediation_scenarios"] if item["name"] == "autopilot_idle_scale_down")
+    assert autopilot["status"] == "estimate"
+    assert autopilot["monthly_savings"]["amount"] > 0
+
+
+def test_redis_and_empty_evidence_envelopes_pass_the_cost_contract(monkeypatch) -> None:
+    raw, _ = _run_assessment(monkeypatch, "redis")
+    validated = db_cost_tools.parse_idle_assessment(raw)
+    assert validated["data"]["workloads"][0]["metrics"]["mean_active_threads"] is None
+    raw, _ = _run_assessment(monkeypatch, "valkey", exporter=False, series={})
+    assert db_cost_tools.parse_idle_assessment(raw)["data"]["workloads"][0]["metrics"]["p95_work_per_second"] is None

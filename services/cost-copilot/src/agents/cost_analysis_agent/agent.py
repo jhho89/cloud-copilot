@@ -139,7 +139,7 @@ When analyzing Kubernetes/GKE costs:
 
 For namespace cost questions, you MUST use the estimate_namespace_cost tool with resource data.
 
-For database idle-cost questions, use `estimate_database_cost_impact` with the exact DBA envelope supplied by the caller. You cannot discover pods and must not query Kubernetes: process only the supplied envelope and model every workload in `data.workloads`. Preserve separate cost attribution and savings per workload and never mix currencies. If no `cloud-copilot.dba.idle-cost.v1` envelope is available, ask the caller to provide one.""",
+For database idle-cost questions, use `estimate_database_cost_impact` with the exact DBA envelope supplied by the caller. You cannot discover pods and must not query Kubernetes: process only the supplied envelope and model every workload in `data.workloads`. Pass the envelope verbatim: never add, edit, or infer fields (GKE distribution, node-pool consolidation, approved idle hours, schedules, or eligibility) because savings depend on operator-supplied evidence and must not be fabricated. Preserve separate cost attribution and savings per workload and never mix currencies. If no `cloud-copilot.dba.idle-cost.v1` envelope is available, ask the caller to provide one.""",
     tools=[
         get_billing_account_for_project,
         get_cost_breakdown,

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import math
+import re
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, Iterable, Mapping, Optional
@@ -267,6 +268,7 @@ def metric_matches_target(
     *,
     container_names: Optional[set[str]] = None,
 ) -> bool:
+    target_pairs = set(targets)
     label_namespace = next(
         (
             str(labels.get(name, ""))
@@ -284,10 +286,12 @@ def metric_matches_target(
         "",
     )
     if label_pod:
-        if not any(pod == label_pod for _, pod in targets):
+        # Pod names repeat across namespaces (StatefulSet ordinals), so a pod
+        # label without a namespace cannot be attributed safely.
+        if not label_namespace or (label_namespace, label_pod) not in target_pairs:
             return False
     elif label_namespace:
-        if not any(namespace == label_namespace for namespace, _ in targets):
+        if not any(namespace == label_namespace for namespace, _ in target_pairs):
             return False
     else:
         return False
@@ -300,17 +304,28 @@ def metric_matches_target(
     return True
 
 
+def _typed_number(value: Any) -> Any:
+    """Read a TypedValue number without mistaking unset proto-plus fields for 0.0."""
+    raw = getattr(value, "_pb", None)
+    if raw is not None and hasattr(raw, "WhichOneof"):
+        kind = raw.WhichOneof("value")
+        if kind in {"double_value", "int64_value"}:
+            return getattr(value, kind)
+        return None
+    number = getattr(value, "double_value", None)
+    if number is None:
+        number = getattr(value, "int64_value", None)
+    return number
+
+
 def parse_metric_samples(points: Any, labels: Optional[Mapping[str, str]] = None) -> list[MetricSample]:
     samples: list[MetricSample] = []
+    shared_labels = dict(labels or {})
     for point in points or []:
         interval = getattr(point, "interval", None)
         value = getattr(point, "value", None)
         end_time = getattr(interval, "end_time", None)
-        number = getattr(value, "double_value", None)
-        if number is None:
-            number = getattr(value, "int64_value", None)
-        if number is None:
-            number = getattr(value, "distribution_value", None)
+        number = _typed_number(value)
         if end_time is None or number is None or not isinstance(number, (int, float)):
             continue
         timestamp = end_time
@@ -319,7 +334,7 @@ def parse_metric_samples(points: Any, labels: Optional[Mapping[str, str]] = None
         if getattr(timestamp, "tzinfo", None) is None:
             timestamp = timestamp.replace(tzinfo=timezone.utc)
         if isinstance(number, (int, float)) and math.isfinite(float(number)):
-            samples.append(MetricSample(timestamp, float(number), dict(labels or {})))
+            samples.append(MetricSample(timestamp, float(number), shared_labels))
     samples.sort(key=lambda sample: sample.timestamp)
     return samples
 
@@ -342,6 +357,9 @@ def read_monitoring_series(
     issuing a query per pod, and Cloud Monitoring remains the only trend source.
     """
 
+    targets = list(targets)
+    if not targets:
+        return {}
     monitoring_v3 = _monitoring_v3_module()
     monitoring_client = load_cloud_monitoring_client()
     interval = monitoring_v3.TimeInterval(
@@ -350,14 +368,16 @@ def read_monitoring_series(
             "end_time": {"seconds": int(end_time.timestamp())},
         }
     )
-    aliases_by_name: dict[str, str] = {}
+    # Alias order is priority order. Exporters often expose several aliases of
+    # one logical metric (for example Queries and Questions); mixing them in one
+    # counter series produces false resets, so only the best present alias is used.
+    alias_rank: dict[str, tuple[str, int]] = {}
     for logical, names in aliases.items():
-        for name in names:
-            aliases_by_name.setdefault(name, logical)
+        for rank, name in enumerate(names):
+            alias_rank.setdefault(name, (logical, rank))
 
-    selected_types: list[str] = []
-    descriptor_names = aliases_by_name
-    if descriptor_names:
+    candidates: list[tuple[int, str, str]] = []
+    if alias_rank:
         for descriptor in monitoring_client.list_metric_descriptors(
             request={
                 "name": f"projects/{project_id}",
@@ -366,25 +386,31 @@ def read_monitoring_series(
         ):
             metric_type = str(getattr(descriptor, "type", ""))
             parts = metric_type.split("/")
-            if len(parts) < 3:
+            if len(parts) < 3 or parts[-2] not in alias_rank:
                 continue
-            logical = aliases_by_name.get(parts[-2])
-            if logical and metric_type not in selected_types:
-                selected_types.append(metric_type)
-    if known_metric_types:
-        selected_types.extend(metric_type for metric_type in known_metric_types.values() if metric_type not in selected_types)
+            logical, rank = alias_rank[parts[-2]]
+            if all(metric_type != existing for _, _, existing in candidates):
+                candidates.append((rank, logical, metric_type))
+    candidates.sort(key=lambda item: item[0])
+    ordered: list[tuple[str, str]] = [(logical, metric_type) for _, logical, metric_type in candidates]
+    for logical, metric_type in (known_metric_types or {}).items():
+        if all(metric_type != existing for _, existing in ordered):
+            ordered.append((logical, metric_type))
 
-    logical_by_type = {value: key for key, value in (known_metric_types or {}).items()}
+    namespaces = sorted({namespace for namespace, _ in targets})
+    quoted = ", ".join('"' + namespace.replace("\\", "\\\\").replace('"', '\\"') + '"' for namespace in namespaces)
+    namespace_filter = (
+        f"(resource.labels.namespace = one_of({quoted}) OR resource.labels.namespace_name = one_of({quoted}))"
+    )
+
     metrics_by_logical: dict[str, dict[str, Any]] = {}
-    for metric_type in selected_types:
-        descriptor_name = metric_type.split("/")[-2] if len(metric_type.split("/")) >= 3 else ""
-        logical = logical_by_type.get(metric_type) or aliases_by_name.get(descriptor_name)
-        if not logical:
+    for logical, metric_type in ordered:
+        if logical in metrics_by_logical:
             continue
         series_list = monitoring_client.list_time_series(
             request={
                 "name": f"projects/{project_id}",
-                "filter": f'metric.type = "{metric_type}"',
+                "filter": f'metric.type = "{metric_type}" AND {namespace_filter}',
                 "interval": interval,
                 "view": monitoring_v3.ListTimeSeriesRequest.TimeSeriesView.FULL,
             }
@@ -435,27 +461,38 @@ def aggregate_hourly(
         return {"values": [], "restarts": 0, "hours_with_data": 0}
     kind = metric.get("kind", "gauge")
     samples = list(metric["samples"])
-    values_by_hour: dict[datetime, list[float]] = {}
     restarts = 0
     if kind == "counter":
-        previous: Optional[MetricSample] = None
+        # Counters are differenced per series. Interleaving distinct series
+        # (different label sets) would look like constant resets.
+        grouped: dict[tuple[tuple[str, str], ...], list[MetricSample]] = {}
         for sample in samples:
-            if previous is None:
+            grouped.setdefault(tuple(sorted(sample.labels.items())), []).append(sample)
+        rate_by_hour: dict[datetime, float] = {}
+        for series_samples in grouped.values():
+            series_hours: dict[datetime, list[float]] = {}
+            previous: Optional[MetricSample] = None
+            for sample in series_samples:
+                if previous is None:
+                    previous = sample
+                    continue
+                elapsed = (sample.timestamp - previous.timestamp).total_seconds()
+                if elapsed <= 0:
+                    continue
+                if sample.value < previous.value:
+                    restarts += 1
+                    previous = sample
+                    continue
+                rate = (sample.value - previous.value) / elapsed
+                series_hours.setdefault(_hour_start(sample.timestamp), []).append(rate)
                 previous = sample
-                continue
-            elapsed = (sample.timestamp - previous.timestamp).total_seconds()
-            if elapsed <= 0:
-                continue
-            if sample.value < previous.value:
-                restarts += 1
-                previous = sample
-                continue
-            rate = (sample.value - previous.value) / elapsed
-            values_by_hour.setdefault(_hour_start(sample.timestamp), []).append(rate)
-            previous = sample
-    else:
-        for sample in samples:
-            values_by_hour.setdefault(_hour_start(sample.timestamp), []).append(sample.value)
+            for hour, rates in series_hours.items():
+                rate_by_hour[hour] = rate_by_hour.get(hour, 0.0) + sum(rates) / len(rates)
+        hours = sorted(rate_by_hour)
+        return {"values": [rate_by_hour[hour] for hour in hours], "restarts": restarts, "hours_with_data": len(hours)}
+    values_by_hour: dict[datetime, list[float]] = {}
+    for sample in samples:
+        values_by_hour.setdefault(_hour_start(sample.timestamp), []).append(sample.value)
     hours = sorted(values_by_hour)
     values = [sum(values) / len(values) for values in (values_by_hour[hour] for hour in hours)]
     return {"values": values, "restarts": restarts, "hours_with_data": len(hours)}
@@ -487,34 +524,49 @@ def classification_thresholds() -> dict[str, float]:
         "work_p95_ops_per_sec": _environment_number("DBA_IDLE_WORK_P95_OPS_PER_SEC", 0.01, minimum=0.0),
         "cpu_p95_fraction": _environment_number("DBA_IDLE_CPU_P95_FRACTION", 0.05, minimum=0.0),
         "min_zero_work_ratio": _environment_number("DBA_IDLE_MIN_ZERO_WORK_RATIO", 0.90, minimum=0.0),
+        # Threads_running is at least 1 while the exporter itself is querying.
+        "active_threads_mean": _environment_number("DBA_IDLE_ACTIVE_THREADS_MEAN", 1.05, minimum=0.0),
+        # Ops/s produced by the exporter's own scrapes; subtracted from the work rate.
+        "work_baseline_ops_per_sec": _environment_number("DBA_IDLE_EXPORTER_BASELINE_OPS_PER_SEC", 0.0, minimum=0.0),
+        "min_data_coverage": min(1.0, _environment_number("DBA_IDLE_MIN_DATA_COVERAGE", 0.8, minimum=0.0)),
     }
+
+
+DEFAULT_MINIMUM_WINDOW_DAYS = 7
 
 
 def minimum_window_days() -> int:
     try:
-        configured = int(os.getenv("DBA_IDLE_ASSESSMENT_MIN_DAYS", "1"))
+        configured = int(os.getenv("DBA_IDLE_ASSESSMENT_MIN_DAYS", str(DEFAULT_MINIMUM_WINDOW_DAYS)))
     except ValueError:
-        configured = 1
-    return configured if 1 <= configured <= 31 else 1
+        configured = DEFAULT_MINIMUM_WINDOW_DAYS
+    return configured if 1 <= configured <= 31 else DEFAULT_MINIMUM_WINDOW_DAYS
 
 
-def _pod_identity(pod: Any) -> str:
-    metadata = getattr(pod, "metadata", None)
-    spec = getattr(pod, "spec", None)
-    values = [str(getattr(metadata, "name", "") or "")]
-    labels = dict(getattr(metadata, "labels", None) or {})
-    values.extend(str(key) for key in labels)
-    values.extend(str(value) for value in labels.values())
-    for container in getattr(spec, "containers", None) or []:
-        values.extend([str(getattr(container, "name", "") or ""), str(getattr(container, "image", "") or "")])
-    return " ".join(values).lower()
+def _container_identity(container: Any) -> str:
+    return f"{getattr(container, 'name', '') or ''} {getattr(container, 'image', '') or ''}".lower()
+
+
+def _is_exporter_container(container: Any, db_type: str) -> bool:
+    profile = DATABASE_PROFILES.get(db_type)
+    identity = _container_identity(container)
+    return bool(profile and any(marker in identity for marker in profile.exporter_identities))
 
 
 def _matches_profile(pod: Any, db_type: str) -> bool:
-    identity = _pod_identity(pod)
-    if db_type in REDIS_DATABASE_TYPES:
-        return db_type in identity
-    return db_type in identity
+    containers = list(getattr(getattr(pod, "spec", None), "containers", None) or [])
+    database_side = [container for container in containers if not _is_exporter_container(container, db_type)]
+    if containers and not database_side:
+        # An exporter-only pod (for example a standalone mysqld-exporter
+        # Deployment) is not a database workload.
+        return False
+    metadata = getattr(pod, "metadata", None)
+    labels = dict(getattr(metadata, "labels", None) or {})
+    values = [str(getattr(metadata, "name", "") or "")]
+    values.extend(str(key) for key in labels)
+    values.extend(str(value) for value in labels.values())
+    values.extend(_container_identity(container) for container in database_side)
+    return db_type in " ".join(values).lower()
 
 
 def _labels(pod: Any) -> dict[str, str]:
@@ -535,18 +587,37 @@ def _role(labels: Mapping[str, str], profile: DatabaseMetricProfile) -> str:
 
 
 def _controller_context(pod: Any) -> tuple[str, str]:
-    for owner in getattr(getattr(pod, "metadata", None), "owner_references", None) or []:
-        if bool(getattr(owner, "controller", False)):
-            return str(getattr(owner, "kind", "") or ""), str(getattr(owner, "name", "") or "")
+    """Return the workload kind/name GKE cost allocation reports.
+
+    GKE labels Deployment-owned pods with the Deployment, not the intermediate
+    ReplicaSet that ownerReferences point at.
+    """
+    metadata = getattr(pod, "metadata", None)
+    for owner in getattr(metadata, "owner_references", None) or []:
+        if not bool(getattr(owner, "controller", False)):
+            continue
+        kind = str(getattr(owner, "kind", "") or "")
+        name = str(getattr(owner, "name", "") or "")
+        if kind == "ReplicaSet":
+            template_hash = str((getattr(metadata, "labels", None) or {}).get("pod-template-hash", ""))
+            suffix = f"-{template_hash}"
+            if template_hash and name.endswith(suffix) and len(name) > len(suffix):
+                return "Deployment", name[: -len(suffix)]
+        return kind, name
     return "", ""
 
 
+def _all_container_names(pod: Any) -> set[str]:
+    return {str(getattr(container, "name", "") or "") for container in getattr(getattr(pod, "spec", None), "containers", None) or []}
+
+
 def _database_containers(pod: Any, db_type: str) -> list[Any]:
-    matching = [container for container in getattr(getattr(pod, "spec", None), "containers", None) or [] if _matches_profile({"metadata": None, "spec": {"containers": [container]}}, db_type)]
+    containers = list(getattr(getattr(pod, "spec", None), "containers", None) or [])
+    database_side = [container for container in containers if not _is_exporter_container(container, db_type)]
+    matching = [container for container in database_side if db_type in _container_identity(container)]
     if matching:
         return matching
-    containers = list(getattr(getattr(pod, "spec", None), "containers", None) or [])
-    return containers[:1] if containers else []
+    return database_side[:1] if database_side else containers[:1]
 
 
 def _exporter_discovery(pod: Any, profile: DatabaseMetricProfile) -> list[dict[str, str]]:
@@ -658,7 +729,6 @@ def _owner_and_environment(pod: Any, namespace_labels: Mapping[str, Mapping[str,
         (
             "cost-owner",
             "cloud-copilot.ai/owner",
-            "app.kubernetes.io/managed-by",
             "owner",
             "team",
             "owner-team",
@@ -671,13 +741,32 @@ def _owner_and_environment(pod: Any, namespace_labels: Mapping[str, Mapping[str,
     current = namespace_labels.get(namespace, {})
     owner = owner or _first_label(current, ("cost-owner", "cloud-copilot.ai/owner", "owner", "team"))
     environment = environment or _first_label(current, ("environment", "env", "cloud-copilot.ai/environment"))
-    lowered = namespace.lower()
-    if not environment:
-        if "prod" in lowered:
-            environment = "production"
-        elif any(marker in lowered for marker in ("staging", "stage", "dev", "test", "sandbox")):
-            environment = "non-production"
+    if environment:
+        return owner, _normalize_environment(environment)
+    tokens = _namespace_tokens(namespace)
+    if tokens & _PRODUCTION_TOKENS:
+        environment = "production"
+    elif tokens & _NON_PRODUCTION_TOKENS:
+        environment = "non-production"
     return owner, environment
+
+
+_PRODUCTION_TOKENS = frozenset({"prod", "production", "prd", "live"})
+_NON_PRODUCTION_TOKENS = frozenset({"dev", "development", "test", "testing", "staging", "stage", "stg", "sandbox", "qa", "uat"})
+
+
+def _namespace_tokens(namespace: str) -> set[str]:
+    # Whole-token matching: "latest-orders" is not "test", "backstage" is not "stage".
+    return {token for token in re.split(r"[^a-z]+", namespace.lower()) if token}
+
+
+def _normalize_environment(value: str) -> str:
+    lowered = value.strip().lower()
+    return "production" if lowered in _PRODUCTION_TOKENS else lowered
+
+
+def _is_production(namespace: str, environment: str) -> bool:
+    return _normalize_environment(environment) == "production" or bool(_namespace_tokens(namespace) & _PRODUCTION_TOKENS)
 
 
 def _eligibility(pod: Any) -> tuple[str, str]:
@@ -696,10 +785,6 @@ def _is_truthy(value: str) -> bool:
     return value.strip().lower() in {"eligible", "true", "yes", "1"}
 
 
-def _is_false(value: str) -> bool:
-    return value.strip().lower() in {"not-eligible", "ineligible", "false", "no", "0"}
-
-
 def _data_gaps(start_time: datetime, end_time: datetime, observed_hours: int) -> int:
     first = _hour_start(start_time)
     expected = int(math.ceil((end_time - first).total_seconds() / 3600.0))
@@ -711,6 +796,7 @@ def _work_evidence(
     profile: DatabaseMetricProfile,
     start_time: datetime,
     end_time: datetime,
+    baseline: float = 0.0,
 ) -> dict[str, Any]:
     hourly_values: list[float] = []
     restarts = 0
@@ -720,7 +806,8 @@ def _work_evidence(
         restarts += int(aggregate["restarts"])
         observed_hours = max(observed_hours, int(aggregate["hours_with_data"]))
         if aggregate["values"]:
-            hourly_values = aggregate["values"]
+            # The exporter's own scrape traffic is counted as database work.
+            hourly_values = [max(0.0, value - baseline) for value in aggregate["values"]]
             break
     p95 = _percentile_95(hourly_values)
     zero_ratio = sum(1 for value in hourly_values if value <= 0.0) / len(hourly_values) if hourly_values else 0.0
@@ -773,8 +860,9 @@ def _classification(
         reasons.append(f"work p95 {work_p95:.6g} ops/s is above idle threshold")
         idle_looking = False
 
-    if active_threads is not None and active_threads > thresholds["work_p95_ops_per_sec"]:
-        reasons.append(f"active threads p95 {active_threads:.6g} is above idle threshold")
+    threads_threshold = thresholds.get("active_threads_mean", 1.05)
+    if active_threads is not None and active_threads > threads_threshold:
+        reasons.append(f"mean active threads {active_threads:.6g} is above idle threshold {threads_threshold:.6g}")
         idle_looking = False
     if cpu_p95 is not None and cpu_p95 > thresholds["cpu_p95_fraction"]:
         reasons.append(f"CPU p95 {cpu_p95:.6g} is above idle threshold")
@@ -789,14 +877,27 @@ def _classification(
     if not idle_looking:
         return "active", reasons
 
+    hours_with_data = work.get("hours_with_data")
+    if hours_with_data is not None:
+        expected_hours = int(hours_with_data) + int(work.get("data_gaps", 0))
+        coverage = int(hours_with_data) / expected_hours if expected_hours else 0.0
+        if coverage < thresholds.get("min_data_coverage", 0.0):
+            reasons.append(f"data coverage {coverage:.2f} is below threshold; idle evidence is incomplete")
+            return "blocked", reasons
+    if cpu_p95 is None:
+        reasons.append("container CPU evidence is missing")
+        return "blocked", reasons
+
     blocking_risks = {
         "replication_failover_role",
+        "role_unknown",
         "primary_with_active_backup",
         "production_environment",
         "ownership_missing",
         "environment_missing",
         "not_cost_review_eligible",
         "backup_schedule_unknown",
+        "counter_restarts_observed",
     }
     if any(risk in blocking_risks for risk in risks):
         reasons.append("operational safety evidence blocks shutdown candidacy")
@@ -811,9 +912,19 @@ def _backup_evidence(
     pod_labels: Mapping[str, str],
     role: str,
     profile: DatabaseMetricProfile,
+    controller_name: str = "",
 ) -> tuple[dict[str, Any], bool, bool]:
-    matches: list[dict[str, str]] = []
-    haystack = " ".join([namespace, *pod_labels.keys(), *pod_labels.values()]).lower()
+    """Return backup evidence, whether a schedule is known, and whether a backup is running now."""
+    matches: list[dict[str, Any]] = []
+    # Only these labels tie a CronJob to this database; the namespace alone does not.
+    pod_identity_values = {
+        str(pod_labels[key]).lower()
+        for key in ("app.kubernetes.io/instance", "app.kubernetes.io/name", "app", "release")
+        if pod_labels.get(key)
+    }
+    if controller_name:
+        pod_identity_values.add(controller_name.lower())
+    pod_identity_values.add(profile.db_type)
     for cronjob in cronjobs:
         metadata = getattr(cronjob, "metadata", None)
         spec = getattr(cronjob, "spec", None)
@@ -821,17 +932,25 @@ def _backup_evidence(
         if cron_namespace != namespace:
             continue
         labels = dict(getattr(metadata, "labels", None) or {})
-        cron_haystack = " ".join([str(getattr(metadata, "name", "") or ""), *labels.keys(), *labels.values()]).lower()
-        if any(term in cron_haystack for term in profile.backup_names) or "backup" in haystack:
-            matches.append(
-                {
-                    "name": str(getattr(metadata, "name", "") or ""),
-                    "schedule": str(getattr(spec, "schedule", "") or ""),
-                    "last_schedule_time": str(getattr(getattr(getattr(cronjob, "status", None), "last_schedule_time", None), "isoformat", lambda: "")() or ""),
-                }
-            )
-    known_schedule = bool(matches and any(item["schedule"] for item in matches))
-    return {"cronjobs": matches, "schedule_known": known_schedule}, known_schedule, role == "primary"
+        cron_name = str(getattr(metadata, "name", "") or "").lower()
+        cron_values = {str(value).lower() for value in labels.values()}
+        is_backup = any(term in cron_name or term in cron_values for term in profile.backup_names)
+        targets_pod = any(value and (value in cron_name or value in cron_values) for value in pod_identity_values)
+        if not (is_backup and targets_pod):
+            continue
+        last_schedule = getattr(getattr(cronjob, "status", None), "last_schedule_time", None)
+        matches.append(
+            {
+                "name": str(getattr(metadata, "name", "") or ""),
+                "schedule": str(getattr(spec, "schedule", "") or ""),
+                "suspended": bool(getattr(spec, "suspend", False)),
+                "active_jobs": len(getattr(getattr(cronjob, "status", None), "active", None) or []),
+                "last_schedule_time": last_schedule.isoformat() if hasattr(last_schedule, "isoformat") else "",
+            }
+        )
+    known_schedule = any(item["schedule"] and not item["suspended"] for item in matches)
+    active_backup = any(item["active_jobs"] for item in matches)
+    return {"cronjobs": matches, "schedule_known": known_schedule, "active": active_backup}, known_schedule, active_backup
 
 
 def _pvc_evidence(
@@ -866,6 +985,7 @@ def _risk_fields(
     work_restarts: int,
     eligibility_source: str,
     eligibility_value: str,
+    backup_active: bool = False,
 ) -> list[str]:
     risks: list[str] = []
     if persistent:
@@ -874,9 +994,12 @@ def _risk_fields(
         risks.append("backup_schedule_unknown")
     if role == "replica":
         risks.append("replication_failover_role")
-    if role == "primary" and backup_known:
+    elif role != "primary":
+        # Without an explicit role label a failover-serving replica cannot be ruled out.
+        risks.append("role_unknown")
+    if backup_active:
         risks.append("primary_with_active_backup")
-    if "prod" in namespace.lower() or environment.lower() == "production":
+    if _is_production(namespace, environment):
         risks.append("production_environment")
     if not owner:
         risks.append("ownership_missing")
@@ -887,6 +1010,24 @@ def _risk_fields(
     if not eligibility_source or not _is_truthy(eligibility_value):
         risks.append("not_cost_review_eligible")
     return risks
+
+
+def _filter_metrics(
+    metrics: Mapping[str, dict[str, Any]],
+    namespace: str,
+    pod_name: str,
+    container_names: set[str],
+) -> dict[str, dict[str, Any]]:
+    """Keep only the samples attributable to one namespace/pod."""
+    filtered: dict[str, dict[str, Any]] = {}
+    for logical, metric in metrics.items():
+        filtered[logical] = dict(metric)
+        filtered[logical]["samples"] = [
+            sample
+            for sample in metric.get("samples", [])
+            if metric_matches_target(sample.labels, [(namespace, pod_name)], container_names=container_names)
+        ]
+    return filtered
 
 
 def _workload_record(
@@ -906,26 +1047,23 @@ def _workload_record(
 ) -> dict[str, Any]:
     labels = _labels(pod)
     role = _role(labels, profile)
-    container_names = {str(getattr(container, "name", "")) for container in _database_containers(pod, profile.db_type)}
-    filtered = {}
-    for logical, metric in metrics.items():
-        filtered[logical] = dict(metric)
-        filtered[logical]["samples"] = [
-            sample
-            for sample in metric.get("samples", [])
-            if metric_matches_target(sample.labels, [(namespace, pod_name)], container_names=container_names)
-        ]
-    work = _work_evidence(filtered, profile, start_time, end_time)
+    # Exporter sidecars report their own container name, so every container of
+    # the pod is acceptable; namespace and pod name do the attribution.
+    container_names = _all_container_names(pod)
+    filtered = _filter_metrics(metrics, namespace, pod_name, container_names)
+    pod_kubernetes_metrics = _filter_metrics(kubernetes_metrics, namespace, pod_name, container_names)
+    work = _work_evidence(filtered, profile, start_time, end_time, thresholds.get("work_baseline_ops_per_sec", 0.0))
     active_threads = _active_thread_evidence(filtered, profile, start_time, end_time)
-    cpu_p95 = _p95_metric("cpu_request", kubernetes_metrics, start_time, end_time)
-    memory_p95 = _p95_metric("memory_request", kubernetes_metrics, start_time, end_time)
-    network_sent = _p95_metric("network_sent", kubernetes_metrics, start_time, end_time)
-    network_received = _p95_metric("network_received", kubernetes_metrics, start_time, end_time)
+    cpu_p95 = _p95_metric("cpu_request", pod_kubernetes_metrics, start_time, end_time)
+    memory_p95 = _p95_metric("memory_request", pod_kubernetes_metrics, start_time, end_time)
+    network_sent = _p95_metric("network_sent", pod_kubernetes_metrics, start_time, end_time)
+    network_received = _p95_metric("network_received", pod_kubernetes_metrics, start_time, end_time)
     owner, environment = _owner_and_environment(pod, namespace_labels, namespace)
     eligibility_source, eligibility_value = _eligibility(pod)
     claimed_names = _volume_claims(pod)
     persistent = bool(claimed_names)
-    backup, backup_known, _ = _backup_evidence(backup_cronjobs, namespace, labels, role, profile)
+    controller_type, controller_name = _controller_context(pod)
+    backup, backup_known, backup_active = _backup_evidence(backup_cronjobs, namespace, labels, role, profile, controller_name)
     risks = _risk_fields(
         profile,
         namespace,
@@ -937,9 +1075,12 @@ def _workload_record(
         int(work.get("restarts", 0)),
         eligibility_source,
         eligibility_value,
+        backup_active,
     )
     classification, reasons = _classification(profile, filtered, work, active_threads, cpu_p95, thresholds, risks)
-    controller_type, controller_name = _controller_context(pod)
+    workload_missing_metrics = sorted(
+        logical for logical in profile.required_metrics if not filtered.get(logical, {}).get("samples")
+    )
     node = _node_pool_information(pod, nodes_by_name)
     if classification == "candidate":
         recommendation = f"Advisory cost review only. Validate the {profile.exporter_recommendation} metrics with the database operator before any shutdown."
@@ -947,10 +1088,10 @@ def _workload_record(
     else:
         recommendation = "Do not recommend shutdown. Collect the missing operational evidence or restore production traffic."
         approvals = ("database_operator",)
-    if not metrics:
+    workload_has_metrics = any(metric.get("samples") for metric in filtered.values())
+    if not workload_has_metrics:
         recommendation = f"Install or enable an existing {profile.exporter_recommendation}; do not use pod/exec as a metrics fallback."
     eligibility_evidence = f"{eligibility_source}={eligibility_value}" if eligibility_source else ""
-    workload_has_metrics = any(metric.get("samples") for metric in filtered.values())
     return {
         "namespace": namespace,
         "pod": pod_name,
@@ -970,6 +1111,8 @@ def _workload_record(
         "owner": owner,
         "environment": environment,
         "eligibility_evidence": eligibility_evidence,
+        "cost_review_eligible": bool(eligibility_source) and _is_truthy(eligibility_value),
+        "missing_metrics": workload_missing_metrics,
         "recommendation": recommendation,
         "required_approvals": list(approvals),
         "classification_reasons": reasons,
@@ -988,6 +1131,23 @@ def _workload_record(
             "p95_network_received_bytes_per_second": network_received,
         },
     }
+
+
+def _operator_cluster_context() -> dict[str, str]:
+    """Cluster facts the Kubernetes API cannot report, supplied by the operator.
+
+    Cost Copilot uses them to match billing rows; without them it never infers
+    a GKE distribution or picks between same-named workloads in two clusters.
+    """
+    context: dict[str, str] = {}
+    distribution = os.getenv("DBA_GKE_DISTRIBUTION", "").strip().lower()
+    if distribution in {"autopilot", "standard"}:
+        context["distribution"] = distribution.capitalize()
+    for key, variable in (("cluster", "DBA_GKE_CLUSTER_NAME"), ("cluster_location", "DBA_GKE_CLUSTER_LOCATION")):
+        value = os.getenv(variable, "").strip()
+        if value:
+            context[key] = value
+    return context
 
 
 def _now_iso() -> str:
@@ -1085,7 +1245,7 @@ def collect_database_idle_assessment(
         ]
         container_names: set[str] = set()
         for item in matching_pods:
-            container_names.update(str(getattr(container, "name", "")) for container in _database_containers(item, normalized_type))
+            container_names.update(_all_container_names(item))
         metrics = read_monitoring_series(
             resolved_project,
             start_time,
@@ -1157,16 +1317,12 @@ def collect_database_idle_assessment(
             )
             for item, (namespace_value, pod_name) in zip(matching_pods, targets, strict=True)
         ]
-        missing_metrics = sorted(
-            {
-                logical
-                for workload in workloads
-                for logical in profile.required_metrics
-                if logical not in metrics or not metrics[logical].get("samples")
-            }
-        )
+        # Per-workload gaps: a pod with no series is not covered by another pod's series.
+        missing_metrics = sorted({logical for workload in workloads for logical in workload["missing_metrics"]})
         exporter_discovered = bool(workloads and any(_exporter_discovery(item, profile) for item in matching_pods))
-        all_missing_exporter = all(workload["metrics_prerequisite"] == "missing_exporter" for workload in workloads)
+        all_missing_exporter = bool(workloads) and all(
+            workload["metrics_prerequisite"] == "missing_exporter" for workload in workloads
+        )
         metrics_prerequisite = "missing_exporter" if all_missing_exporter else "none"
         payload: dict[str, Any] = {
             "schema_version": SCHEMA_VERSION,
@@ -1184,6 +1340,7 @@ def collect_database_idle_assessment(
                 "metrics_prerequisite": metrics_prerequisite,
                 "resolved_metrics": sorted(metrics),
                 "pod_count": len(workloads),
+                "kubernetes": _operator_cluster_context(),
             },
         }
         return json.dumps(payload, sort_keys=True, separators=(",", ":")) if output_mode == "json" else _render_human(payload)

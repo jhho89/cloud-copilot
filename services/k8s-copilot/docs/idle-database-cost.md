@@ -20,13 +20,22 @@ Thresholds are configurable and conservative:
 
 | Variable | Default |
 | --- | --- |
-| `DBA_IDLE_ASSESSMENT_MIN_DAYS` | `1` |
+| `DBA_IDLE_ASSESSMENT_MIN_DAYS` | `7` |
 | `DBA_IDLE_WORK_P95_OPS_PER_SEC` | `0.01` |
 | `DBA_IDLE_CPU_P95_FRACTION` | `0.05` |
 | `DBA_IDLE_MIN_ZERO_WORK_RATIO` | `0.90` |
+| `DBA_IDLE_ACTIVE_THREADS_MEAN` | `1.05` (MySQL `Threads_running` is at least 1 while the exporter queries) |
+| `DBA_IDLE_EXPORTER_BASELINE_OPS_PER_SEC` | `0` (subtracted from the work rate) |
+| `DBA_IDLE_MIN_DATA_COVERAGE` | `0.8` (hours with data / expected hours) |
+| `DBA_GKE_DISTRIBUTION` | unset (`Autopilot` or `Standard`; copied to `metadata.kubernetes`) |
+| `DBA_GKE_CLUSTER_NAME`, `DBA_GKE_CLUSTER_LOCATION` | unset (pin billing rows to one cluster) |
 | `DBA_COST_REVIEW_ELIGIBILITY_ANNOTATION` | `cloud-copilot.ai/cost-review` |
 
-The supported window is 1-31 days. Classification is `active`, `candidate`, or `blocked`. Connections never establish idleness; work-rate p95, active MySQL threads, CPU utilization, and the zero-work ratio must all support it. A workload is a `candidate` only when those thresholds are met and a non-secret annotation or operator label marks it eligible for cost review.
+The exporter's own scrapes (`SHOW GLOBAL STATUS`, `INFO`, `PING`) count as database work, so on real clusters the default `0.01` ops/s threshold may never be met. Measure your exporter's idle rate and set `DBA_IDLE_EXPORTER_BASELINE_OPS_PER_SEC`; the default `0` is the safe direction (nothing is marked idle by accident).
+
+Candidacy also needs at least `DBA_IDLE_MIN_DATA_COVERAGE` of the window to have samples, container CPU evidence, an explicit `primary` role label (an unlabeled pod might serve failover), no counter restarts, and no running backup job. Backup CronJobs must be named for, or labeled with, this database; suspended CronJobs do not count as a schedule. Savings are modeled only for `candidate` workloads. Set `DBA_GKE_DISTRIBUTION` because Cost Copilot never infers it, and set the cluster variables when one project hosts same-named workloads in several clusters.
+
+The supported window is 1-31 days (default minimum 7). Classification is `active`, `candidate`, or `blocked`. Connections never establish idleness; work-rate p95, active MySQL threads, CPU utilization, and the zero-work ratio must all support it. A workload is a `candidate` only when those thresholds are met and a non-secret annotation or operator label marks it eligible for cost review.
 
 Shutdown is never recommended for failover replicas, primaries with active backups, production workloads, or workloads lacking an owner or environment marker. Persistent data and unknown backup schedules are risks and block candidacy. Recommendations include database-operator, backup-owner, and service-owner approval requirements and are advisory only.
 

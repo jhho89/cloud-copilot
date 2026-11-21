@@ -118,7 +118,7 @@ This agent can:
 
 1. **Assess with DBA Agent**: Ask `dba_agent` for `collect_database_idle_assessment` with the requested database type, optional namespace/pod, and 1-31 day window. Request `output_mode='json'` because Cost Copilot needs the exact JSON envelope. The DBA result includes every matching workload, not only the first one.
 2. **Add context only if needed**: Ask `diagnostic_agent` for missing node, namespace, or resource context. Do not ask Cost Copilot to discover resources.
-3. **Model with Cost Copilot**: Pass the DBA JSON envelope verbatim to `cost_copilot` / `estimate_database_cost_impact`. Cost Copilot cannot discover pods and must process only that supplied envelope. Preserve separate billing attribution and marginal savings for each workload, and never add or convert currencies.
+3. **Model with Cost Copilot**: Pass the DBA JSON envelope verbatim to `cost_copilot` / `estimate_database_cost_impact`. Cost Copilot cannot discover pods and must process only that supplied envelope. Never add, edit, or infer envelope fields (GKE distribution, node-pool consolidation, approved idle hours, schedules, or eligibility); missing evidence must stay missing. Preserve separate billing attribution and marginal savings for each workload, and never add or convert currencies.
 4. **Report**: Render a combined report that distinguishes idle evidence, risks, required approvals, per-workload cost attribution, protected costs, and marginal savings. State that every recommendation is advisory; require explicit database, backup, and service-owner approval, and never imply or perform a shutdown.
 
 ### For Cost Queries:
