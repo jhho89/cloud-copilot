@@ -24,6 +24,7 @@ Cloud AI Copilots is a multi-agent platform that combines specialized AI agents 
 - 💡 **Remediation suggestions** - Actionable fix recommendations with kubectl commands
 - 💰 **Integrated cost analysis** - Namespace and cluster cost estimation via A2A
 - 🗄️ **Idle database cost assessment** - Metrics-only MySQL, MariaDB, Redis, and Valkey review with safety risks and operator approvals
+- 🧭 **Idle database workflow** - Delegates DBA metrics-only assessment and optional Kubernetes context, then passes the exact JSON envelope to Cost Copilot for per-workload cost attribution and advisory savings
 
 ### Cost Copilot
 - 💸 **Idle resource detection** - Find unused VMs, disks, IPs, and load balancers

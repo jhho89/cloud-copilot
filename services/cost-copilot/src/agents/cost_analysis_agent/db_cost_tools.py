@@ -506,16 +506,14 @@ def _merge_missing_evidence(scenarios: list[dict[str, Any]]) -> list[str]:
     return evidence
 
 
-def build_idle_cost_result(
-    envelope: dict[str, Any], rows: list[dict[str, Any]], days: int
+def _model_workload(
+    envelope: dict[str, Any], workload: dict[str, Any], rows: list[dict[str, Any]], days: int
 ) -> dict[str, Any]:
-    """Build a model result from validated envelope data and billing rows."""
-    workload = envelope["data"]["workloads"][0]
+    """Model one workload in isolation so currency and attribution stay separate."""
     metadata = envelope["metadata"]
     project_id = metadata["project_id"]
-    relevant_rows = [row for row in rows if row.get("project") == project_id]
-    attribution = _attribution_from_rows(relevant_rows, workload, project_id, days)
-    workload_rows = _match_workload_rows(relevant_rows, workload, project_id)
+    attribution = _attribution_from_rows(rows, workload, project_id, days)
+    workload_rows = _match_workload_rows(rows, workload, project_id)
     compute = _compute_cost(workload_rows, days)
     protected = _protected_costs(workload_rows, days)
 
@@ -524,7 +522,7 @@ def build_idle_cost_result(
     if distribution == "Autopilot":
         scenarios.append(_autopilot_scenario(compute, workload, metadata, days))
     elif distribution == "Standard":
-        scenarios.append(_standard_scenario(compute, workload, metadata, relevant_rows, days))
+        scenarios.append(_standard_scenario(compute, workload, metadata, rows, days))
     else:
         scenarios.append({
             "name": "workload_attribution",
@@ -540,11 +538,6 @@ def build_idle_cost_result(
         missing_evidence.insert(0, "GKE billing attribution")
 
     return {
-        "schema_version": OUTPUT_SCHEMA,
-        "generated_at": envelope["generated_at"],
-        "status": "ok",
-        "project_id": project_id,
-        "source_metadata": metadata,
         "source_workload": workload,
         "workload": {
             key: workload.get(key)
@@ -560,10 +553,33 @@ def build_idle_cost_result(
         "marginal_monthly_savings": scenarios[0].get("monthly_savings", {"currency": "", "amount": 0.0}),
         "compute_cost": compute,
         "protected_costs": protected,
-        "unattributed_costs": _unattributed_costs(relevant_rows),
         "remediation_scenarios": scenarios,
         "confidence": _confidence(attribution, metadata["missing_metrics"], scenarios, days),
         "missing_evidence": missing_evidence,
+    }
+
+
+def build_idle_cost_result(
+    envelope: dict[str, Any], rows: list[dict[str, Any]], days: int
+) -> dict[str, Any]:
+    """Build a model result from validated envelope data and billing rows."""
+    metadata = envelope["metadata"]
+    project_id = metadata["project_id"]
+    relevant_rows = [row for row in rows if row.get("project") == project_id]
+    workload_results = [_model_workload(envelope, workload, relevant_rows, days) for workload in envelope["data"]["workloads"]]
+    first = workload_results[0]
+
+    return {
+        "schema_version": OUTPUT_SCHEMA,
+        "generated_at": envelope["generated_at"],
+        "status": "ok",
+        "project_id": project_id,
+        "source_metadata": metadata,
+        # Keep the first workload's legacy fields for existing callers. New
+        # callers should consume workloads[], which models every DBA item.
+        **first,
+        "unattributed_costs": _unattributed_costs(relevant_rows),
+        "workloads": workload_results,
         "limits": [
             "No Kubernetes discovery or mutation calls.",
             "Only workload-attributed GKE system-label rows are used for savings.",
@@ -591,38 +607,35 @@ def format_idle_cost_markdown(result: dict[str, Any]) -> str:
     if result["status"] != "ok":
         return f"## Database Cost Impact Error\n\n{result['error']['message']}"
 
-    attribution = result["billing_attribution"]
     lines = [
         "## Database Cost Impact",
         "",
-        f"Project `{result['project_id']}` | Confidence: **{result['confidence']}**",
+        f"Project `{result['project_id']}`",
         "",
-        "### Billing Attribution",
-        f"Status: **{attribution['status']}**",
+        "### Modeled Workloads",
+        "",
     ]
-    monthly = result.get("attributed_monthly_cost")
-    if monthly:
-        lines.append(f"Attributed monthly cost: {monthly['currency']} {monthly['amount']:,.2f}")
-    else:
-        lines.append("Attributed monthly cost: unavailable")
+    for index, item in enumerate(result["workloads"], 1):
+        identity = item["workload"]
+        attribution = item["billing_attribution"]
+        lines.extend(
+            [
+                f"### {index}. {identity['namespace']}/{identity['pod']} ({identity['db_type']})",
+                f"Attribution: **{attribution['status']}** | Confidence: **{item['confidence']}**",
+            ]
+        )
+        monthly = item.get("attributed_monthly_cost")
+        lines.append(f"Attributed monthly cost: {monthly['currency']} {monthly['amount']:,.2f}" if monthly else "Attributed monthly cost: unavailable")
+        lines.extend(["", "Marginal savings scenarios:"])
+        for scenario in item["remediation_scenarios"]:
+            savings = scenario.get("monthly_savings") or {"currency": "", "amount": 0.0}
+            lines.append(f"- **{scenario['name']}**: {scenario['status']} - {savings['currency']} {savings['amount']:,.2f}/month")
+            if scenario.get("note"):
+                lines.append(f"  - {scenario['note']}")
+        if item["missing_evidence"]:
+            lines.append("Missing evidence: " + "; ".join(item["missing_evidence"]))
+        lines.append("")
 
-    lines.extend(["", "### Marginal Savings Scenarios", ""])
-    for scenario in result["remediation_scenarios"]:
-        savings = scenario.get("monthly_savings") or {"currency": "", "amount": 0.0}
-        lines.append(f"- **{scenario['name']}**: {scenario['status']} - {savings['currency']} {savings['amount']:,.2f}/month")
-        if scenario.get("note"):
-            lines.append(f"  - {scenario['note']}")
-
-    lines.extend(["", "### Protected Costs", ""])
-    protected = result["protected_costs"]["monthly_projection"]
-    for key, values in protected.items():
-        if not values:
-            lines.append(f"- {key}: 0.00")
-        else:
-            lines.append(f"- {key}: " + ", ".join(f"{currency} {value:,.2f}" for currency, value in values.items()))
-    if result["missing_evidence"]:
-        lines.extend(["", "### Missing Evidence", ""])
-        lines.extend(f"- {item}" for item in result["missing_evidence"])
     lines.extend(["", result["limits"][0], result["limits"][1]])
     return "\n".join(lines)
 

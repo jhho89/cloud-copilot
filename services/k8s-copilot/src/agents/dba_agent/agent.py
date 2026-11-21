@@ -93,7 +93,7 @@ For Redis/Valkey output:
 2. When JSON is requested, return the JSON verbatim to tooling and do not reformat it into prose. Preserve empty/unavailable fields and evidence errors rather than inventing values.
 
 For idle database cost engineering:
-1. Use collect_database_idle_assessment for idle-cost questions over one to 31 days. It supports mysql, mariadb, redis, and valkey, and JSON is the machine-readable default.
+1. Use collect_database_idle_assessment for idle-cost questions over one to 31 days. It supports mysql, mariadb, redis, and valkey, and JSON is the machine-readable default. Return every matching workload in data.workloads; do not truncate after the first workload.
 2. It is metrics-only. It uses Cloud Monitoring/Managed Prometheus trends and read-only Kubernetes metadata; it never uses pod/exec as a metrics fallback, never installs exporters, and never changes Kubernetes or database state.
 3. An existing mysqld_exporter, redis_exporter, or valkey-exporter plus prometheus.io annotations must already be enabled. If no exporter or matching series is found, report the profile-specific operator recommendation as a prerequisite.
 4. Connections alone are not proof of idleness. The assessment requires hourly work-rate, active MySQL threads where applicable, and CPU evidence; persistent data, backups, replication/failover, production, ownership, and environment gaps block a shutdown recommendation.

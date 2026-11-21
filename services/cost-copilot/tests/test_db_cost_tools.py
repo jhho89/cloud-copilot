@@ -3,6 +3,7 @@ import inspect
 import json
 import os
 import sys
+from copy import deepcopy
 
 import pytest
 
@@ -157,6 +158,53 @@ def test_build_idle_result_separates_costs_and_savings():
     assert result["protected_costs"]["window_observed"]["backups_snapshots"] == {"USD": 3.0}
     assert result["unattributed_costs"][0]["observed_cost"] == 99.0
     assert result["missing_evidence"] == []
+
+
+def test_build_idle_result_models_every_workload_separately():
+    envelope = parse_idle_assessment(ENVELOPE)
+    redis = deepcopy(envelope["data"]["workloads"][0])
+    redis.update(pod="redis-0", db_type="redis", controller_name="redis")
+    envelope["data"]["workloads"].append(redis)
+    rows = [
+        _row(cost=20),
+        _row(service="Compute Engine", sku="Persistent SSD", cost=5),
+        _row(workload="redis", node_pool="pool-2", cost=8),
+        _row(workload="redis", node_pool="pool-2", service="Cloud SQL", sku="Backup", cost=2),
+    ]
+
+    result = build_idle_cost_result(envelope, rows, 30)
+
+    assert [item["workload"]["pod"] for item in result["workloads"]] == ["mysql-0", "redis-0"]
+    mysql, redis_result = result["workloads"]
+    assert mysql["observed_cost"] == {"currency": "USD", "amount": 25.0}
+    assert mysql["compute_cost"]["monthly_cost"] == {"currency": "USD", "amount": 20.0}
+    assert mysql["protected_costs"]["window_observed"]["persistent_storage"] == {"USD": 5.0}
+    assert redis_result["observed_cost"] == {"currency": "USD", "amount": 10.0}
+    assert redis_result["compute_cost"]["monthly_cost"] == {"currency": "USD", "amount": 8.0}
+    assert redis_result["protected_costs"]["window_observed"]["backups_snapshots"] == {"USD": 2.0}
+    assert result["workload"]["pod"] == "mysql-0"
+    assert result["marginal_monthly_savings"] == mysql["marginal_monthly_savings"]
+
+
+def test_multi_workload_results_never_mix_currencies():
+    envelope = parse_idle_assessment(ENVELOPE)
+    redis = deepcopy(envelope["data"]["workloads"][0])
+    redis.update(pod="redis-0", db_type="redis", controller_name="redis")
+    envelope["data"]["workloads"].append(redis)
+    rows = [
+        _row(cost=20),
+        _row(workload="redis", cost=8, currency="USD"),
+        _row(workload="redis", cost=2, currency="EUR"),
+    ]
+
+    result = build_idle_cost_result(envelope, rows, 30)
+
+    assert result["billing_attribution"]["status"] == "available"
+    assert result["marginal_monthly_savings"]["currency"] == "USD"
+    redis_result = result["workloads"][1]
+    assert redis_result["billing_attribution"]["status"] == "unavailable"
+    assert "currencies were not mixed" in redis_result["billing_attribution"]["detail"]["reason"]
+    assert redis_result["marginal_monthly_savings"]["amount"] == 0.0
 
 
 def test_autopilot_uses_approved_idle_hours_and_keeps_storage():

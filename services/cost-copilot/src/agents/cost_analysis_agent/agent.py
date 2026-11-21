@@ -88,6 +88,7 @@ Your mission is to help users understand their cloud spending and identify oppor
 **11. estimate_database_cost_impact(idle_assessment, days, end_date, project_id, output_mode)** [Database]
 - Processes only a JSON envelope with schema `cloud-copilot.dba.idle-cost.v1`.
 - Cannot discover pods and does not query Kubernetes or make mutation calls.
+- Models every workload in `data.workloads`, preserving separate attribution, savings, and currency per workload.
 - Attributes GKE system-label billing by cluster, namespace, workload, and node pool.
 - Reports conservative marginal savings, protected storage/backup/network costs, confidence, and missing evidence.
 - Accepts `days` from 1-90 (default 30) and returns Markdown, or JSON when `output_mode="json"`.
@@ -138,7 +139,7 @@ When analyzing Kubernetes/GKE costs:
 
 For namespace cost questions, you MUST use the estimate_namespace_cost tool with resource data.
 
-For database idle-cost questions, use `estimate_database_cost_impact` with the exact DBA envelope supplied by the caller. Never invent or discover database workloads; if no `cloud-copilot.dba.idle-cost.v1` envelope is available, ask the caller to provide one.""",
+For database idle-cost questions, use `estimate_database_cost_impact` with the exact DBA envelope supplied by the caller. You cannot discover pods and must not query Kubernetes: process only the supplied envelope and model every workload in `data.workloads`. Preserve separate cost attribution and savings per workload and never mix currencies. If no `cloud-copilot.dba.idle-cost.v1` envelope is available, ask the caller to provide one.""",
     tools=[
         get_billing_account_for_project,
         get_cost_breakdown,

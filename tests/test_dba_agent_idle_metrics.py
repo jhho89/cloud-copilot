@@ -12,10 +12,14 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 K8S_AGENTS = REPO_ROOT / "services" / "k8s-copilot" / "src" / "agents"
+COST_AGENTS = REPO_ROOT / "services" / "cost-copilot" / "src" / "agents"
 if str(K8S_AGENTS) not in sys.path:
     sys.path.insert(0, str(K8S_AGENTS))
+if str(COST_AGENTS) not in sys.path:
+    sys.path.insert(0, str(COST_AGENTS))
 
 from dba_agent import idle_metrics  # noqa: E402
+from cost_analysis_agent import db_cost_tools  # noqa: E402
 
 
 END_TIME = datetime(2026, 1, 3, 12, 0, tzinfo=timezone.utc)
@@ -49,6 +53,7 @@ def _database_profile_pod(
     owner: str = "platform-data",
     environment: str = "staging",
     role: str = "",
+    pod_name: str | None = None,
 ) -> SimpleNamespace:
     images = {"mysql": "mysql:8.0", "mariadb": "mariadb:11", "redis": "redis:7", "valkey": "valkey/valkey:8.0"}
     labels = {"app.kubernetes.io/name": db_type, "team": owner}
@@ -68,7 +73,7 @@ def _database_profile_pod(
         containers.append(SimpleNamespace(name="metrics", image=exporter_image))
     return SimpleNamespace(
         metadata=SimpleNamespace(
-            name=f"{db_type}-0",
+            name=pod_name or f"{db_type}-0",
             namespace="database",
             labels=labels,
             annotations={
@@ -226,6 +231,31 @@ def _gke_series() -> dict[str, list[SimpleNamespace]]:
     return series
 
 
+def _profile_series_for_pods(db_type: str, pod_names: list[str]) -> dict[str, list[SimpleNamespace]]:
+    single_pod_series = _profile_series(db_type)
+    series = {}
+    for metric_type, samples in single_pod_series.items():
+        points = samples[0].points
+        series[metric_type] = [_series("database", pod_name, points=points) for pod_name in pod_names]
+    return series
+
+
+def _gke_series_for_pods(pod_names: list[str]) -> dict[str, list[SimpleNamespace]]:
+    single_pod_series = _gke_series()
+    series = {}
+    for metric_type, samples in single_pod_series.items():
+        points = samples[0].points
+        series[metric_type] = [samples[0]] + [
+            SimpleNamespace(
+                metric=SimpleNamespace(labels={"namespace_name": "database", "pod_name": pod_name, "container_name": "database"}),
+                resource=SimpleNamespace(labels={}),
+                points=points,
+            )
+            for pod_name in pod_names[1:]
+        ]
+    return series
+
+
 def _assessment_fixtures(
     db_type: str,
     *,
@@ -320,6 +350,71 @@ def test_mysql_assessment_is_candidate_with_existing_exporter(monkeypatch) -> No
     assert payload["metadata"]["window_days"] == 2
     assert payload["metadata"]["metrics_source"] == "cloud_monitoring"
     assert payload["metadata"]["missing_metrics"] == []
+
+
+def test_mysql_assessment_represents_every_matching_workload(monkeypatch) -> None:
+    pod_names = ["mysql-0", "mysql-1"]
+    pods = [
+        _database_profile_pod("mysql", True, pod_name=pod_name, persistent=True)
+        for pod_name in pod_names
+    ]
+    core = FakeCoreApi(pods)
+    monitoring = FakeMonitoringApi({**_profile_series_for_pods("mysql", pod_names), **_gke_series_for_pods(pod_names)})
+    monkeypatch.setattr(idle_metrics, "_load_kubernetes_client", lambda: core)
+    monkeypatch.setattr(idle_metrics, "load_cloud_monitoring_client", lambda: monitoring)
+    backup = SimpleNamespace(
+        metadata=SimpleNamespace(name="mysql-backup", namespace="database", labels={}),
+        spec=SimpleNamespace(schedule="0 2 * * *"),
+        status=SimpleNamespace(last_schedule_time=END_TIME - timedelta(hours=2)),
+    )
+    monkeypatch.setattr(idle_metrics.client, "BatchV1Api", lambda: FakeBatchApi([backup]))
+
+    raw = idle_metrics.collect_database_idle_assessment(
+        "mysql",
+        namespace="database",
+        days=2,
+        project_id="example-project",
+        output_mode="json",
+    )
+    payload = json.loads(raw)
+
+    assert payload["metadata"]["pod_count"] == 2
+    assert [workload["pod"] for workload in payload["data"]["workloads"]] == pod_names
+    assert all(workload["classification"] == "candidate" for workload in payload["data"]["workloads"])
+    assert all(workload["kubernetes"]["persistent_volume_claims"]["mounted"] for workload in payload["data"]["workloads"])
+
+
+def test_dba_envelope_is_compatible_with_cost_copilot_contract(monkeypatch) -> None:
+    pod_names = ["mysql-0", "mysql-1"]
+    pods = [_database_profile_pod("mysql", True, pod_name=pod_name) for pod_name in pod_names]
+    core = FakeCoreApi(pods)
+    monitoring = FakeMonitoringApi({**_profile_series_for_pods("mysql", pod_names), **_gke_series_for_pods(pod_names)})
+    monkeypatch.setattr(idle_metrics, "_load_kubernetes_client", lambda: core)
+    monkeypatch.setattr(idle_metrics, "load_cloud_monitoring_client", lambda: monitoring)
+    monkeypatch.setattr(idle_metrics.client, "BatchV1Api", lambda: FakeBatchApi([]))
+
+    raw = idle_metrics.collect_database_idle_assessment(
+        "mysql",
+        namespace="database",
+        days=2,
+        project_id="example-project",
+        output_mode="json",
+    )
+    validated = db_cost_tools.parse_idle_assessment(raw)
+
+    assert validated["schema_version"] == idle_metrics.SCHEMA_VERSION
+    assert len(validated["data"]["workloads"]) == 2
+    required = {
+        "namespace", "pod", "db_type", "node_name", "controller_name", "controller_type",
+        "classification", "metrics", "risks", "labels",
+    }
+    for workload in validated["data"]["workloads"]:
+        assert required <= set(workload)
+        assert set(workload["metrics"]) >= {
+            "p95_work_per_second", "mean_active_threads", "p95_cpu_fraction", "zero_work_hour_ratio",
+        }
+    modeled = db_cost_tools.build_idle_cost_result(validated, [], 14)
+    assert [item["workload"]["pod"] for item in modeled["workloads"]] == pod_names
 
 
 def test_redis_alias_and_connection_does_not_establish_idleness(monkeypatch) -> None:
