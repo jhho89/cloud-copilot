@@ -30,6 +30,15 @@ BILLING_EXPORT_SCHEMA = {
     "usage_end_time": "TIMESTAMP",
 }
 
+GKE_SYSTEM_LABELS = {
+    "cluster": "goog-k8s-cluster-name",
+    "cluster_location": "goog-k8s-cluster-location",
+    "namespace": "goog-k8s-namespace",
+    "workload": "goog-k8s-workload-name",
+    "workload_type": "goog-k8s-workload-type",
+    "node_pool": "goog-k8s-node-pool-name",
+}
+
 
 class BillingExportError(Exception):
     """Base error for billing-export problems."""
@@ -112,6 +121,7 @@ def build_cost_breakdown_query(
     group_by: list[str],
     days: int = 30,
     end_date: Any | None = None,
+    limit: int | None = 100,
 ) -> tuple[str, dict[str, Any]]:
     """Build a parameterized cost-breakdown query for the billing export."""
     allowed = {
@@ -120,22 +130,35 @@ def build_cost_breakdown_query(
         "project": "project.id",
         "date": "DATE(usage_start_time)",
     }
+    for key, label_name in GKE_SYSTEM_LABELS.items():
+        # A scalar subquery preserves billing rows; UNNEST in the FROM clause
+        # would multiply each row once for every attached label.
+        allowed[key] = (
+            f'COALESCE((SELECT label.value FROM UNNEST(labels) AS label '
+            f"WHERE label.key = '{label_name}' LIMIT 1), 'unlabeled')"
+        )
     keys = [k.strip().lower() for k in group_by]
     invalid = [k for k in keys if k not in allowed]
     if invalid:
         raise ValueError(f"Unsupported group-by field(s): {', '.join(invalid)}. Allowed: {', '.join(sorted(allowed))}")
     start, end = normalize_window(days, end_date)
     select_parts = [allowed[k] for k in keys]
+    aliased_parts = []
+    for key, expression in zip(keys, select_parts, strict=True):
+        if key in GKE_SYSTEM_LABELS:
+            expression += f" AS {key}"
+        aliased_parts.append(expression)
+    limit_clause = f"\n        LIMIT {limit}" if limit is not None else ""
     query = f"""
         SELECT
-          {', '.join(select_parts)},
+          {', '.join(aliased_parts)},
           currency,
           SUM(cost) AS total_cost
         FROM `{billing_export_table_id()}`
         WHERE DATE(usage_start_time) BETWEEN @start_date AND @end_date
         GROUP BY {', '.join(keys)}, currency
         ORDER BY total_cost DESC
-        LIMIT 100
+        {limit_clause}
     """
     params = {
         "start_date": start.isoformat(),
@@ -210,6 +233,7 @@ def get_cost_breakdown(
     days: int = 30,
     end_date: Any | None = None,
     client: bigquery.Client | None = None,
+    limit: int | None = 100,
 ) -> list[dict[str, Any]]:
     """Return grouped cost totals from the billing export."""
     if not group_by:
@@ -219,7 +243,7 @@ def get_cost_breakdown(
         raise ValueError("group_by contains duplicate fields")
     if "label" in group_by:
         raise ValueError("label breakdown requires the unnest path; not yet implemented in this helper")
-    query, params = build_cost_breakdown_query(group_by, days, end_date)
+    query, params = build_cost_breakdown_query(group_by, days, end_date, limit)
     keys = group_by
     client = client or get_billing_client()
     rows = _run_query(client, query, params)

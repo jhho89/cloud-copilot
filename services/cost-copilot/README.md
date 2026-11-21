@@ -34,6 +34,7 @@ Cost Copilot (Orchestrator)
 - Reviews storage optimization strategies
 - Calculates total potential savings
 - Queries the BigQuery billing export for real cost breakdowns and anomalies
+- Estimates database idle-cost impact from a supplied `cloud-copilot.dba.idle-cost.v1` envelope
 
 ## Features
 
@@ -50,6 +51,7 @@ Cost Copilot (Orchestrator)
 - Savings estimation
 - BigQuery billing-export cost breakdowns by service, SKU, project and date
 - Daily cost anomaly detection
+- Database idle-impact modeling from DBA envelopes, with GKE system-label attribution
 
 ✅ **Actionable Recommendations**
 - Dollar-quantified savings
@@ -125,6 +127,46 @@ The service account needs:
 - `suggest_committed_use_discounts(project_id)` - CUD opportunities
 - `estimate_cost_savings(summary)` - Calculate potential savings
 - `analyze_storage_costs(project_id)` - Storage optimization guide
+- `estimate_database_cost_impact(idle_assessment, days=30, end_date=None, project_id=None, output_mode="markdown")` - Attribute database billing and model marginal savings from a DBA envelope
+
+### Database Idle Impact
+
+The database tool is envelope-driven. It accepts the DBA schema
+`cloud-copilot.dba.idle-cost.v1` only, validates the workload, metrics, status,
+window, and project fields defensively, and never discovers pods or queries
+Kubernetes. It also makes no mutation calls.
+
+Billing attribution uses these GKE cost-allocation system labels:
+
+| Result field | Billing-export label |
+| --- | --- |
+| `cluster` | `goog-k8s-cluster-name` |
+| `cluster_location` | `goog-k8s-cluster-location` |
+| `namespace` | `goog-k8s-namespace` |
+| `workload` | `goog-k8s-workload-name` |
+| `workload_type` | `goog-k8s-workload-type` |
+| `node_pool` | `goog-k8s-node-pool-name` |
+
+The tool reports observed cost, projected 30-day cost, compute cost, marginal
+savings scenarios, protected costs, confidence, and missing evidence. Totals
+are never mixed across currencies. If cost allocation is disabled or labels are
+absent, `billing_attribution.status` is `unavailable`; the tool does not
+fabricate node-level spend.
+
+Savings remain conservative:
+
+- **Autopilot**: pod-request compute attributable to the workload is marginal
+  for approved idle hours. PVC and backup costs remain.
+- **Standard GKE**: workload attribution is not savings by itself. Marginal
+  compute savings require evidence that the database is the last removable
+  non-DaemonSet workload on a node and that remaining pods fit on existing nodes
+  in the same node pool. Otherwise the result is a consolidation opportunity with
+  zero or unavailable savings.
+- **Scheduled shutdown**: savings are proportional to approved off-hours, minus
+  restart/warm-up cost, using minimum run-length assumptions.
+- **Permanent decommission**: only marginal compute is savings. Persistent
+  storage, backups, snapshots, load balancers, and static IPs remain visible and
+  are not counted.
 
 ## Deployment
 
@@ -167,6 +209,8 @@ KubernetesCopilot = Agent(
 - **Recommender API**: Needs 24-48 hours of data collection
 - **Zone/Region Scanning**: Limited to top 10 zones for performance
 - **Read-Only**: No automated actions (recommendations only)
+- **Database Idle Impact**: Requires a caller-provided DBA envelope and GKE cost
+  allocation labels; it does not discover pods or query Kubernetes
 
 ## Future Enhancements
 
