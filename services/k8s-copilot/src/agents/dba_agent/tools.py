@@ -14,6 +14,14 @@ from typing import Any
 
 from kubernetes import client, config, stream
 
+from .idle_metrics import (
+    MetricSample,
+    REDIS_METRIC_ALIASES,
+    REDIS_METRIC_KINDS,
+    read_monitoring_series,
+    resolve_metrics_project_id,
+)
+
 
 _AUDIT_LOGGER = logging.getLogger("cloud_copilot.dba_agent")
 _SLOW_LOG_READER = "/usr/bin/tail"
@@ -58,52 +66,6 @@ _REDIS_REMEDIATION_FORK_USEC = 100_000
 _REDIS_REMEDIATION_EXPIRED_KEYS = 1_000
 _REDIS_REMEDIATION_TOP_COMMAND_COUNT = 10
 _REDIS_STRUCTURED_SCHEMA_VERSION = "cloud-copilot.dba.redis.v1"
-_REDIS_METRIC_ALIASES = {
-    "memory_used_bytes": ("redis_memory_used_bytes", "redis_used_memory_bytes"),
-    "maxmemory_bytes": ("redis_memory_max_bytes", "redis_maxmemory_bytes"),
-    "fragmentation_ratio": (
-        "redis_mem_fragmentation_ratio",
-        "redis_memory_fragmentation_ratio",
-    ),
-    "evicted_total": (
-        "redis_evicted_keys_total",
-        "redis_evicted_keys",
-        "redis_total_keys_evicted",
-    ),
-    "connected_clients": (
-        "redis_connected_clients",
-        "redis_clients_connected",
-    ),
-    "commands_total": (
-        "redis_commands_processed_total",
-        "redis_total_commands_processed",
-    ),
-    "instantaneous_ops": (
-        "redis_instantaneous_ops_per_sec",
-        "redis_commands_per_second",
-    ),
-    "hits_total": (
-        "redis_keyspace_hits_total",
-        "redis_keyspace_hits",
-    ),
-    "misses_total": (
-        "redis_keyspace_misses_total",
-        "redis_keyspace_misses",
-    ),
-}
-_REDIS_METRIC_KINDS = {
-    "memory_used_bytes": "gauge",
-    "maxmemory_bytes": "gauge",
-    "fragmentation_ratio": "gauge",
-    "evicted_total": "counter",
-    "connected_clients": "gauge",
-    "commands_total": "counter",
-    "instantaneous_ops": "gauge",
-    "hits_total": "counter",
-    "misses_total": "counter",
-}
-
-
 class SlowLogFileConfigError(ValueError):
     """Raised when a slow-log file path is missing, ambiguous, or not allowlisted."""
 
@@ -177,10 +139,7 @@ class RedisRemediation:
         ]
 
 
-@dataclass
-class RedisMetricSample:
-    timestamp: datetime
-    value: float
+RedisMetricSample = MetricSample
 
 
 def _redis_output_mode(output_mode: object) -> str:
@@ -717,83 +676,14 @@ def _redis_metrics_discovery(
     return {"pods": pods, "candidates": candidates}
 
 
-def _load_cloud_monitoring_client() -> Any:
-    from google.cloud import monitoring_v3
-
-    return monitoring_v3.MetricServiceClient()
-
-
 def _redis_project_id(requested: Optional[str]) -> str:
-    project = requested or os.getenv("DBA_REDIS_METRICS_PROJECT_ID")
-    if project:
-        return project
-    import google.auth
-
-    _, inferred = google.auth.default()
-    if not inferred:
+    try:
+        return resolve_metrics_project_id(requested)
+    except Exception as exc:
         raise RedisMetricsUnavailableError(
             "A metrics project is not configured. Set DBA_REDIS_METRICS_PROJECT_ID "
             "or provide project_id when using Google Cloud Monitoring."
-        )
-    return inferred
-
-
-def _normalize_redis_metric_labels(
-    metric_labels: Optional[dict[str, str]],
-    resource_labels: Optional[dict[str, str]],
-) -> dict[str, str]:
-    labels = {str(key): str(value) for key, value in (metric_labels or {}).items()}
-    labels.update({str(key): str(value) for key, value in (resource_labels or {}).items()})
-    return labels
-
-
-def _redis_metric_matches_target(labels: dict[str, str], namespace: str, pod_name: str) -> bool:
-    label_namespace = next(
-        (
-            labels.get(name, "")
-            for name in ("namespace", "namespace_name", "k8s_namespace", "k8s_pod_namespace")
-            if labels.get(name)
-        ),
-        "",
-    )
-    label_pod = next(
-        (
-            labels.get(name, "")
-            for name in ("pod", "pod_name", "k8s_pod", "k8s_pod_name")
-            if labels.get(name)
-        ),
-        "",
-    )
-    if not label_namespace and not label_pod:
-        return True
-    if label_namespace and namespace and label_namespace != namespace:
-        return False
-    if label_pod and pod_name and label_pod != pod_name:
-        return False
-    return True
-
-
-def _redis_metric_samples(points: Any) -> list[RedisMetricSample]:
-    samples: list[RedisMetricSample] = []
-    for point in points or []:
-        interval = getattr(point, "interval", None)
-        value = getattr(point, "value", None)
-        end_time = getattr(interval, "end_time", None)
-        number = getattr(value, "double_value", None)
-        if number is None:
-            number = getattr(value, "int64_value", None)
-        if number is None:
-            number = getattr(value, "distribution_value", None)
-        if end_time is None or number is None or not isinstance(number, (int, float)):
-            continue
-        timestamp = end_time
-        if isinstance(timestamp, str):
-            timestamp = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
-        if getattr(timestamp, "tzinfo", None) is None:
-            timestamp = timestamp.replace(tzinfo=timezone.utc)
-        samples.append(RedisMetricSample(timestamp, float(number)))
-    samples.sort(key=lambda sample: sample.timestamp)
-    return samples
+        ) from exc
 
 
 def _read_redis_monitoring_series(
@@ -803,63 +693,18 @@ def _read_redis_monitoring_series(
     target_namespace: str,
     target_pod: str,
 ) -> dict[str, dict[str, Any]]:
-    from google.cloud import monitoring_v3
-
-    client = _load_cloud_monitoring_client()
-    interval = monitoring_v3.TimeInterval(
-        {
-            "start_time": {"seconds": int(start_time.timestamp())},
-            "end_time": {"seconds": int(end_time.timestamp())},
-        }
+    metrics = read_monitoring_series(
+        project_id,
+        start_time,
+        end_time,
+        [(target_namespace, target_pod)],
+        REDIS_METRIC_ALIASES,
+        REDIS_METRIC_KINDS,
+        descriptor_prefix="prometheus.googleapis.com/redis_",
     )
-    metrics: dict[str, dict[str, Any]] = {}
-    descriptors = client.list_metric_descriptors(
-        request={
-            "name": f"projects/{project_id}",
-            "filter": 'metric.type = starts_with("prometheus.googleapis.com/redis_")',
-        }
-    )
-    for descriptor in descriptors:
-        metric_type = getattr(descriptor, "type", "")
-        parts = metric_type.split("/")
-        if len(parts) < 3:
-            continue
-        metric_name = parts[-2]
-        logical = next(
-            (logical_name for logical_name, aliases in _REDIS_METRIC_ALIASES.items() if metric_name in aliases),
-            None,
-        )
-        if logical is None or logical in metrics:
-            continue
-        series_list = client.list_time_series(
-            request={
-                "name": f"projects/{project_id}",
-                "filter": f'metric.type = "{metric_type}"',
-                "interval": interval,
-                "view": monitoring_v3.ListTimeSeriesRequest.TimeSeriesView.FULL,
-            }
-        )
-        matched_samples: list[RedisMetricSample] = []
-        matched_labels: dict[str, str] = {}
-        for series in series_list:
-            labels = _normalize_redis_metric_labels(
-                getattr(series.metric, "labels", None),
-                getattr(series.resource, "labels", None),
-            )
-            if not _redis_metric_matches_target(labels, target_namespace, target_pod):
-                continue
-            samples = _redis_metric_samples(getattr(series, "points", None))
-            if samples:
-                matched_samples.extend(samples)
-                matched_labels = labels
-        if matched_samples:
-            matched_samples.sort(key=lambda sample: sample.timestamp)
-            metrics[logical] = {
-                "metric_type": metric_type,
-                "kind": _REDIS_METRIC_KINDS[logical],
-                "labels": matched_labels,
-                "samples": matched_samples,
-            }
+    # Preserve the long-standing logical names consumed by trend reporting.
+    legacy_names = {"work_total": "commands_total", "instantaneous_work_rate": "instantaneous_ops"}
+    return {legacy_names.get(logical, logical): metric for logical, metric in metrics.items()}
     if not metrics:
         raise RedisMetricsUnavailableError(
             "No Redis/Valkey metric series were found in the configured monitoring project "

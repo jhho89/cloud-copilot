@@ -77,6 +77,7 @@ Coordinates specialized sub-agents to solve complex troubleshooting workflows. U
 - `get_redis_metrics_trends()` - Report metrics-backed hit rate, memory, eviction, client, and ops/sec trends when a Redis exporter/monitoring pipeline is discoverable
 - `get_redis_snapshot_diff()` - Compare two read-only INFO snapshots taken a bounded number of minutes apart
 - `get_redis_remediation_recommendations()` - Correlate read-only diagnostics into evidence-linked advisory changes
+- `collect_database_idle_assessment()` - Assess idle database cost for MySQL/MariaDB/Redis/Valkey using Cloud Monitoring, existing exporters, and read-only Kubernetes metadata
 
 Slow-query analysis reads the container's `stdout`/`stderr` by default. A read-only file mode is also available when an operator allowlists an absolute slow-log path; it uses a shell-free `tail` exec and emits audit metadata without SQL or credentials. See [docs/dba-rbac.md](../docs/dba-rbac.md) for RBAC, file prerequisites, and replica-selection guidance.
 
@@ -89,6 +90,8 @@ Redis and Valkey memory reports use the same CLI path with only `INFO memory`, `
 The client report groups buffer-heavy, long-idle, subscription-heavy, MONITOR, and blocked clients by connection name or address, explains likely application-side causes, and surfaces replica lag/backlog headroom, Sentinel quorum and failover state, and cluster shard layout. Cluster mode still requires per-node/per-master evidence; the report explicitly calls out that fan-out rather than treating one shard as the cluster.
 
 Redis/Valkey trends prefer metrics. The trend tool can use an existing Google Managed Prometheus/GKE pipeline or a `redis_exporter`/`valkey-exporter` sidecar with scrape annotations; it does not use pod/exec as a trend fallback. A separate snapshot diff makes two read-only INFO reads a bounded number of minutes apart and reports memory, fragmentation, eviction, hit/miss, client, and ops deltas without storing credentials or raw output. Redis/Valkey tools preserve Markdown by default and support `output_mode="json"` with a stable envelope. See [docs/redis-valkey-dba.md](docs/redis-valkey-dba.md).
+
+Idle database cost assessment is metrics-only. It profiles MySQL, MariaDB, Redis, and Valkey through Cloud Monitoring/Managed Prometheus, reuses an already-installed `mysqld_exporter`, `redis_exporter`, or `valkey-exporter`, and never falls back to pod/exec or installs an exporter. It combines hourly work, active-thread, and CPU evidence with non-secret Kubernetes ownership, PVC, backup, replication, and node/resource envelope context. Cost-review candidates require an operator-controlled eligibility annotation; production, failover, backup, ownership, and environment gaps remain blocked. See [docs/idle-database-cost.md](docs/idle-database-cost.md).
 
 ---
 

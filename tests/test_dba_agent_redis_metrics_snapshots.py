@@ -16,6 +16,7 @@ if str(K8S_AGENTS) not in sys.path:
     sys.path.insert(0, str(K8S_AGENTS))
 
 from dba_agent import tools  # noqa: E402
+from dba_agent import idle_metrics  # noqa: E402
 
 
 def _redis_pod(
@@ -107,7 +108,7 @@ def test_monitoring_series_normalizes_labels_and_sorts_samples(monkeypatch) -> N
             assert request["filter"] == 'metric.type = "prometheus.googleapis.com/redis_memory_used_bytes/gauge"'
             return [wrong_target, series]
 
-    monkeypatch.setattr(tools, "_load_cloud_monitoring_client", MonitoringClient)
+    monkeypatch.setattr(idle_metrics, "load_cloud_monitoring_client", lambda: MonitoringClient())
     metrics = tools._read_redis_monitoring_series(
         "prod",
         datetime(2026, 1, 1, tzinfo=timezone.utc),
