@@ -127,14 +127,16 @@ The service account needs:
 - `suggest_committed_use_discounts(project_id)` - CUD opportunities
 - `estimate_cost_savings(summary)` - Calculate potential savings
 - `analyze_storage_costs(project_id)` - Storage optimization guide
-- `estimate_database_cost_impact(idle_assessment, days=30, end_date=None, project_id=None, output_mode="markdown")` - Attribute database billing and model marginal savings from a DBA envelope
+- `estimate_database_cost_impact(idle_assessment, days=30, end_date=None, project_id=None, output_mode="markdown")` - Attribute database billing and model marginal savings for every workload in a DBA envelope
 
 ### Database Idle Impact
 
 The database tool is envelope-driven. It accepts the DBA schema
-`cloud-copilot.dba.idle-cost.v1` only, validates the workload, metrics, status,
+`cloud-copilot.dba.idle-cost.v1` only, validates the workloads, metrics, status,
 window, and project fields defensively, and never discovers pods or queries
-Kubernetes. It also makes no mutation calls.
+Kubernetes. It also makes no mutation calls. It models every workload in
+`data.workloads`; results include a `workloads` array, while the legacy
+first-workload fields remain at the top level for compatibility.
 
 Billing attribution uses these GKE cost-allocation system labels:
 

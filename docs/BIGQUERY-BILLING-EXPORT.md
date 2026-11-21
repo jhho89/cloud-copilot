@@ -75,6 +75,8 @@ parameterized.
 
 Each workload must include namespace, pod, database type, node, controller name
 and type, metrics, classification, owner, environment, and eligibility evidence.
+The tool validates and models every workload in the array; it does not stop after
+the first item.
 The minimum metrics are `p95_work_per_second`, `mean_active_threads`,
 `p95_cpu_fraction`, and `zero_work_hour_ratio`.
 

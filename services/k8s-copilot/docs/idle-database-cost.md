@@ -1,6 +1,6 @@
 # Idle database cost engineering
 
-`collect_database_idle_assessment` is a metrics-only cost assessment for MySQL, MariaDB, Redis, and Valkey. It returns `schema_version=cloud-copilot.dba.idle-cost.v1`, preserves workload attribution, and is advisory. It does not use pod/exec as a metrics fallback, install an exporter, read Secrets, accept credentials, or mutate Kubernetes or database state.
+`collect_database_idle_assessment` is a metrics-only cost assessment for MySQL, MariaDB, Redis, and Valkey. It returns `schema_version=cloud-copilot.dba.idle-cost.v1`, preserves attribution for every matching workload in `data.workloads`, and is advisory. It does not use pod/exec as a metrics fallback, install an exporter, read Secrets, accept credentials, or mutate Kubernetes or database state.
 
 ## Prerequisites and IAM
 
@@ -35,3 +35,10 @@ Shutdown is never recommended for failover replicas, primaries with active backu
 JSON is the default and is intended for Cost Copilot. Stable fields are `schema_version`, `generated_at`, `status`, `data.workloads[*]` attribution, classification, metrics, risks, owner, environment, and eligibility evidence, plus project, window, source, and missing-metric metadata. Each workload also carries a `kubernetes` envelope with node/controller context, requests and limits, PVCs, backup evidence, and node-pool information so downstream services need no Kubernetes access. Non-secret metadata may be added, but existing fields and the schema version remain stable.
 
 Human output summarizes the same evidence for operators. All output avoids Secrets, credential values, and raw metric labels that could contain sensitive identity data.
+
+## Orchestration with Cost Copilot
+
+1. Ask DBA Agent for `collect_database_idle_assessment` and use `output_mode=json`.
+2. If modeling needs missing node, namespace, or resource context, ask Diagnostic Agent. Cost Copilot has no Kubernetes access.
+3. Pass the DBA JSON envelope verbatim to Cost Copilot's `estimate_database_cost_impact`. It models every workload in `data.workloads`, preserving separate attribution, protected costs, savings, and currency.
+4. Render a combined report with idle evidence, risks, required approvals, cost attribution, and marginal savings. The result is advisory: explicit database, backup, and service-owner approval is required, and no shutdown or mutation is automatic.

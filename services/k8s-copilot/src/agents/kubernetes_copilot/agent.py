@@ -77,6 +77,7 @@ Delegate to this agent for:
 - Reading recent database pod logs for slow-query activity
 - Summarizing slow queries by query time, lock time, rows examined, and SQL text
 - Redis/Valkey read-only diagnostics, metrics trends, snapshot deltas, and advisory remediations
+- Metrics-only idle database assessments through `collect_database_idle_assessment`
 
 **5. cost_copilot (GCP Cost Analysis & Optimization)** [Remote A2A Agent]
 ⚠️ **IMPORTANT**: cost_copilot CANNOT access your Kubernetes cluster. It needs YOU to provide resource data.
@@ -113,6 +114,13 @@ This agent can:
 3. **Use exec for forensics**: Slow logs, memory, latency, client, and topology reports remain point-in-time and use the DBA agent's strict read-only allowlist.
 4. **Honor output mode**: Pass output_mode='json' only when tooling needs the structured envelope; otherwise retain the human-readable report.
 
+### For Database Idle-Cost Engineering:
+
+1. **Assess with DBA Agent**: Ask `dba_agent` for `collect_database_idle_assessment` with the requested database type, optional namespace/pod, and 1-31 day window. Request `output_mode='json'` because Cost Copilot needs the exact JSON envelope. The DBA result includes every matching workload, not only the first one.
+2. **Add context only if needed**: Ask `diagnostic_agent` for missing node, namespace, or resource context. Do not ask Cost Copilot to discover resources.
+3. **Model with Cost Copilot**: Pass the DBA JSON envelope verbatim to `cost_copilot` / `estimate_database_cost_impact`. Cost Copilot cannot discover pods and must process only that supplied envelope. Preserve separate billing attribution and marginal savings for each workload, and never add or convert currencies.
+4. **Report**: Render a combined report that distinguishes idle evidence, risks, required approvals, per-workload cost attribution, protected costs, and marginal savings. State that every recommendation is advisory; require explicit database, backup, and service-owner approval, and never imply or perform a shutdown.
+
 ### For Cost Queries:
 
 **For K8s cost questions:** First get resource data from diagnostic_agent, then pass it to cost_copilot.
@@ -128,6 +136,7 @@ This agent can:
 - Use investigator_agent to understand root causes
 - Use remediation_advisor_agent for actionable fixes
 - Use cost_copilot for cost analysis and optimization (when available)
+- Treat database idle-cost findings as advisory; no automatic shutdown or mutation is allowed
 - Synthesize findings into clear recommendations
 
 Always explain which agent you're delegating to and why.""",

@@ -42,6 +42,7 @@ class DatabaseMetricProfile:
 class MetricSample:
     timestamp: datetime
     value: float
+    labels: dict[str, str] = field(default_factory=dict)
 
 
 MYSQL_METRIC_ALIASES: dict[str, tuple[str, ...]] = {
@@ -299,7 +300,7 @@ def metric_matches_target(
     return True
 
 
-def parse_metric_samples(points: Any) -> list[MetricSample]:
+def parse_metric_samples(points: Any, labels: Optional[Mapping[str, str]] = None) -> list[MetricSample]:
     samples: list[MetricSample] = []
     for point in points or []:
         interval = getattr(point, "interval", None)
@@ -318,7 +319,7 @@ def parse_metric_samples(points: Any) -> list[MetricSample]:
         if getattr(timestamp, "tzinfo", None) is None:
             timestamp = timestamp.replace(tzinfo=timezone.utc)
         if isinstance(number, (int, float)) and math.isfinite(float(number)):
-            samples.append(MetricSample(timestamp, float(number)))
+            samples.append(MetricSample(timestamp, float(number), dict(labels or {})))
     samples.sort(key=lambda sample: sample.timestamp)
     return samples
 
@@ -395,7 +396,7 @@ def read_monitoring_series(
             )
             if not metric_matches_target(labels, targets, container_names=container_names):
                 continue
-            samples = parse_metric_samples(getattr(series, "points", None))
+            samples = parse_metric_samples(getattr(series, "points", None), labels)
             if not samples:
                 continue
             existing = metrics_by_logical.setdefault(
@@ -912,7 +913,7 @@ def _workload_record(
         filtered[logical]["samples"] = [
             sample
             for sample in metric.get("samples", [])
-            if metric_matches_target(metric.get("labels", {}), [(namespace, pod_name)], container_names=container_names)
+            if metric_matches_target(sample.labels, [(namespace, pod_name)], container_names=container_names)
         ]
     work = _work_evidence(filtered, profile, start_time, end_time)
     active_threads = _active_thread_evidence(filtered, profile, start_time, end_time)
