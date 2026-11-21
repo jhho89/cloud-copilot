@@ -13,6 +13,7 @@ from .tools import (
     get_redis_snapshot_diff,
     recommend_mysql_indexes,
 )
+from .idle_metrics import collect_database_idle_assessment
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -36,6 +37,7 @@ Available tools:
 - get_redis_metrics_trends: Use a discovered Redis exporter/Cloud Monitoring pipeline for hit-rate, memory, eviction, client, and ops/sec trends without pod/exec.
 - get_redis_snapshot_diff: Capture two read-only INFO snapshots a bounded number of minutes apart and report eviction, fragmentation, memory, client, hit, and ops deltas.
 - get_redis_remediation_recommendations: Correlate existing Redis/Valkey diagnostics into evidence-linked remediation suggestions without applying changes.
+- collect_database_idle_assessment: Produce a metrics-only idle-cost assessment for MySQL, MariaDB, Redis, or Valkey using existing exporter/Cloud Monitoring data and read-only Kubernetes metadata.
 
 For slow-query requests:
 1. If the user provides a namespace or pod, pass it directly. Otherwise search cluster-wide.
@@ -90,7 +92,14 @@ For Redis/Valkey output:
 1. Every Redis/Valkey diagnostic supports output_mode='human' (default) or output_mode='json'. JSON is a stable envelope with schema_version, tool, status, generated_at, data.report, and metadata/errors; keep the human Markdown text unchanged unless the user asks for JSON.
 2. When JSON is requested, return the JSON verbatim to tooling and do not reformat it into prose. Preserve empty/unavailable fields and evidence errors rather than inventing values.
 
-The tool reads Kubernetes pod logs by default for MySQL/MariaDB, which must have slow-query logging enabled and emit the slow log to the selected container's stdout/stderr. If logs are written only to a file inside the pod, the operator must allowlist an absolute path with DBA_ALLOWED_SLOW_LOG_PATHS (semicolon-separated) or set DBA_SLOW_LOG_FILE_PATH; the agent can then request a read-only tail of that file. Redis/Valkey slow-log inspection uses bounded pod/exec with valkey-cli or redis-cli. See docs/dba-rbac.md and docs/redis-valkey-dba.md.""",
+For idle database cost engineering:
+1. Use collect_database_idle_assessment for idle-cost questions over one to 31 days. It supports mysql, mariadb, redis, and valkey, and JSON is the machine-readable default.
+2. It is metrics-only. It uses Cloud Monitoring/Managed Prometheus trends and read-only Kubernetes metadata; it never uses pod/exec as a metrics fallback, never installs exporters, and never changes Kubernetes or database state.
+3. An existing mysqld_exporter, redis_exporter, or valkey-exporter plus prometheus.io annotations must already be enabled. If no exporter or matching series is found, report the profile-specific operator recommendation as a prerequisite.
+4. Connections alone are not proof of idleness. The assessment requires hourly work-rate, active MySQL threads where applicable, and CPU evidence; persistent data, backups, replication/failover, production, ownership, and environment gaps block a shutdown recommendation.
+5. A candidate requires an operator-controlled cost-review annotation or label plus all metric thresholds. Return JSON verbatim when output_mode='json'; every recommendation is advisory and requires database, backup, and service-owner approvals.
+
+The tool reads Kubernetes pod logs by default for MySQL/MariaDB, which must have slow-query logging enabled and emit the slow log to the selected container's stdout/stderr. If logs are written only to a file inside the pod, the operator must allowlist an absolute path with DBA_ALLOWED_SLOW_LOG_PATHS (semicolon-separated) or set DBA_SLOW_LOG_FILE_PATH; the agent can then request a read-only tail of that file. Redis/Valkey slow-log inspection uses bounded pod/exec with valkey-cli or redis-cli. See docs/dba-rbac.md, docs/redis-valkey-dba.md, and docs/idle-database-cost.md.""",
     tools=[
         find_database_pods,
         get_mysql_slow_queries,
@@ -104,6 +113,7 @@ The tool reads Kubernetes pod logs by default for MySQL/MariaDB, which must have
         get_redis_metrics_trends,
         get_redis_snapshot_diff,
         get_redis_remediation_recommendations,
+        collect_database_idle_assessment,
     ],
 )
 

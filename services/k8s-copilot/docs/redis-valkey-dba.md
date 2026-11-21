@@ -75,3 +75,9 @@ Redis/Valkey diagnostic tools accept `output_mode='human'` (default) or `output_
 Errors use `status: "error"` and an `errors` array instead of mixing failure text into a successful envelope. Metadata contains bounded attribution such as namespace, pod, window, and evidence counts. It does not contain credentials, command arguments, or raw CLI responses. Keep structured JSON verbatim for dashboards; use the human report only when a person is the intended consumer.
 
 All reports are advisory. No change is applied.
+
+## Idle cost assessment
+
+For one-to-31-day idle-cost questions, use `collect_database_idle_assessment` instead of the point-in-time diagnostics. It reads Cloud Monitoring/Managed Prometheus series from an existing `redis_exporter` or `valkey-exporter`, aggregates counters and gauges hourly, and adds read-only Kubernetes ownership, PVC, backup, replication, node, and resource-envelope context. It does not use pod/exec for trends or install an exporter.
+
+Connections alone never establish idleness. The assessment combines work-rate and CPU evidence with the configured cost-review eligibility marker and blocks replicas, primaries with backups, production workloads, unknown backups, and workloads without owner/environment markers. See [idle-database-cost.md](idle-database-cost.md) for IAM, threshold variables, and the stable JSON envelope.
