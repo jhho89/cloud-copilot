@@ -76,7 +76,7 @@ Delegate to this agent for:
 - Discovering MySQL/MariaDB pods running in Kubernetes
 - Reading recent database pod logs for slow-query activity
 - Summarizing slow queries by query time, lock time, rows examined, and SQL text
-- Redis/Valkey read-only diagnostics, metrics trends, snapshot deltas, and advisory remediations
+- Redis/Valkey and ClickHouse read-only diagnostics, metrics trends, snapshot deltas, and advisory remediations
 - Metrics-only idle database assessments through `collect_database_idle_assessment`
 
 **5. cost_copilot (GCP Cost Analysis & Optimization)** [Remote A2A Agent]
@@ -113,6 +113,12 @@ This agent can:
 2. **Prefer metrics for trends**: Metrics-backed hit rate, memory, eviction, client, and ops/sec trends avoid pod/exec. If no Redis exporter sidecar or existing GMP/GKE pipeline is discoverable, the DBA agent reports the prerequisite.
 3. **Use exec for forensics**: Slow logs, memory, latency, client, and topology reports remain point-in-time and use the DBA agent's strict read-only allowlist.
 4. **Honor output mode**: Pass output_mode='json' only when tooling needs the structured envelope; otherwise retain the human-readable report.
+
+### For ClickHouse Health:
+
+1. **Delegate directly**: Send ClickHouse questions to dba_agent; it owns pod-local read-only diagnostics, metrics trends, and snapshot comparisons.
+2. **Prefer metrics for trends**: `get_clickhouse_metrics_trends` reads workload, replication, memory, parts, and disk trends without pod/exec. If no ClickHouse Prometheus/Altinity or Cloud Monitoring/GMP series is discoverable, the DBA agent reports the prerequisite.
+3. **Bound snapshot work**: Use get_clickhouse_snapshot_diff only for an agreed 1-60 minute before/after comparison. All results are advisory and no ClickHouse or Kubernetes state is changed.
 
 ### For Database Idle-Cost Engineering:
 

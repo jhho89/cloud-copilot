@@ -34,6 +34,7 @@ GRANT SELECT ON system.replicas TO copilot_dba;
 GRANT SELECT ON system.replication_queue TO copilot_dba;
 GRANT SELECT ON system.distribution_queue TO copilot_dba;
 GRANT SELECT ON system.zookeeper_connection TO copilot_dba;
+GRANT SELECT ON system.events TO copilot_dba;
 GRANT SELECT ON system.metrics TO copilot_dba;
 GRANT SELECT ON system.errors TO copilot_dba;
 GRANT SELECT ON system.quotas_usage TO copilot_dba;
@@ -119,6 +120,20 @@ For size leaders, the report uses only metadata from `system.parts` and `system.
 
 The tool may recommend memory headroom investigation, external aggregation or sorting, column codecs, `LowCardinality`, retention/TTL review, storage tiering, or disk-pressure investigation. It never deletes, moves, detaches, or mutates data and never changes ClickHouse or Kubernetes configuration. Missing asynchronous metrics or older table layouts are reported as unavailable evidence rather than inferred.
 
+## Metrics trends
+
+`get_clickhouse_metrics_trends(namespace=None, pod=None, hours=24, project_id=None, output_mode="human")` is metrics-only for time-window questions. It first uses read-only pod metadata to recognize an existing ClickHouse native Prometheus endpoint (`<prometheus>` plus `prometheus.io/*` annotations, usually port 9363), an Altinity operator metrics endpoint, or an existing Google Managed Prometheus/GKE pipeline. It then reads matching Cloud Monitoring series.
+
+The reader resolves native `ClickHouseProfileEvents_*`, `ClickHouseMetrics_*`, and `ClickHouseAsyncMetrics_*` families, plus Altinity `chi_clickhouse_event_*` and `chi_clickhouse_metric_*` aliases. It reports trends for query, SELECT, and INSERT rates, inserted rows, failed queries, query and connection concurrency, tracked memory, parts, running merges, replication delay/queue, read-only replicas, and disk free. Counter decreases are labeled restart/reset evidence and never become negative rates.
+
+Set `DBA_CLICKHOUSE_METRICS_PROJECT_ID` when the existing project fallbacks do not identify the monitoring project. If no endpoint evidence and no matching series are discoverable, the tool returns a prerequisite rather than falling back to pod/exec or installing anything.
+
+## Snapshot diffs
+
+`get_clickhouse_snapshot_diff(namespace, pod, interval_minutes=5, output_mode="human")` reads selected numeric values from `system.events`, `system.metrics`, and `system.asynchronous_metrics`, waits 1-60 minutes, and reads the same bounded selection again. It reports deltas for queries, SELECT/INSERT queries, inserted and merged rows, failed queries, memory, parts, merges, replication delay/queue, read-only replicas, and disk free where those selected values are readable.
+
+Each source is independent and failures remain evidence gaps. The snapshot contains only selected names and numeric values; it does not persist credentials, secrets, raw application data, or query text. The mandatory readonly profile check and direct-argv registry path are unchanged.
+
 ## Query plans and table design
 
 `get_clickhouse_query_plan` accepts one validated `SELECT` or `WITH` statement and one of these modes: `indexes`, `actions`, `pipeline`, or `estimate`. It emits `EXPLAIN indexes = 1`, `EXPLAIN actions = 1`, `EXPLAIN PIPELINE`, or `EXPLAIN ESTIMATE` respectively. None of these modes executes the user query. The mandatory `readonly=1` check, direct argv, fixed timeouts, and audit logging remain unchanged.
@@ -136,3 +151,7 @@ The recommendation is advisory only. It can discuss sorting keys, partition prun
 The tool emits advisory cards with a stable id, one of the `query`, `table_design`, `parts_merges`, `mutations`, `replication`, `memory`, `storage`, or `workload` categories, the triggering measurement, a suggested change, a risk/trade-off, a required approver, and `No change was applied.` It may collect `EXPLAIN indexes = 1` only for a complete, non-secret normalized `SELECT` or `WITH` statement found in existing query-log evidence; it does not execute that statement. When a normalized query is truncated, secret-shaped, not a guarded read-only form, or lacks a simple table target, the tool reports that as an evidence gap instead of running a plan.
 
 Human output labels any operator-runnable command text as operator review/execution only; the agent does not execute commands. Mutation cards always identify mutation review as an operator-owned action. JSON mode uses the existing ClickHouse advisory envelope and includes structured recommendation cards plus evidence errors. Every recommendation requires the named owner approval, and one pod's evidence remains pod-local rather than a cluster-wide conclusion.
+
+## Structured output
+
+All ClickHouse tools accept `output_mode='human'` (the default, preserving existing Markdown) or `output_mode='json'`. JSON uses `schema_version: cloud-copilot.dba.clickhouse.v1`, `generated_at`, `tool`, `status`, `data.report`, and bounded metadata. Failures use `status: error` and an `errors` array. The envelope excludes credentials, secrets, command arguments, and raw application data; pass JSON verbatim to dashboards or automation.
