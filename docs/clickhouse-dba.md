@@ -1,6 +1,6 @@
 # ClickHouse DBA foundation
 
-ClickHouse support in the DBA agent is diagnostic-only. The first PR provides discovery, a safe direct-argv query path, a versioned SQL template registry, and slow/expensive query analysis from `system.query_log` and `system.processes`. It does not kill queries, change settings, alter tables, or execute remediation.
+ClickHouse support in the DBA agent is diagnostic-only. The foundation provides discovery, a safe direct-argv query path, a versioned SQL template registry, and slow/expensive query analysis from `system.query_log` and `system.processes`. Replication/topology and workload/concurrency reporting use the same safety model. The DBA agent does not kill queries, change settings, alter tables, restart pods, or execute remediation.
 
 ## Discovery
 
@@ -26,6 +26,14 @@ GRANT SELECT ON system.processes TO copilot_dba;
 GRANT SELECT ON system.tables TO copilot_dba;
 GRANT SELECT ON system.settings TO copilot_dba;
 GRANT SELECT ON system.server_settings TO copilot_dba;
+GRANT SELECT ON system.clusters TO copilot_dba;
+GRANT SELECT ON system.replicas TO copilot_dba;
+GRANT SELECT ON system.replication_queue TO copilot_dba;
+GRANT SELECT ON system.distribution_queue TO copilot_dba;
+GRANT SELECT ON system.zookeeper_connection TO copilot_dba;
+GRANT SELECT ON system.metrics TO copilot_dba;
+GRANT SELECT ON system.errors TO copilot_dba;
+GRANT SELECT ON system.quotas_usage TO copilot_dba;
 ```
 
 Operators may grant SELECT on application tables for other read-only analysis, but the foundation does not require it. Keep the ClickHouse user's `readonly` profile set to `1` and no `allow_ddl` bypass. The client config should look like:
@@ -57,3 +65,21 @@ Aggregation is by `normalized_query_hash`. The report includes run count, durati
 The tool also reports whether `log_queries` is enabled, the query-log flush interval when available, and query-log TTL/retention from the table engine definition. Stale logging or a short TTL means evidence may be incomplete; the report does not infer missing data.
 
 `system.processes` evidence is read-only and bounded. The agent never issues `KILL`, `SYSTEM`, `OPTIMIZE`, or any other maintenance or mutation command. Recommendations are advisory and always name the triggering measurement. Cluster-level conclusions require examining every shard; one pod's query log is not a whole-cluster result.
+
+## Replication and topology analysis
+
+`get_clickhouse_replication_report(namespace=None, pod=None, cluster=None, output_mode="human")` is replica-local. It reads bounded snapshots from `system.clusters`, `system.replicas`, `system.replication_queue`, `system.distribution_queue`, and `system.zookeeper_connection` where available. Each source can fail or be absent without hiding the others; the report names the limitation.
+
+The report includes configured shard/replica membership, the local replica identity, read-only replicas, expired Keeper sessions, absolute replication delay, queue size, inserts/merges in queue, replication-log gap, active replica count, lost parts, errors, and recovery time where the server supplies them. It also lists the oldest replication-queue entries with retries, last exceptions, postponement reasons, and pending `Distributed` files and bytes.
+
+Altinity labels and generic Kubernetes hints are displayed but never trusted as topology truth. When a label and `system.clusters` disagree, the report flags the mismatch and says that runtime evidence is authoritative. A single pod's report cannot prove cluster-wide health; repeat the check on every shard or replica, or use the existing opt-in `clusterAllReplicas` mechanism only when an operator has explicitly accepted its broader cost and access implications.
+
+Recommendations are evidence-linked and advisory. The report does not request Keeper changes, permission changes, table mutations, restarts, or data repair.
+
+## Workload, concurrency, and error analysis
+
+`get_clickhouse_workload_report(namespace=None, pod=None, minutes=60, output_mode="human")` reads bounded evidence from `system.metrics`, `system.processes`, `system.errors`, `system.query_log`, and `system.quotas_usage` where readable. It also reads selected concurrency-related rows from `system.settings`. The window is clamped to 1-10,080 minutes and every source list is bounded.
+
+The report shows query and merge counters; HTTP, TCP, interserver, MySQL, and PostgreSQL connection counters; pool/task counts; running queries; long-running or memory-heavy queries; recent and cumulative top errors; and quota usage against its limits. Recent load is grouped by user, client name, HTTP user agent, and initial address where those columns exist. Query text is produced by `normalizeQuery`, truncated, and write/DDL/maintenance/access-management text is redacted rather than echoed. Secret-shaped client attributes are redacted as well.
+
+Use the report to discuss client pool sizing, per-user concurrency, quotas, and misbehaving consumers with service owners. Every recommendation names its triggering evidence. The tool never kills a query, changes a setting or quota, drops a connection, or takes any database or Kubernetes action.

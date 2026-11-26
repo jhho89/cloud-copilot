@@ -63,10 +63,15 @@ _CLICKHOUSE_RELEVANT_PROFILE_EVENTS = (
     "OSReadBytes",
     "OSWriteBytes",
 )
+_CLICKHOUSE_SECRET_TEXT_RE = re.compile(
+    r"(?i)\b(password|passwd|secret|token|credential|authorization|api[_-]?key)\s*[:=]\s*[^,;\s]+"
+)
 _CLICKHOUSE_CLICKHOUSE_USER = "copilot_dba"
 _CLICKHOUSE_MAX_MINUTES = 10_080
 _CLICKHOUSE_MAX_LIMIT = 100
 _CLICKHOUSE_QUERY_TEXT_LIMIT = 320
+_CLICKHOUSE_MAX_EVIDENCE_ROWS = 200
+_CLICKHOUSE_MAX_REPLICATION_PODS = 16
 
 
 class ClickHouseUserSQLBlockedError(ValueError):
@@ -279,6 +284,279 @@ ORDER BY elapsed DESC, query_id ASC
 LIMIT {limit:UInt64}
 FORMAT JSONEachRow""",
         required_params=("limit", "query_kind"),
+    )
+)
+_register_template(
+    ClickHouseSQLTemplate(
+        "clickhouse_topology.v1",
+        1,
+        "Read the replica-local view of configured cluster shard and replica membership.",
+        """SELECT
+    cluster,
+    shard_num,
+    replica_num,
+    host_name,
+    host_address,
+    port,
+    is_local,
+    errors_count,
+    slowdowns_count,
+    estimated_recovery_time
+FROM system.clusters
+ORDER BY cluster, shard_num, replica_num
+LIMIT 200
+FORMAT JSONEachRow""",
+    )
+)
+_register_template(
+    ClickHouseSQLTemplate(
+        "clickhouse_replicas.v1",
+        1,
+        "Read local replicated-table health, delay, queue size, membership, and recovery evidence.",
+        """SELECT
+    database,
+    table,
+    replica_name,
+    replica_path,
+    is_leader,
+    is_readonly,
+    is_session_expired,
+    absolute_delay,
+    queue_size,
+    inserts_in_queue,
+    merges_in_queue,
+    log_max_index,
+    log_pointer,
+    total_replicas,
+    active_replicas,
+    lost_parts,
+    last_queue_update_exception,
+    recovery_time
+FROM system.replicas
+ORDER BY database, table, replica_name
+LIMIT 200
+FORMAT JSONEachRow""",
+    )
+)
+_register_template(
+    ClickHouseSQLTemplate(
+        "clickhouse_replication_queue.v1",
+        1,
+        "Read bounded replication-queue entries, retries, exceptions, and postponement reasons.",
+        """SELECT
+    database,
+    table,
+    replica_name,
+    replica_path,
+    node_name,
+    type,
+    size,
+    attempts,
+    last_exception,
+    postpone_reason,
+    last_postpone_time,
+    last_attempt_time
+FROM system.replication_queue
+ORDER BY last_attempt_time DESC, database ASC, table ASC, node_name ASC
+LIMIT 200
+FORMAT JSONEachRow""",
+    )
+)
+_register_template(
+    ClickHouseSQLTemplate(
+        "clickhouse_distribution_queue.v1",
+        1,
+        "Read pending Distributed-table files, bytes, errors, and last-send evidence.",
+        """SELECT
+    database,
+    table,
+    address,
+    errors_count,
+    data_files,
+    data_compressed_files,
+    bytes_to_send,
+    last_exception,
+    last_time
+FROM system.distribution_queue
+ORDER BY bytes_to_send DESC, database ASC, table ASC
+LIMIT 200
+FORMAT JSONEachRow""",
+    )
+)
+_register_template(
+    ClickHouseSQLTemplate(
+        "clickhouse_keeper_connection.v1",
+        1,
+        "Read the local Keeper/ZooKeeper connection state when the system table is present.",
+        """SELECT
+    name,
+    host,
+    port,
+    is_connected,
+    latency_ms,
+    errors_count,
+    timeout_count
+FROM system.zookeeper_connection
+ORDER BY name
+LIMIT 200
+FORMAT JSONEachRow""",
+    )
+)
+_register_template(
+    ClickHouseSQLTemplate(
+        "clickhouse_metrics.v1",
+        1,
+        "Read bounded server metric counters from system.metrics.",
+        """SELECT
+    metric,
+    value,
+    description
+FROM system.metrics
+ORDER BY metric
+LIMIT 200
+FORMAT JSONEachRow""",
+    )
+)
+_register_template(
+    ClickHouseSQLTemplate(
+        "clickhouse_workload_processes.v1",
+        1,
+        "Read bounded running queries with client attribution and normalized query text.",
+        """SELECT
+    query_id,
+    user,
+    elapsed,
+    query_kind,
+    normalized_query_hash AS query_hash,
+    read_rows,
+    read_bytes,
+    memory_usage,
+    client_name,
+    http_user_agent,
+    initial_address,
+    normalizeQuery(coalesce(query, '')) AS normalized_query
+FROM system.processes
+WHERE user != 'copilot_dba'
+ORDER BY memory_usage DESC, elapsed DESC, query_id ASC
+LIMIT {limit:UInt64}
+FORMAT JSONEachRow""",
+        required_params=("limit",),
+    )
+)
+_register_template(
+    ClickHouseSQLTemplate(
+        "clickhouse_settings.v1",
+        1,
+        "Read selected concurrency-related settings as advisory evidence.",
+        """SELECT
+    name,
+    value,
+    changed
+FROM system.settings
+WHERE name IN (
+    'max_threads',
+    'max_concurrent_queries',
+    'max_concurrent_queries_for_all_users',
+    'max_concurrent_queries_for_user',
+    'max_concurrent_select_queries',
+    'max_concurrent_insert_queries',
+    'max_io_threads',
+    'max_sessions_for_user'
+)
+ORDER BY name
+FORMAT JSONEachRow""",
+    )
+)
+_register_template(
+    ClickHouseSQLTemplate(
+        "clickhouse_errors.v1",
+        1,
+        "Read bounded recent and cumulative server error counters.",
+        """SELECT
+    code AS error_code,
+    name,
+    value,
+    last_error_time,
+    last_error_text,
+    remote
+FROM system.errors
+ORDER BY value DESC, name ASC
+LIMIT {limit:UInt64}
+FORMAT JSONEachRow""",
+        required_params=("limit",),
+    )
+)
+_register_template(
+    ClickHouseSQLTemplate(
+        "clickhouse_quotas_usage.v1",
+        1,
+        "Read bounded per-user/application quota usage and limits when available.",
+        """SELECT
+    quota_name,
+    user_name,
+    application_name,
+    elapsed,
+    duration,
+    num_queries,
+    max_queries,
+    query_duration_ms,
+    max_query_duration_ms,
+    exceptions,
+    max_exceptions,
+    result_rows,
+    max_result_rows,
+    read_rows,
+    max_read_rows,
+    read_bytes,
+    max_read_bytes
+FROM system.quotas_usage
+ORDER BY read_bytes DESC, num_queries DESC, user_name ASC
+LIMIT 200
+FORMAT JSONEachRow""",
+    )
+)
+_register_template(
+    ClickHouseSQLTemplate(
+        "clickhouse_workload_query_log.v1",
+        1,
+        "Aggregate recent initial-query load by user, client, HTTP user agent, and initial address.",
+        """SELECT
+    user,
+    client_name,
+    http_user_agent,
+    initial_address,
+    normalizeQuery(coalesce(any(query), '')) AS normalized_query,
+    count() AS run_count,
+    sum(query_duration_ms) AS total_duration_ms,
+    max(query_duration_ms) AS max_duration_ms,
+    avg(query_duration_ms) AS avg_duration_ms,
+    quantileTDigest(0.95)(query_duration_ms) AS p95_duration_ms,
+    sum(read_rows) AS read_rows,
+    sum(read_bytes) AS read_bytes,
+    sum(result_rows) AS result_rows,
+    sum(written_rows) AS written_rows,
+    sum(memory_usage) AS total_memory_usage,
+    max(memory_usage) AS peak_memory_usage,
+    groupUniqArray(exception_code) AS exception_codes,
+    any(exception) AS exception,
+    countIf(type = 'ExceptionWhileProcessing') AS error_count
+FROM system.query_log
+WHERE event_date >= toDate({start_time:DateTime})
+  AND event_date <= toDate({end_time:DateTime})
+  AND event_time >= {start_time:DateTime}
+  AND event_time <= {end_time:DateTime}
+  AND type IN ('QueryFinish', 'ExceptionWhileProcessing')
+  AND user != 'copilot_dba'
+  AND is_initial_query = 1
+GROUP BY user, client_name, http_user_agent, initial_address
+ORDER BY total_duration_ms DESC, read_bytes DESC, run_count DESC
+LIMIT {limit:UInt64}
+FORMAT JSONEachRow""",
+        required_params=(
+            "start_time",
+            "end_time",
+            "limit",
+        ),
     )
 )
 
@@ -641,6 +919,367 @@ def _clickhouse_query_text(value: object) -> str:
     )):
         return "[redacted write/DDL/maintenance query]"
     return text[:_CLICKHOUSE_QUERY_TEXT_LIMIT] + ("..." if len(text) > _CLICKHOUSE_QUERY_TEXT_LIMIT else "")
+
+
+def _clickhouse_redacted_text(value: object, limit: int = 160) -> str:
+    text = " ".join(str(value or "").split())
+    text = _CLICKHOUSE_SECRET_TEXT_RE.sub(lambda match: f"{match.group(1)}=[redacted]", text)
+    text = "".join(char if char.isprintable() or char.isspace() else " " for char in text)
+    return text[:limit] + ("..." if len(text) > limit else "")
+
+
+def _clickhouse_is_true(value: object) -> bool:
+    if isinstance(value, bool):
+        return value
+    try:
+        return bool(int(value))
+    except (TypeError, ValueError):
+        return str(value).strip().lower() in {"true", "yes", "on"}
+
+
+def _clickhouse_identity_equal(actual: object, hint: object) -> bool:
+    actual_text = str(actual or "").strip()
+    hint_text = str(hint or "").strip()
+    if not actual_text or not hint_text:
+        return False
+    try:
+        return int(actual_text) == int(hint_text)
+    except ValueError:
+        return actual_text.lower() == hint_text.lower()
+
+
+def _clickhouse_topology_evidence(
+    hints: dict[str, Any],
+    rows: list[dict[str, Any]],
+    cluster: Optional[str],
+) -> list[str]:
+    lines = []
+    local_rows = [row for row in rows if _clickhouse_is_true(row.get("is_local"))]
+    if cluster:
+        rows = [row for row in rows if str(row.get("cluster", "")) == cluster]
+        if not rows:
+            lines.append(f"- Requested runtime cluster {cluster!r} is not present in local system.clusters.")
+    configured_clusters = sorted({str(row.get("cluster", "")) for row in rows if row.get("cluster")})
+    lines.append(
+        f"- Runtime clusters visible locally: {', '.join(configured_clusters) or 'none'}; "
+        f"local server rows: {len(local_rows)}."
+    )
+
+    for row in local_rows:
+        runtime_cluster = str(row.get("cluster", "unknown"))
+        if cluster and runtime_cluster != cluster:
+            lines.append(
+                f"- Local runtime identity is cluster={runtime_cluster}, shard={row.get('shard_num')}, "
+                f"replica={row.get('replica_num')}; it is outside requested cluster {cluster!r}."
+            )
+            continue
+        shard_rows = [
+            member
+            for member in rows
+            if str(member.get("cluster", "")) == runtime_cluster
+            and str(member.get("shard_num", "")) == str(row.get("shard_num", ""))
+        ]
+        members = ", ".join(
+            f"{_clickhouse_redacted_text(member.get('host_name'))}:"
+            f"{_clickhouse_redacted_text(member.get('port'))}"
+            f"{' (local)' if _clickhouse_is_true(member.get('is_local')) else ''}"
+            for member in shard_rows[:8]
+        )
+        lines.append(
+            f"- Runtime membership: cluster={runtime_cluster}; shard={row.get('shard_num')}; "
+            f"local_replica={row.get('replica_num')}; configured_replicas={len(shard_rows)}; "
+            f"members={members or 'unavailable'}."
+        )
+
+    label_cluster = hints.get("cluster")
+    label_shard = hints.get("shard")
+    label_replica = hints.get("replica")
+    generic_hints = [
+        f"statefulset={hints['statefulset']}" if hints.get("statefulset") else "",
+        f"ordinal={hints['ordinal']}" if hints.get("ordinal") is not None else "",
+        f"component={hints['component']}" if hints.get("component") else "",
+        f"instance={hints['instance']}" if hints.get("instance") else "",
+    ]
+    lines.append(
+        f"- Label hints: altinity_cluster={label_cluster or 'absent'}; shard={label_shard or 'absent'}; "
+        f"replica={label_replica or 'absent'}; generic={', '.join(item for item in generic_hints if item) or 'none'}."
+    )
+
+    for local in local_rows:
+        runtime_cluster = str(local.get("cluster", ""))
+        mismatches: list[str] = []
+        if label_cluster and not _clickhouse_identity_equal(runtime_cluster, label_cluster):
+            mismatches.append(f"cluster label {label_cluster!r} != runtime {runtime_cluster!r}")
+        if label_shard and not _clickhouse_identity_equal(local.get("shard_num"), label_shard):
+            mismatches.append(f"shard label {label_shard!r} != runtime {local.get('shard_num')!r}")
+        if label_replica and not _clickhouse_identity_equal(local.get("replica_num"), label_replica):
+            mismatches.append(f"replica label {label_replica!r} != runtime {local.get('replica_num')!r}")
+        if mismatches:
+            lines.append(f"- Topology mismatch: {'; '.join(mismatches)}. Runtime system.clusters is authoritative.")
+        else:
+            lines.append("- Topology check: no label/runtime mismatch was observed for supplied hints.")
+    return lines
+
+
+def _clickhouse_replica_health_lines(rows: list[dict[str, Any]]) -> list[str]:
+    if not rows:
+        return ["- system.replicas: no replicated tables visible to this replica-local user."]
+    lines = [f"- Replicated tables: {len(rows)}; active replicas reported: {sum(int(_clickhouse_number(row, 'active_replicas')) for row in rows)}."]
+    readonly_count = 0
+    expired_count = 0
+    for row in rows:
+        readonly = _clickhouse_is_true(row.get("is_readonly"))
+        expired = _clickhouse_is_true(row.get("is_session_expired"))
+        readonly_count += int(readonly)
+        expired_count += int(expired)
+        lines.append(
+            f"  - {_clickhouse_redacted_text(row.get('database'))}.{_clickhouse_redacted_text(row.get('table'))} "
+            f"replica={_clickhouse_redacted_text(row.get('replica_name'))}; readonly={'yes' if readonly else 'no'}; "
+            f"session_expired={'yes' if expired else 'no'}; absolute_delay={int(_clickhouse_number(row, 'absolute_delay'))}s; "
+            f"queue_size={int(_clickhouse_number(row, 'queue_size'))}; "
+            f"inserts/merges={int(_clickhouse_number(row, 'inserts_in_queue'))}/"
+            f"{int(_clickhouse_number(row, 'merges_in_queue'))}; "
+            f"log_gap={int(_clickhouse_number(row, 'log_max_index') - _clickhouse_number(row, 'log_pointer'))}; "
+            f"active/total={int(_clickhouse_number(row, 'active_replicas'))}/"
+            f"{int(_clickhouse_number(row, 'total_replicas'))}; lost_parts={int(_clickhouse_number(row, 'lost_parts'))}; "
+            f"recovery_time={row.get('recovery_time', 'unavailable')}."
+        )
+        exception = row.get("last_queue_update_exception")
+        if exception:
+            lines.append(f"    last_queue_update_exception={_clickhouse_query_text(exception)}")
+    if readonly_count:
+        lines.append(f"- Read-only replicated tables: {readonly_count}. Investigate Keeper state and table permissions; no action was taken.")
+    if expired_count:
+        lines.append(f"- Expired Keeper sessions: {expired_count}. Confirm Keeper connectivity before resuming writes; no action was taken.")
+    delayed = [row for row in rows if _clickhouse_number(row, "absolute_delay") >= 30]
+    queued = [row for row in rows if _clickhouse_number(row, "queue_size") >= 10]
+    if delayed:
+        lines.append(f"- Replication delay >=30s on {len(delayed)} table(s); compare each shard's replicas.")
+    if queued:
+        lines.append(f"- Replication queue >=10 on {len(queued)} table(s); review oldest entries and queue pressure.")
+    return lines
+
+
+def _clickhouse_queue_lines(rows: list[dict[str, Any]]) -> list[str]:
+    if not rows:
+        return ["- system.replication_queue: empty or unavailable."]
+    lines = [f"- Replication queue entries (bounded): {len(rows)}."]
+    for row in rows[:10]:
+        lines.append(
+            f"  - {_clickhouse_redacted_text(row.get('database'))}.{_clickhouse_redacted_text(row.get('table'))} "
+            f"replica={_clickhouse_redacted_text(row.get('replica_name'))}; node={_clickhouse_redacted_text(row.get('node_name'))}; "
+            f"type={_clickhouse_redacted_text(row.get('type'))}; size={int(_clickhouse_number(row, 'size'))}; "
+            f"attempts={int(_clickhouse_number(row, 'attempts'))}; postpone_reason={_clickhouse_redacted_text(row.get('postpone_reason')) or 'none'}; "
+            f"last_exception={_clickhouse_query_text(row.get('last_exception')) or 'none'}."
+        )
+    return lines
+
+
+def _clickhouse_distribution_lines(rows: list[dict[str, Any]]) -> list[str]:
+    if not rows:
+        return ["- system.distribution_queue: no pending Distributed files visible or unavailable."]
+    total_files = sum(int(_clickhouse_number(row, "data_files")) for row in rows)
+    total_bytes = sum(_clickhouse_number(row, "bytes_to_send") for row in rows)
+    lines = [f"- Distributed queue pressure: files={total_files}; bytes={int(total_bytes)} across {len(rows)} bounded row(s)."]
+    for row in rows[:10]:
+        lines.append(
+            f"  - {_clickhouse_redacted_text(row.get('database'))}.{_clickhouse_redacted_text(row.get('table'))} "
+            f"address={_clickhouse_redacted_text(row.get('address'))}; files={int(_clickhouse_number(row, 'data_files'))}; "
+            f"compressed_files={int(_clickhouse_number(row, 'data_compressed_files'))}; bytes_to_send={int(_clickhouse_number(row, 'bytes_to_send'))}; "
+            f"errors={int(_clickhouse_number(row, 'errors_count'))}; last_exception={_clickhouse_query_text(row.get('last_exception')) or 'none'}."
+        )
+    return lines
+
+
+def _clickhouse_keeper_lines(rows: list[dict[str, Any]]) -> list[str]:
+    if not rows:
+        return ["- system.zookeeper_connection: unavailable or no connections visible."]
+    lines = [f"- Keeper/ZooKeeper connections (bounded): {len(rows)}."]
+    for row in rows:
+        connected = _clickhouse_is_true(row.get("is_connected"))
+        lines.append(
+            f"  - name={_clickhouse_redacted_text(row.get('name'))}; host={_clickhouse_redacted_text(row.get('host'))}; "
+            f"port={_clickhouse_redacted_text(row.get('port'))}; connected={'yes' if connected else 'no'}; "
+            f"latency_ms={int(_clickhouse_number(row, 'latency_ms'))}; errors={int(_clickhouse_number(row, 'errors_count'))}; "
+            f"timeouts={int(_clickhouse_number(row, 'timeout_count'))}."
+        )
+        if not connected:
+            lines.append("    Lost Keeper session observed. This is replica-local evidence; confirm all Keeper hosts before changing anything.")
+    return lines
+
+
+def _clickhouse_replication_recommendations(
+    replica_rows: list[dict[str, Any]],
+    queue_rows: list[dict[str, Any]],
+    distribution_rows: list[dict[str, Any]],
+    keeper_rows: list[dict[str, Any]],
+) -> list[str]:
+    recommendations: list[str] = []
+    for row in replica_rows:
+        label = f"{row.get('database')}.{row.get('table')}"
+        if _clickhouse_is_true(row.get("is_readonly")):
+            recommendations.append(
+                f"- Review read-only state for {label}; evidence: is_readonly=1. Check Keeper quorum and permissions before any change."
+            )
+        if _clickhouse_number(row, "absolute_delay") >= 30:
+            recommendations.append(
+                f"- Investigate replication lag for {label}; evidence: absolute_delay={int(_clickhouse_number(row, 'absolute_delay'))}s."
+            )
+        if _clickhouse_number(row, "queue_size") >= 10:
+            recommendations.append(
+                f"- Review replication backlog for {label}; evidence: queue_size={int(_clickhouse_number(row, 'queue_size'))}."
+            )
+        if _clickhouse_number(row, "lost_parts"):
+            recommendations.append(
+                f"- Investigate lost parts for {label}; evidence: lost_parts={int(_clickhouse_number(row, 'lost_parts'))}."
+            )
+    oldest = queue_rows[0] if queue_rows else None
+    if oldest:
+        recommendations.append(
+            f"- Review oldest replication-queue entry {_clickhouse_redacted_text(oldest.get('node_name'))}; "
+            f"evidence: attempts={int(_clickhouse_number(oldest, 'attempts'))}, "
+            f"postpone_reason={_clickhouse_redacted_text(oldest.get('postpone_reason')) or 'none'}."
+        )
+    if sum(_clickhouse_number(row, "data_files") for row in distribution_rows) >= 10:
+        recommendations.append(
+            f"- Review Distributed queue pressure; evidence: pending files={sum(int(_clickhouse_number(row, 'data_files')) for row in distribution_rows)}."
+        )
+    if any(not _clickhouse_is_true(row.get("is_connected")) for row in keeper_rows):
+        recommendations.append("- Investigate lost Keeper session; evidence: system.zookeeper_connection reports is_connected=false.")
+    return recommendations
+
+
+def _collect_clickhouse_replication_evidence(
+    namespace: str,
+    pod: str,
+    container: Optional[str],
+) -> tuple[dict[str, list[dict[str, Any]]], list[str]]:
+    evidence: dict[str, list[dict[str, Any]]] = {}
+    errors: list[str] = []
+    templates = (
+        ("clusters", "clickhouse_topology.v1"),
+        ("replicas", "clickhouse_replicas.v1"),
+        ("queue", "clickhouse_replication_queue.v1"),
+        ("distribution", "clickhouse_distribution_queue.v1"),
+        ("keeper", "clickhouse_keeper_connection.v1"),
+    )
+    for key, template_id in templates:
+        try:
+            rows, _ = _run_clickhouse_query(namespace, pod, template_id, {}, container)
+            evidence[key] = rows
+        except Exception as exc:
+            evidence[key] = []
+            errors.append(f"{template_id}: {exc}")
+    return evidence, errors
+
+
+def _clickhouse_metrics_map(rows: list[dict[str, Any]]) -> dict[str, float]:
+    return {str(row.get("metric", "")): _clickhouse_number(row, "value") for row in rows if row.get("metric")}
+
+
+def _clickhouse_setting_map(rows: list[dict[str, Any]]) -> dict[str, str]:
+    return {str(row.get("name", "")): _clickhouse_redacted_text(row.get("value")) for row in rows if row.get("name")}
+
+
+def _clickhouse_workload_recommendations(
+    metrics: dict[str, float],
+    process_rows: list[dict[str, Any]],
+    settings: dict[str, str],
+    error_rows: list[dict[str, Any]],
+    quota_rows: list[dict[str, Any]],
+    query_rows: list[dict[str, Any]],
+) -> list[str]:
+    recommendations: list[str] = []
+    for row in process_rows:
+        if _clickhouse_number(row, "elapsed") >= 300:
+            recommendations.append(
+                f"- Review long-running query {row.get('query_id')}; evidence: elapsed={_clickhouse_number(row, 'elapsed'):.3f}s."
+            )
+        if _clickhouse_number(row, "memory_usage") >= 1024 * 1024 * 1024:
+            recommendations.append(
+                f"- Review memory pressure for query {row.get('query_id')}; evidence: memory_usage={int(_clickhouse_number(row, 'memory_usage'))}."
+            )
+    for row in quota_rows:
+        for used, maximum in (
+            ("num_queries", "max_queries"),
+            ("read_bytes", "max_read_bytes"),
+            ("read_rows", "max_read_rows"),
+            ("exceptions", "max_exceptions"),
+        ):
+            max_value = _clickhouse_number(row, maximum)
+            used_value = _clickhouse_number(row, used)
+            if max_value > 0 and used_value >= max_value:
+                recommendations.append(
+                    f"- Review quota {_clickhouse_redacted_text(row.get('quota_name'))}; evidence: {used}={int(used_value)} "
+                    f"reached max={int(max_value)}. Coordinate with the owner before changing quotas."
+                )
+    for name in ("max_concurrent_queries", "max_concurrent_queries_for_all_users", "max_concurrent_queries_for_user"):
+        try:
+            maximum = float(settings.get(name, "0"))
+        except ValueError:
+            continue
+        if maximum > 0 and metrics.get("Query", 0.0) >= maximum:
+            recommendations.append(
+                f"- Review concurrency limits and client pool sizing; evidence: Query={int(metrics.get('Query', 0))}, {name}={int(maximum)}."
+            )
+    if error_rows:
+        recommendations.append(
+            f"- Review top server errors; evidence: system.errors reports {len(error_rows)} bounded row(s) with nonzero cumulative counts."
+        )
+    failed_queries = sum(int(_clickhouse_number(row, "error_count")) for row in query_rows)
+    if failed_queries:
+        recommendations.append(
+            f"- Review recent failed query groups; evidence: error_count={failed_queries} in the selected query_log window."
+        )
+    return recommendations
+
+
+def _collect_clickhouse_workload_evidence(
+    namespace: str,
+    pod: str,
+    minutes: int,
+    limit: int,
+    container: Optional[str],
+) -> tuple[dict[str, Any], list[str]]:
+    evidence: dict[str, Any] = {}
+    errors: list[str] = []
+    optional_templates = (
+        ("metrics", "clickhouse_metrics.v1", {}),
+        ("processes", "clickhouse_workload_processes.v1", {"limit": limit}),
+        ("settings", "clickhouse_settings.v1", {}),
+        ("errors", "clickhouse_errors.v1", {"limit": limit}),
+        ("quotas", "clickhouse_quotas_usage.v1", {}),
+    )
+    try:
+        profile_rows, _ = _run_clickhouse_query(
+            namespace, pod, "clickhouse_readonly_profile.v1", {}, container
+        )
+        evidence["profile"] = profile_rows
+    except Exception as exc:
+        evidence["profile"] = []
+        errors.append(f"clickhouse_readonly_profile.v1: {exc}")
+    for key, template_id, params in optional_templates:
+        try:
+            rows, _ = _run_clickhouse_query(namespace, pod, template_id, params, container)
+            evidence[key] = rows
+        except Exception as exc:
+            evidence[key] = []
+            errors.append(f"{template_id}: {exc}")
+    try:
+        start, end = _clickhouse_time_window(minutes)
+        params = {
+            "start_time": start.strftime("%Y-%m-%d %H:%M:%S"),
+            "end_time": end.strftime("%Y-%m-%d %H:%M:%S"),
+            "limit": limit,
+        }
+        rows, _ = _run_clickhouse_query(
+            namespace, pod, "clickhouse_workload_query_log.v1", params, container
+        )
+        evidence["query_log"] = rows
+    except Exception as exc:
+        evidence["query_log"] = []
+        errors.append(f"clickhouse_workload_query_log.v1: {exc}")
+    return evidence, errors
 
 
 def parse_clickhouse_query_log_rows(
@@ -1081,6 +1720,278 @@ def get_clickhouse_slow_queries(
             "sort_by": sort_by,
             "query_kind": query_kind,
             "include_distributed": include_distributed,
+        },
+    )
+
+
+def get_clickhouse_replication_report(
+    namespace: Optional[str] = None,
+    pod: Optional[str] = None,
+    cluster: Optional[str] = None,
+    output_mode: str = "human",
+    *,
+    container: Optional[str] = None,
+    label_selector: Optional[str] = None,
+) -> str:
+    """Report replica-local ClickHouse replication and topology evidence read-only."""
+    tool = "get_clickhouse_replication_report"
+    mode = "human"
+    try:
+        mode = _clickhouse_output_mode(output_mode)
+        if cluster is not None and (not isinstance(cluster, str) or not cluster.strip()):
+            raise ValueError("cluster must be a non-empty string or None.")
+        from .tools import _load_kubernetes_client
+
+        v1 = _load_kubernetes_client()
+        pods = _clickhouse_pod_candidates(v1, namespace, pod, label_selector)
+    except Exception as exc:
+        return _clickhouse_tool_error(tool, f"Error preparing ClickHouse replication report: {exc}", mode)
+
+    if not pods:
+        return _clickhouse_tool_error(
+            tool,
+            "No ClickHouse server pods found. Use find_database_pods with 'clickhouse' to confirm labels.",
+            mode,
+        )
+    if len(pods) > _CLICKHOUSE_MAX_REPLICATION_PODS:
+        pods = pods[:_CLICKHOUSE_MAX_REPLICATION_PODS]
+
+    sections: list[str] = []
+    errors: list[str] = []
+    for pod_item in pods[:_CLICKHOUSE_MAX_REPLICATION_PODS]:
+        target_namespace = pod_item.metadata.namespace
+        target_pod = pod_item.metadata.name
+        label = f"{target_namespace}/{target_pod}"
+        hints = _clickhouse_topology_hints(pod_item)
+        try:
+            evidence, evidence_errors = _collect_clickhouse_replication_evidence(
+                target_namespace, target_pod, container
+            )
+            replica_rows = evidence.get("replicas", [])
+            queue_rows = evidence.get("queue", [])
+            distribution_rows = evidence.get("distribution", [])
+            keeper_rows = evidence.get("keeper", [])
+            recommendations = _clickhouse_replication_recommendations(
+                replica_rows, queue_rows, distribution_rows, keeper_rows
+            )
+            section = [
+                f"### {label} (replica-local)",
+                *_clickhouse_topology_evidence(
+                    hints, evidence.get("clusters", []), cluster
+                ),
+                *_clickhouse_replica_health_lines(replica_rows),
+                *_clickhouse_queue_lines(queue_rows),
+                *_clickhouse_distribution_lines(distribution_rows),
+                *_clickhouse_keeper_lines(keeper_rows),
+                "",
+            ]
+            if evidence_errors:
+                section.extend(["Unreadable or malformed evidence:", *(f"- {error}" for error in evidence_errors), ""])
+            if recommendations:
+                section.extend(["Evidence-linked advisory recommendations:"])
+                section.extend(recommendations)
+            else:
+                section.append("No replication recommendation is supported by this pod's evidence.")
+            section.extend(
+                [
+                    "",
+                    "This report is replica-local. Cluster-wide conclusions require repeating the check on each shard or replica; "
+                    "Kubernetes labels are hints and system.clusters is the runtime evidence.",
+                    "All recommendations are advisory. No query, configuration, Keeper state, or ClickHouse state was changed.",
+                    "",
+                ]
+            )
+            sections.append("\n".join(section))
+        except Exception as exc:
+            errors.append(f"{label}: {exc}")
+
+    if not sections and errors:
+        return _clickhouse_tool_error(tool, "; ".join(errors), mode)
+    report = [
+        "ClickHouse replication and topology analysis (advisory only):",
+        "",
+        *"\n".join(sections).splitlines(),
+    ]
+    if errors:
+        report.extend(["Skipped pods/evidence errors:", *(f"- {error}" for error in errors), ""])
+    report.append("No changes were made; this analysis is advisory only.")
+    return _clickhouse_tool_output(
+        tool,
+        "\n".join(report),
+        mode,
+        metadata={
+            "namespace": namespace,
+            "pod": pod,
+            "cluster": cluster,
+            "pods_reported": len(sections),
+            "pods_limit": _CLICKHOUSE_MAX_REPLICATION_PODS,
+            "label_selector": label_selector,
+        },
+    )
+
+
+def get_clickhouse_workload_report(
+    namespace: Optional[str] = None,
+    pod: Optional[str] = None,
+    minutes: int = 60,
+    output_mode: str = "human",
+    *,
+    container: Optional[str] = None,
+    label_selector: Optional[str] = None,
+    limit: int = 25,
+) -> str:
+    """Report bounded ClickHouse workload, concurrency, and error evidence read-only."""
+    tool = "get_clickhouse_workload_report"
+    mode = "human"
+    try:
+        mode = _clickhouse_output_mode(output_mode)
+        minutes = _clamp_clickhouse_number(minutes, 60, 1, _CLICKHOUSE_MAX_MINUTES)
+        limit = _clamp_clickhouse_number(limit, 25, 1, _CLICKHOUSE_MAX_LIMIT)
+        from .tools import _load_kubernetes_client
+
+        v1 = _load_kubernetes_client()
+        pods = _clickhouse_pod_candidates(v1, namespace, pod, label_selector)
+    except Exception as exc:
+        return _clickhouse_tool_error(tool, f"Error preparing ClickHouse workload report: {exc}", mode)
+
+    if not pods:
+        return _clickhouse_tool_error(
+            tool,
+            "No ClickHouse server pods found. Use find_database_pods with 'clickhouse' to confirm labels.",
+            mode,
+        )
+    if len(pods) > _CLICKHOUSE_MAX_REPLICATION_PODS:
+        pods = pods[:_CLICKHOUSE_MAX_REPLICATION_PODS]
+
+    sections: list[str] = []
+    errors: list[str] = []
+    for pod_item in pods[:_CLICKHOUSE_MAX_REPLICATION_PODS]:
+        target_namespace = pod_item.metadata.namespace
+        target_pod = pod_item.metadata.name
+        label = f"{target_namespace}/{target_pod}"
+        try:
+            evidence, evidence_errors = _collect_clickhouse_workload_evidence(
+                target_namespace, target_pod, minutes, limit, container
+            )
+            profile_rows = evidence.get("profile", [])
+            version = _clickhouse_string(profile_rows[0], "version", default="unknown") if profile_rows else "unknown"
+            metrics = _clickhouse_metrics_map(evidence.get("metrics", []))
+            process_rows = evidence.get("processes", [])
+            settings = _clickhouse_setting_map(evidence.get("settings", []))
+            error_rows = evidence.get("errors", [])
+            quota_rows = evidence.get("quotas", [])
+            query_rows = evidence.get("query_log", [])
+            recommendations = _clickhouse_workload_recommendations(
+                metrics, process_rows, settings, error_rows, quota_rows, query_rows
+            )
+            section = [
+                f"### {label} (server {version})",
+                "- Evidence: system.metrics, system.processes, system.settings, system.errors, "
+                "system.quotas_usage, and system.query_log; each source is optional and bounded.",
+            ]
+            metric_names = (
+                "Query",
+                "Merge",
+                "PoolTask",
+                "BackgroundPoolTask",
+                "BackgroundSchedulePoolTask",
+                "BackgroundProcessingPoolTask",
+                "TCPConnection",
+                "HTTPConnection",
+                "InterserverConnection",
+                "MySQLConnection",
+                "PostgreSQLConnection",
+            )
+            metrics_text = ", ".join(f"{name}={int(metrics.get(name, 0.0))}" for name in metric_names)
+            section.append(f"- Server counters: {metrics_text}.")
+            settings_text = (
+                ", ".join(f"{name}={settings[name]}" for name in sorted(settings)) or "concurrency settings unavailable"
+            )
+            section.append(f"- Concurrency settings: {settings_text}.")
+            section.append(f"- Running-query snapshot (bounded): {len(process_rows)} row(s).")
+            for row in process_rows[:10]:
+                section.append(
+                    f"  - query_id={row.get('query_id')}; user={_clickhouse_redacted_text(row.get('user'))}; "
+                    f"kind={_clickhouse_redacted_text(row.get('query_kind'))}; elapsed={_clickhouse_number(row, 'elapsed'):.3f}s; "
+                    f"read_rows/bytes={int(_clickhouse_number(row, 'read_rows'))}/{int(_clickhouse_number(row, 'read_bytes'))}; "
+                    f"memory_usage={int(_clickhouse_number(row, 'memory_usage'))}; "
+                    f"client={_clickhouse_redacted_text(row.get('client_name')) or 'unknown'}; "
+                    f"http_user_agent={_clickhouse_redacted_text(row.get('http_user_agent')) or 'unknown'}; "
+                    f"initial_address={_clickhouse_redacted_text(row.get('initial_address')) or 'unknown'}; "
+                    f"query={_clickhouse_query_text(row.get('normalized_query')) or 'unavailable'}."
+                )
+            section.append(f"- Recent load by attribution (bounded): {len(query_rows)} row(s).")
+            for row in query_rows[:10]:
+                section.append(
+                    f"  - user={_clickhouse_redacted_text(row.get('user')) or 'unknown'}; "
+                    f"client={_clickhouse_redacted_text(row.get('client_name')) or 'unknown'}; "
+                    f"http_user_agent={_clickhouse_redacted_text(row.get('http_user_agent')) or 'unknown'}; "
+                    f"initial_address={_clickhouse_redacted_text(row.get('initial_address')) or 'unknown'}; "
+                    f"queries={int(_clickhouse_number(row, 'run_count'))}; total={_clickhouse_number(row, 'total_duration_ms') / 1000:.3f}s; "
+                    f"p95={_clickhouse_number(row, 'p95_duration_ms') / 1000:.3f}s; read_bytes={int(_clickhouse_number(row, 'read_bytes'))}; "
+                    f"peak_memory={int(_clickhouse_number(row, 'peak_memory_usage'))}; errors={int(_clickhouse_number(row, 'error_count'))}."
+                )
+            section.append(f"- Recent/cumulative server errors (bounded): {len(error_rows)} row(s).")
+            for row in error_rows[:10]:
+                section.append(
+                    f"  - code={row.get('error_code')}; name={_clickhouse_redacted_text(row.get('name'))}; "
+                    f"value={int(_clickhouse_number(row, 'value'))}; remote={'yes' if _clickhouse_is_true(row.get('remote')) else 'no'}; "
+                    f"last_time={row.get('last_error_time', 'unknown')}; "
+                    f"last_error_text={_clickhouse_query_text(row.get('last_error_text')) or 'none'}."
+                )
+            section.append(f"- Quota usage (bounded): {len(quota_rows)} row(s).")
+            for row in quota_rows[:10]:
+                section.append(
+                    f"  - quota={_clickhouse_redacted_text(row.get('quota_name'))}; "
+                    f"user={_clickhouse_redacted_text(row.get('user_name')) or 'unknown'}; "
+                    f"application={_clickhouse_redacted_text(row.get('application_name')) or 'unknown'}; "
+                    f"queries/max={int(_clickhouse_number(row, 'num_queries'))}/{row.get('max_queries', 'unlimited')}; "
+                    f"read_bytes/max={int(_clickhouse_number(row, 'read_bytes'))}/{row.get('max_read_bytes', 'unlimited')}; "
+                    f"exceptions/max={int(_clickhouse_number(row, 'exceptions'))}/{row.get('max_exceptions', 'unlimited')}."
+                )
+            section.append("")
+            if evidence_errors:
+                section.extend(["Unreadable or malformed evidence:", *(f"- {error}" for error in evidence_errors), ""])
+            if recommendations:
+                section.extend(["Evidence-linked advisory recommendations:"])
+                section.extend(recommendations)
+            else:
+                section.append("No workload recommendation is supported by this pod's evidence.")
+            section.extend(
+                [
+                    "",
+                    "Use these counters to discuss pool sizing, per-user concurrency, and quotas with service owners. "
+                    "Do not kill queries or change quotas or settings from this report.",
+                    "All recommendations are advisory. No query, configuration, connection, quota, or ClickHouse state was changed.",
+                    "",
+                ]
+            )
+            sections.append("\n".join(section))
+        except Exception as exc:
+            errors.append(f"{label}: {exc}")
+
+    if not sections and errors:
+        return _clickhouse_tool_error(tool, "; ".join(errors), mode)
+    report = [
+        "ClickHouse workload, concurrency, and error analysis (advisory only):",
+        "",
+        *"\n".join(sections).splitlines(),
+    ]
+    if errors:
+        report.extend(["Skipped pods/evidence errors:", *(f"- {error}" for error in errors), ""])
+    report.append("No changes were made; this analysis is advisory only.")
+    return _clickhouse_tool_output(
+        tool,
+        "\n".join(report),
+        mode,
+        metadata={
+            "namespace": namespace,
+            "pod": pod,
+            "minutes": minutes,
+            "limit": limit,
+            "pods_reported": len(sections),
+            "pods_limit": _CLICKHOUSE_MAX_REPLICATION_PODS,
+            "label_selector": label_selector,
         },
     )
 
