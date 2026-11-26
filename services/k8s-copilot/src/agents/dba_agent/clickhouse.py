@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import os
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, Mapping, Optional
 
@@ -45,6 +45,12 @@ _CLICKHOUSE_USER_SQL_BLOCKED_WORDS = (
     "INTO OUTFILE",
 )
 _CLICKHOUSE_QUERY_KINDS = {"Select", "Insert", "All"}
+_CLICKHOUSE_PLAN_MODES = {
+    "indexes": "indexes = 1",
+    "actions": "actions = 1",
+    "pipeline": "PIPELINE",
+    "estimate": "ESTIMATE",
+}
 _CLICKHOUSE_SORT_KEYS = {
     "total_duration": "total_duration_ms",
     "read_bytes": "read_bytes",
@@ -72,6 +78,13 @@ _CLICKHOUSE_MAX_LIMIT = 100
 _CLICKHOUSE_QUERY_TEXT_LIMIT = 320
 _CLICKHOUSE_MAX_EVIDENCE_ROWS = 200
 _CLICKHOUSE_MAX_REPLICATION_PODS = 16
+_CLICKHOUSE_TABLE_REFERENCE_RE = re.compile(
+    r"(?i)\b(?:FROM|JOIN)\s+"
+    r"([A-Za-z_][A-Za-z0-9_$]*)(?:\.([A-Za-z_][A-Za-z0-9_$]*))?"
+)
+_CLICKHOUSE_LARGE_TABLE_BYTES = 10 * 1024 * 1024 * 1024
+_CLICKHOUSE_LARGE_JOIN_BYTES = 1024 * 1024 * 1024
+_CLICKHOUSE_METADATA_LIMIT = 10
 
 
 class ClickHouseUserSQLBlockedError(ValueError):
@@ -118,6 +131,62 @@ class ClickHouseQueryLogAggregate:
     log_types: set[str] | None = None
     normalized_query: str = ""
     profile_events: dict[str, float] | None = None
+
+
+@dataclass(frozen=True)
+class ClickHouseTableMetadata:
+    database: str
+    name: str
+    engine: str = "unknown"
+    engine_full: str = ""
+    sorting_key: str = ""
+    primary_key: str = ""
+    partition_key: str = ""
+    sampling_key: str = ""
+    total_rows: float = 0.0
+    total_bytes: float = 0.0
+
+
+@dataclass(frozen=True)
+class ClickHouseColumnMetadata:
+    name: str
+    type: str
+    codec: str = ""
+    default_kind: str = ""
+    default_expression: str = ""
+    in_partition_key: bool = False
+    in_sorting_key: bool = False
+    in_primary_key: bool = False
+    in_sampling_key: bool = False
+
+
+@dataclass(frozen=True)
+class ClickHouseSkippingIndexMetadata:
+    name: str
+    type: str
+    expr: str
+    granularity: str = ""
+    is_built: bool = False
+
+
+@dataclass(frozen=True)
+class ClickHouseProjectionMetadata:
+    name: str
+    columns: str = ""
+    partition_key: str = ""
+    sorting_key: str = ""
+    primary_key: str = ""
+
+
+@dataclass
+class ClickHouseTableEvidence:
+    namespace: str
+    pod: str
+    tables: dict[tuple[str, str], ClickHouseTableMetadata] = field(default_factory=dict)
+    columns: dict[tuple[str, str], list[ClickHouseColumnMetadata]] = field(default_factory=dict)
+    indices: dict[tuple[str, str], list[ClickHouseSkippingIndexMetadata]] = field(default_factory=dict)
+    projections: dict[tuple[str, str], list[ClickHouseProjectionMetadata]] = field(default_factory=dict)
+    errors: list[str] = field(default_factory=list)
 
 
 CLICKHOUSE_SQL_TEMPLATES: dict[str, ClickHouseSQLTemplate] = {}
@@ -663,6 +732,30 @@ FORMAT JSONEachRow""",
 )
 _register_template(
     ClickHouseSQLTemplate(
+        "clickhouse_table.v1",
+        1,
+        "Read MergeTree/table design metadata from system.tables.",
+        """SELECT
+    database,
+    name,
+    engine,
+    engine_full,
+    sorting_key,
+    primary_key,
+    partition_key,
+    sampling_key,
+    total_rows,
+    total_bytes
+FROM system.tables
+WHERE database = {database:String}
+  AND name = {table:String}
+LIMIT 1
+FORMAT JSONEachRow""",
+        required_params=("database", "table"),
+    )
+)
+_register_template(
+    ClickHouseSQLTemplate(
         "clickhouse_workload_processes.v1",
         1,
         "Read bounded running queries with client attribution and normalized query text.",
@@ -685,6 +778,30 @@ ORDER BY memory_usage DESC, elapsed DESC, query_id ASC
 LIMIT {limit:UInt64}
 FORMAT JSONEachRow""",
         required_params=("limit",),
+    )
+)
+_register_template(
+    ClickHouseSQLTemplate(
+        "clickhouse_columns.v1",
+        1,
+        "Read column types, keys, defaults, and codecs from system.columns.",
+        """SELECT
+    name,
+    type,
+    compression_codec,
+    default_kind,
+    default_expression,
+    is_in_partition_key,
+    is_in_sorting_key,
+    is_in_primary_key,
+    is_in_sampling_key
+FROM system.columns
+WHERE database = {database:String}
+  AND table = {table:String}
+ORDER BY position ASC
+LIMIT {limit:UInt64}
+FORMAT JSONEachRow""",
+        required_params=("database", "table", "limit"),
     )
 )
 _register_template(
@@ -734,6 +851,25 @@ WHERE name IN (
 )
 ORDER BY name
 FORMAT JSONEachRow""",
+    )
+)
+_register_template(
+    ClickHouseSQLTemplate(
+        "clickhouse_data_skipping_indices.v1",
+        1,
+        "Read existing data-skipping index metadata.",
+        """SELECT
+    name,
+    type,
+    expr,
+    granularity,
+    is_built
+FROM system.data_skipping_indices
+WHERE database = {database:String}
+  AND table = {table:String}
+LIMIT {limit:UInt64}
+FORMAT JSONEachRow""",
+        required_params=("database", "table", "limit"),
     )
 )
 _register_template(
@@ -847,6 +983,25 @@ FORMAT JSONEachRow""",
 )
 _register_template(
     ClickHouseSQLTemplate(
+        "clickhouse_projections.v1",
+        1,
+        "Read available projection metadata when the server exposes system.projections.",
+        """SELECT
+    name,
+    columns,
+    partition_key,
+    sorting_key,
+    primary_key
+FROM system.projections
+WHERE database = {database:String}
+  AND table = {table:String}
+LIMIT {limit:UInt64}
+FORMAT JSONEachRow""",
+        required_params=("database", "table", "limit"),
+    )
+)
+_register_template(
+    ClickHouseSQLTemplate(
         "clickhouse_workload_query_log.v1",
         1,
         "Aggregate recent initial-query load by user, client, HTTP user agent, and initial address.",
@@ -936,6 +1091,46 @@ LIMIT {limit:UInt64}
 FORMAT JSONEachRow""",
         required_params=("limit",),
         optional_params=("database", "table"),
+    )
+)
+_register_template(
+    ClickHouseSQLTemplate(
+        "clickhouse_query_log_hash.v1",
+        1,
+        "Aggregate recent query_log events for one normalized query hash.",
+        """SELECT
+    normalized_query_hash AS query_hash,
+    count() AS run_count,
+    sum(query_duration_ms) AS total_duration_ms,
+    max(query_duration_ms) AS max_duration_ms,
+    quantileTDigest(0.50)(query_duration_ms) AS p50_duration_ms,
+    quantileTDigest(0.95)(query_duration_ms) AS p95_duration_ms,
+    quantileTDigest(0.99)(query_duration_ms) AS p99_duration_ms,
+    sum(read_rows) AS read_rows,
+    sum(read_bytes) AS read_bytes,
+    max(memory_usage) AS peak_memory_usage,
+    sum(memory_usage) AS total_memory_usage,
+    sum(result_rows) AS result_rows,
+    groupUniqArray(exception_code) AS exception_codes,
+    any(exception) AS exception,
+    any(normalizeQuery(coalesce(query, ''))) AS normalized_query,
+    sum(ProfileEvents['ReadMarks']) AS read_marks,
+    sum(ProfileEvents['SelectedMarks']) AS selected_marks
+FROM system.query_log
+WHERE event_date >= toDate({start_time:DateTime})
+  AND event_date <= toDate({end_time:DateTime})
+  AND event_time >= {start_time:DateTime}
+  AND event_time <= {end_time:DateTime}
+  AND type IN ('QueryFinish', 'ExceptionWhileProcessing')
+  AND user != 'copilot_dba'
+  AND query_kind = 'Select'
+  AND is_initial_query = 1
+  AND normalized_query_hash = {query_hash:UInt64}
+GROUP BY normalized_query_hash
+ORDER BY normalized_query_hash ASC
+LIMIT {limit:UInt64}
+FORMAT JSONEachRow""",
+        required_params=("query_hash", "start_time", "end_time", "limit"),
     )
 )
 
@@ -1156,6 +1351,38 @@ def _clickhouse_query_argv(
         argv.extend([f"--param_{name}", params[name]])
     argv.extend(["--query", sql])
     return argv
+
+
+def _render_clickhouse_plan_statement(sql: object, mode: object) -> str:
+    """Validate user SQL and return one non-executing EXPLAIN statement."""
+    if mode not in _CLICKHOUSE_PLAN_MODES:
+        raise ValueError("Invalid plan mode: use indexes, actions, pipeline, or estimate.")
+    statement = _guard_clickhouse_user_sql(sql, explain=False)
+    return f"EXPLAIN {_CLICKHOUSE_PLAN_MODES[mode]} {statement}"
+
+
+def _run_clickhouse_statement(
+    namespace: str,
+    pod: str,
+    sql: str,
+    *,
+    container: Optional[str] = None,
+    operation: str = "clickhouse_readonly_statement",
+) -> str:
+    """Run one validated statement through the direct-argv read-only client path."""
+    from .tools import _pod_exec
+
+    client_prefix = _detect_clickhouse_client(namespace, pod, container)
+    _ensure_clickhouse_readonly(namespace, pod, client_prefix, container)
+    argv = _clickhouse_query_argv(client_prefix, sql, format="")
+    return _pod_exec(
+        namespace,
+        pod,
+        argv,
+        container,
+        operation,
+        timeout_seconds=30,
+    )
 
 
 def _detect_clickhouse_client(
@@ -2621,6 +2848,416 @@ def _clickhouse_sequence(row: Mapping[str, Any], name: str) -> list[Any]:
     return [value]
 
 
+def _clickhouse_bool(value: object) -> bool:
+    return value in {1, "1", True, "true", "True", "yes", "Yes"}
+
+
+def _parse_clickhouse_table_row(row: Mapping[str, Any]) -> ClickHouseTableMetadata:
+    return ClickHouseTableMetadata(
+        database=_clickhouse_string(row, "database", default="unknown"),
+        name=_clickhouse_string(row, "name", default="unknown"),
+        engine=_clickhouse_string(row, "engine", default="unknown"),
+        engine_full=_clickhouse_string(row, "engine_full"),
+        sorting_key=_clickhouse_string(row, "sorting_key"),
+        primary_key=_clickhouse_string(row, "primary_key"),
+        partition_key=_clickhouse_string(row, "partition_key"),
+        sampling_key=_clickhouse_string(row, "sampling_key"),
+        total_rows=_clickhouse_number(row, "total_rows"),
+        total_bytes=_clickhouse_number(row, "total_bytes"),
+    )
+
+
+def _parse_clickhouse_column_rows(rows: list[dict[str, Any]]) -> list[ClickHouseColumnMetadata]:
+    columns: list[ClickHouseColumnMetadata] = []
+    for row in rows:
+        columns.append(
+            ClickHouseColumnMetadata(
+                name=_clickhouse_string(row, "name"),
+                type=_clickhouse_string(row, "type", default="unknown"),
+                codec=_clickhouse_string(row, "compression_codec"),
+                default_kind=_clickhouse_string(row, "default_kind"),
+                default_expression=_clickhouse_string(row, "default_expression"),
+                in_partition_key=_clickhouse_bool(row.get("is_in_partition_key")),
+                in_sorting_key=_clickhouse_bool(row.get("is_in_sorting_key")),
+                in_primary_key=_clickhouse_bool(row.get("is_in_primary_key")),
+                in_sampling_key=_clickhouse_bool(row.get("is_in_sampling_key")),
+            )
+        )
+    return columns
+
+
+def _parse_clickhouse_index_rows(rows: list[dict[str, Any]]) -> list[ClickHouseSkippingIndexMetadata]:
+    indices: list[ClickHouseSkippingIndexMetadata] = []
+    for row in rows:
+        indices.append(
+            ClickHouseSkippingIndexMetadata(
+                name=_clickhouse_string(row, "name"),
+                type=_clickhouse_string(row, "type", default="unknown"),
+                expr=_clickhouse_string(row, "expr"),
+                granularity=_clickhouse_string(row, "granularity"),
+                is_built=_clickhouse_bool(row.get("is_built")),
+            )
+        )
+    return indices
+
+
+def _parse_clickhouse_projection_rows(rows: list[dict[str, Any]]) -> list[ClickHouseProjectionMetadata]:
+    projections: list[ClickHouseProjectionMetadata] = []
+    for row in rows:
+        projections.append(
+            ClickHouseProjectionMetadata(
+                name=_clickhouse_string(row, "name"),
+                columns=_clickhouse_string(row, "columns"),
+                partition_key=_clickhouse_string(row, "partition_key"),
+                sorting_key=_clickhouse_string(row, "sorting_key"),
+                primary_key=_clickhouse_string(row, "primary_key"),
+            )
+        )
+    return projections
+
+
+def _collect_clickhouse_table_evidence(
+    namespace: str,
+    pod: str,
+    targets: list[tuple[str, str]],
+    *,
+    container: Optional[str] = None,
+) -> ClickHouseTableEvidence:
+    """Read only ClickHouse catalog metadata for the requested tables."""
+    evidence = ClickHouseTableEvidence(namespace=namespace, pod=pod)
+    for database, table in targets[:_CLICKHOUSE_METADATA_LIMIT]:
+        key = (database, table)
+        try:
+            table_rows, _ = _run_clickhouse_query(
+                namespace,
+                pod,
+                "clickhouse_table.v1",
+                {"database": database, "table": table},
+                container,
+            )
+            if table_rows:
+                evidence.tables[key] = _parse_clickhouse_table_row(table_rows[0])
+            else:
+                evidence.errors.append(f"system.tables has no row for {database}.{table}.")
+
+            column_rows, _ = _run_clickhouse_query(
+                namespace,
+                pod,
+                "clickhouse_columns.v1",
+                {"database": database, "table": table, "limit": 500},
+                container,
+            )
+            evidence.columns[key] = _parse_clickhouse_column_rows(column_rows)
+
+            index_rows, _ = _run_clickhouse_query(
+                namespace,
+                pod,
+                "clickhouse_data_skipping_indices.v1",
+                {"database": database, "table": table, "limit": 100},
+                container,
+            )
+            evidence.indices[key] = _parse_clickhouse_index_rows(index_rows)
+        except Exception as exc:
+            evidence.errors.append(f"{database}.{table}: {exc}")
+            continue
+
+        try:
+            projection_rows, _ = _run_clickhouse_query(
+                namespace,
+                pod,
+                "clickhouse_projections.v1",
+                {"database": database, "table": table, "limit": 100},
+                container,
+            )
+            evidence.projections[key] = _parse_clickhouse_projection_rows(projection_rows)
+        except Exception as exc:
+            evidence.errors.append(f"{database}.{table} projection metadata unavailable: {exc}")
+    return evidence
+
+
+def _clickhouse_query_hash_aggregate(
+    namespace: str,
+    pod: str,
+    query_hash: str,
+    *,
+    container: Optional[str] = None,
+) -> Optional[ClickHouseQueryLogAggregate]:
+    start, end = _clickhouse_time_window(1440)
+    rows, _ = _run_clickhouse_query(
+        namespace,
+        pod,
+        "clickhouse_query_log_hash.v1",
+        {
+            "query_hash": str(int(query_hash)),
+            "start_time": start.strftime("%Y-%m-%d %H:%M:%S"),
+            "end_time": end.strftime("%Y-%m-%d %H:%M:%S"),
+            "limit": 1,
+        },
+        container,
+    )
+    aggregates = parse_clickhouse_query_log_rows(namespace, pod, rows)
+    return aggregates[0] if aggregates else None
+
+
+def _clickhouse_table_targets_from_sql(sql: str, default_database: Optional[str]) -> list[tuple[str, str]]:
+    """Extract simple, validated table references from one guarded SELECT/WITH."""
+    ctes = {
+        match.group(1).lower()
+        for match in re.finditer(r"(?i)\bWITH\s+([A-Za-z_][A-Za-z0-9_$]*)\s+AS\s*\(", sql)
+    }
+    targets: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for match in _CLICKHOUSE_TABLE_REFERENCE_RE.finditer(sql):
+        table = match.group(2) or match.group(1)
+        database = match.group(2) and match.group(1) or (default_database or "default")
+        if table.lower() in ctes or sql[match.end():match.end() + 1] == "(":
+            continue
+        target = (_validate_clickhouse_identifier(database, "database"), _validate_clickhouse_identifier(table, "table"))
+        if target not in seen:
+            targets.append(target)
+            seen.add(target)
+    return targets
+
+
+_CLICKHOUSE_RESERVED_WORDS = {
+    "AND", "ANY", "AS", "ASC", "BETWEEN", "BY", "CASE", "DESC", "DISTINCT", "ELSE", "END",
+    "EXISTS", "FALSE", "FROM", "GLOBAL", "GROUP", "HAVING", "IF", "IN", "INNER", "INTO",
+    "IS", "JOIN", "LEFT", "LIKE", "LIMIT", "NOT", "NULL", "OFFSET", "ON", "OR", "ORDER",
+    "OUTER", "RIGHT", "SELECT", "SETTINGS", "THEN", "TRUE", "UNION", "USING", "WHEN",
+    "WHERE", "WITH",
+}
+_CLICKHOUSE_SQL_CLAUSE_RE = re.compile(
+    r"(?is)\b(WHERE|GROUP\s+BY|ORDER\s+BY|HAVING|ON)\b\s*(.*?)"
+    r"(?=\b(?:WHERE|GROUP\s+BY|ORDER\s+BY|HAVING|LIMIT|OFFSET|UNION|SELECT|FROM|JOIN|WITH|SETTINGS|FORMAT|INTO)\b|\Z)"
+)
+_CLICKHOUSE_IDENTIFIER_IN_SQL_RE = re.compile(r"(?<![\w$.])([A-Za-z_][A-Za-z0-9_$]*)(?:\.[A-Za-z_][A-Za-z0-9_$]*)?")
+
+
+def _clickhouse_columns_in_sql(sql: str) -> list[str]:
+    text = re.sub(r"'(?:[^']|'')*'", " ", sql)
+    columns: list[str] = []
+    seen: set[str] = set()
+    for match in _CLICKHOUSE_SQL_CLAUSE_RE.finditer(text):
+        for identifier_match in _CLICKHOUSE_IDENTIFIER_IN_SQL_RE.finditer(match.group(2)):
+            identifier = identifier_match.group(1)
+            if identifier.upper() in _CLICKHOUSE_RESERVED_WORDS or identifier.isdigit():
+                continue
+            if identifier not in seen:
+                columns.append(identifier)
+                seen.add(identifier)
+    return columns
+
+
+def _clickhouse_key_columns(value: object) -> list[str]:
+    text = str(value or "")
+    keys: list[str] = []
+    seen: set[str] = set()
+    for match in _CLICKHOUSE_IDENTIFIER_IN_SQL_RE.finditer(text):
+        identifier = match.group(1)
+        if identifier.upper() not in _CLICKHOUSE_RESERVED_WORDS and identifier not in seen:
+            keys.append(identifier)
+            seen.add(identifier)
+    return keys
+
+
+def _clickhouse_plan_summary(output: object) -> list[str]:
+    text = str(output or "")
+    summary: list[str] = []
+    patterns = (
+        ("parts", re.compile(r"(?i)\bparts\s*[:=]\s*(\d+)")),
+        ("rows", re.compile(r"(?i)\brows\s*[:=]\s*(\d+)")),
+        ("marks", re.compile(r"(?i)\bmarks\s*[:=]\s*(\d+)")),
+        ("read_marks", re.compile(r"(?i)\bread\s+marks\s*[:=]\s*(\d+)")),
+        ("selected_marks", re.compile(r"(?i)\bselected\s+marks\s*[:=]\s*(\d+)")),
+    )
+    for name, pattern in patterns:
+        match = pattern.search(text)
+        if match:
+            summary.append(f"{name}={match.group(1)}")
+    return summary
+
+
+def _clickhouse_has_select_grant_error(exc: BaseException) -> bool:
+    message = str(exc).lower()
+    return "select" in message and (
+        "access denied" in message or "not granted" in message or "privilege" in message
+    )
+
+
+def _clickhouse_table_advice(
+    evidence: ClickHouseTableEvidence,
+    sql: Optional[str],
+    plan_output: Optional[str],
+    aggregate: Optional[ClickHouseQueryLogAggregate],
+) -> list[str]:
+    lines: list[str] = []
+    query_columns = _clickhouse_columns_in_sql(sql or "")
+    aggregate_columns = query_columns
+    has_join = bool(re.search(r"(?i)\bJOIN\b", sql or ""))
+    has_final = bool(re.search(r"(?i)\bFINAL\b(?![A-Za-z0-9_$])", sql or ""))
+    has_large_in_subquery = bool(re.search(r"(?i)\bIN\s*\(\s*SELECT\b", sql or ""))
+
+    for key, table in evidence.tables.items():
+        database, table_name = key
+        lines.extend(
+            [
+                f"### {database}.{table_name}",
+                (
+                    f"- Table evidence: engine={table.engine}; rows={int(table.total_rows)}; "
+                    f"bytes={int(table.total_bytes)}; sorting_key={table.sorting_key or 'none'}; "
+                    f"partition_key={table.partition_key or 'none'}; primary_key={table.primary_key or 'none'}."
+                ),
+            ]
+        )
+        columns = evidence.columns.get(key, [])
+        indices = evidence.indices.get(key, [])
+        projections = evidence.projections.get(key, [])
+        index_columns: set[str] = set()
+        for index in indices:
+            index_columns.update(_clickhouse_key_columns(index.expr))
+        suggestions: list[str] = []
+
+        sorting_columns = _clickhouse_key_columns(table.sorting_key)
+        missing_sort_columns = [name for name in query_columns if name not in sorting_columns]
+        if not sorting_columns:
+            suggestions.append(
+                "- Sorting key design: no sorting key is defined. Evaluate an ORDER BY aligned to the dominant "
+                "equality/range predicates and group/order work. Cost/risk: changing it requires a table rebuild "
+                "or backfill and increases merge, storage, and operational work."
+            )
+        elif missing_sort_columns:
+            evidence_text = ", ".join(missing_sort_columns[:12])
+            suggestions.append(
+                f"- Sorting key design: query predicates touch {evidence_text} outside the sorting-key prefix "
+                f"{', '.join(sorting_columns[:12])}. Consider whether a revised key would improve pruning. "
+                "Cost/risk: a key change is a rebuild/backfill with extra storage and merge work."
+            )
+
+        if table.partition_key:
+            partition_columns = _clickhouse_key_columns(table.partition_key)
+            if partition_columns and not any(column in query_columns for column in partition_columns):
+                suggestions.append(
+                    f"- Partition pruning: query predicates do not mention partition column(s) "
+                    f"{', '.join(partition_columns[:12])}. Align future query predicates or evaluate a more useful "
+                    "partition key. Cost/risk: changing partitioning is a rebuild/backfill, can create too many parts, "
+                    "and may increase merge work."
+                )
+        else:
+            suggestions.append(
+                "- Partition pruning: no partition key is defined. Evaluate whether time or another coarse range "
+                "would help the workload. Cost/risk: a partition change requires rebuild/backfill and can increase "
+                "part count and merge work."
+            )
+
+        filter_candidates = [name for name in query_columns if name not in index_columns]
+        if filter_candidates:
+            candidates = ", ".join(filter_candidates[:12])
+            suggestions.append(
+                f"- Skipping-index design: consider ClickHouse-native data-skipping index candidates for predicate "
+                f"column(s) {candidates}. Choose bloom_filter/set for selective equality and minmax for ranges based "
+                "on evidence. Cost/risk: indexes consume storage and can increase ingest/merge work; they are not a "
+                "replacement for the primary/sorting key. No index is being created."
+            )
+
+        if not projections:
+            suggestion = (
+                "- Projection design: no projection metadata is visible. If repeated aggregations or alternate "
+                "sort orders dominate, evaluate a projection aligned to that workload."
+            )
+            if aggregate_columns:
+                suggestion += f" Candidate columns from the supplied query: {', '.join(aggregate_columns[:12])}."
+            suggestion += (
+                " Cost/risk: projections add storage, ingest/merge work, and may need a backfill; verify query "
+                "planner use before assuming benefit."
+            )
+            suggestions.append(suggestion)
+
+        if has_final:
+            suggestions.append(
+                "- FINAL use: the query requests FINAL, which performs extra merge/collapse work. Evaluate whether an "
+                "ArgMax-style query pattern, a projection, or a table design that makes deduplication explicit is "
+                "sufficient. Cost/risk: any redesign can require backfill and changes query semantics; verify with "
+                "the data owner."
+            )
+
+        if has_large_in_subquery:
+            suggestions.append(
+                "- Large IN subqueries: consider materializing/precomputing the lookup in a suitable table or "
+                "dictionary and revisiting join shape. Cost/risk: a new data pipeline adds maintenance, freshness, "
+                "storage, and consistency work."
+            )
+
+        for column in columns:
+            if "String" in column.type and "LowCardinality" not in column.type and column.name in query_columns:
+                suggestions.append(
+                    f"- LowCardinality candidate: column {column.name} is {column.type}; evaluate whether its actual "
+                    "cardinality is low enough for LowCardinality. Cost/risk: converting requires a rebuild/backfill "
+                    "and can hurt performance for truly high-cardinality data."
+                )
+                break
+
+        for column in columns:
+            if column.codec in {"", "Default", "DEFAULT"} and (
+                "String" in column.type or any(word in column.type for word in ("Int", "UInt", "Float", "Decimal"))
+            ):
+                suggestions.append(
+                    f"- Codec/compression: column {column.name} does not show an explicit codec. Evaluate "
+                    "ClickHouse-native codecs such as ZSTD, Delta, DoubleDelta, or Gorilla against data shape. "
+                    "Cost/risk: codec changes require rewrite/backfill and can increase CPU/merge work or storage "
+                    "if chosen poorly."
+                )
+                break
+
+        if table.total_bytes >= _CLICKHOUSE_LARGE_TABLE_BYTES and has_join:
+            suggestions.append(
+                f"- Join order/memory: table bytes={int(table.total_bytes)}; place the smaller/side-filtered relation "
+                "in memory-first join design where possible and verify memory in EXPLAIN. Cost/risk: incorrect join "
+                "order can increase memory, spill/disk work, or latency; test representative data."
+            )
+
+        if suggestions:
+            lines.append("  Advice:")
+            lines.extend(f"  {suggestion}" for suggestion in suggestions)
+        else:
+            lines.append("  No table-specific design change is supported by this evidence.")
+        lines.append("")
+
+    if has_join:
+        large_tables = sorted(
+            (f"{database}.{table.name} bytes={int(table.total_bytes)}", table.total_bytes)
+            for (database, _table), table in evidence.tables.items()
+            if table.total_bytes >= _CLICKHOUSE_LARGE_JOIN_BYTES
+        )
+        if large_tables:
+            lines.extend(
+                [
+                    "Join memory review:",
+                    f"- Candidate large relation(s): {'; '.join(name for name, _size in large_tables[:5])}.",
+                    "- Consider join order, prefiltering, and aggregation before joins in the query design. "
+                    "Cost/risk: these changes can alter semantics and need validation; no change is applied.",
+                    "",
+                ]
+            )
+
+    if aggregate:
+        lines.append("Slow-query evidence:")
+        lines.append(
+            f"- query_hash={aggregate.query_hash}; runs={aggregate.run_count}; p95={aggregate.p95_duration_ms:.0f}ms; "
+            f"read_rows={int(aggregate.read_rows)}; read_bytes={int(aggregate.read_bytes)}; "
+            f"peak_memory={int(aggregate.peak_memory_usage)}."
+        )
+        if aggregate.exceptions:
+            lines.append(f"- Exceptions: {', '.join(sorted(aggregate.exceptions))[:300]}.")
+        lines.append("")
+
+    if plan_output:
+        summary = _clickhouse_plan_summary(plan_output)
+        lines.append("EXPLAIN indexes = 1 evidence:")
+        lines.append(f"- {'; '.join(summary) if summary else 'plan returned; numeric summary unavailable'}.")
+        lines.append("")
+    return lines
+
+
 def _clickhouse_marks_efficiency(aggregate: ClickHouseQueryLogAggregate) -> Optional[float]:
     events = aggregate.profile_events or {}
     marks = events.get("ReadMarks", events.get("SelectedMarks", events.get("Marks", 0.0)))
@@ -3103,6 +3740,88 @@ def get_clickhouse_replication_report(
     )
 
 
+def get_clickhouse_query_plan(
+    namespace: str,
+    pod: str,
+    sql: str,
+    database: Optional[str] = None,
+    mode: str = "indexes",
+    output_mode: str = "human",
+    *,
+    container: Optional[str] = None,
+) -> str:
+    """Return a ClickHouse EXPLAIN plan without executing the supplied SELECT/WITH."""
+    tool = "get_clickhouse_query_plan"
+    try:
+        mode = str(mode)
+        statement = _render_clickhouse_plan_statement(sql, mode)
+        database = _validate_clickhouse_identifier(database, "database") if database else None
+        output_mode = _clickhouse_output_mode(output_mode)
+        from .tools import _load_kubernetes_client
+
+        v1 = _load_kubernetes_client()
+        pods = _clickhouse_pod_candidates(v1, namespace, pod, None)
+    except Exception as exc:
+        return _clickhouse_tool_error(tool, f"Error preparing ClickHouse query plan: {exc}", output_mode)
+
+    if not pods:
+        return _clickhouse_tool_error(
+            tool,
+            "No ClickHouse server pod was found for the requested target.",
+            output_mode,
+        )
+    pod_item = pods[0]
+    if _clickhouse_pod_kind(pod_item) != "clickhouse":
+        return _clickhouse_tool_error(
+            tool,
+            "The requested pod is not identified as a ClickHouse server pod.",
+            output_mode,
+        )
+    target_namespace = str(getattr(getattr(pod_item, "metadata", None), "namespace", None) or namespace)
+    target_pod = str(getattr(getattr(pod_item, "metadata", None), "name", None) or pod)
+    try:
+        plan_output = _run_clickhouse_statement(
+            target_namespace,
+            target_pod,
+            statement,
+            container=container,
+            operation="clickhouse_query_plan",
+        )
+    except Exception as exc:
+        message = str(exc)
+        if _clickhouse_has_select_grant_error(exc):
+            message = (
+                "SELECT privilege is missing for the referenced table; EXPLAIN cannot be collected. "
+                f"Client/server evidence: {message}"
+            )
+        return _clickhouse_tool_error(tool, f"ClickHouse EXPLAIN failed: {message}", output_mode)
+
+    report = [
+        "ClickHouse query plan (advisory only):",
+        f"- Target: {target_namespace}/{target_pod}.",
+        f"- Mode: {_CLICKHOUSE_PLAN_MODES[mode]}.",
+        "- Safety: EXPLAIN only; the supplied SELECT/WITH was not executed. The readonly=1 profile was verified.",
+        "",
+        "Plan output:",
+        "```",
+        plan_output.rstrip(),
+        "```",
+        "",
+        "No changes were made; this analysis is advisory only.",
+    ]
+    return _clickhouse_tool_output(
+        tool,
+        "\n".join(report),
+        output_mode,
+        metadata={
+            "database": database,
+            "mode": mode,
+            "namespace": target_namespace,
+            "pod": target_pod,
+        },
+    )
+
+
 def get_clickhouse_workload_report(
     namespace: Optional[str] = None,
     pod: Optional[str] = None,
@@ -3265,6 +3984,147 @@ def get_clickhouse_workload_report(
             "pods_reported": len(sections),
             "pods_limit": _CLICKHOUSE_MAX_REPLICATION_PODS,
             "label_selector": label_selector,
+        },
+    )
+
+
+def recommend_clickhouse_table_design(
+    namespace: str,
+    pod: str,
+    sql: Optional[str] = None,
+    database: Optional[str] = None,
+    table: Optional[str] = None,
+    normalized_query_hash: Optional[str] = None,
+    output_mode: str = "human",
+    *,
+    container: Optional[str] = None,
+) -> str:
+    """Build advisory ClickHouse table-design guidance from catalog and EXPLAIN evidence."""
+    tool = "recommend_clickhouse_table_design"
+    try:
+        output_mode = _clickhouse_output_mode(output_mode)
+        database = _validate_clickhouse_identifier(database, "database") if database else None
+        table = _validate_clickhouse_identifier(table, "table") if table else None
+        statement = _guard_clickhouse_user_sql(sql, explain=False) if sql is not None else None
+        targets: list[tuple[str, str]] = []
+        if table:
+            targets.append((database or "default", table))
+        elif statement:
+            targets = _clickhouse_table_targets_from_sql(statement, database)
+
+        if normalized_query_hash is not None:
+            hash_text = str(normalized_query_hash).strip()
+            if not hash_text.isdigit():
+                raise ValueError("normalized_query_hash must be the decimal ClickHouse normalized_query_hash.")
+        else:
+            hash_text = ""
+    except Exception as exc:
+        return _clickhouse_tool_error(tool, f"Error preparing ClickHouse table-design analysis: {exc}", output_mode)
+
+    from .tools import _load_kubernetes_client
+
+    try:
+        v1 = _load_kubernetes_client()
+        pods = _clickhouse_pod_candidates(v1, namespace, pod, None)
+    except Exception as exc:
+        return _clickhouse_tool_error(tool, f"Error preparing ClickHouse table-design analysis: {exc}", output_mode)
+    if not pods:
+        return _clickhouse_tool_error(
+            tool,
+            "No ClickHouse server pod was found for the requested target.",
+            output_mode,
+        )
+
+    pod_item = pods[0]
+    if _clickhouse_pod_kind(pod_item) != "clickhouse":
+        return _clickhouse_tool_error(
+            tool,
+            "The requested pod is not identified as a ClickHouse server pod.",
+            output_mode,
+        )
+    target_namespace = str(getattr(getattr(pod_item, "metadata", None), "namespace", None) or namespace)
+    target_pod = str(getattr(getattr(pod_item, "metadata", None), "name", None) or pod)
+    aggregate: Optional[ClickHouseQueryLogAggregate] = None
+    evidence_errors: list[str] = []
+    if hash_text and not targets:
+        try:
+            aggregate = _clickhouse_query_hash_aggregate(target_namespace, target_pod, hash_text, container=container)
+            if aggregate and aggregate.normalized_query:
+                targets = _clickhouse_table_targets_from_sql(aggregate.normalized_query, database)
+        except Exception as exc:
+            evidence_errors.append(f"query_hash evidence unavailable: {exc}")
+
+    if not targets:
+        return _clickhouse_tool_error(
+            tool,
+            "No analyzable table was supplied or found in the supplied query/query hash.",
+            output_mode,
+        )
+
+    evidence = _collect_clickhouse_table_evidence(target_namespace, target_pod, targets, container=container)
+    evidence_errors.extend(evidence.errors)
+    plan_output: Optional[str] = None
+    plan_error: Optional[str] = None
+    missing_select_grant = False
+    if statement:
+        try:
+            plan_output = _run_clickhouse_statement(
+                target_namespace,
+                target_pod,
+                f"EXPLAIN indexes = 1 {statement}",
+                container=container,
+                operation="clickhouse_table_design_explain",
+            )
+        except Exception as exc:
+            plan_error = str(exc)
+            missing_select_grant = _clickhouse_has_select_grant_error(exc)
+
+    if hash_text and aggregate is None:
+        try:
+            aggregate = _clickhouse_query_hash_aggregate(target_namespace, target_pod, hash_text, container=container)
+        except Exception as exc:
+            evidence_errors.append(f"query_hash evidence unavailable: {exc}")
+
+    advice = _clickhouse_table_advice(evidence, statement, plan_output, aggregate)
+    if missing_select_grant:
+        advice.extend(
+            [
+                "Missing grant:",
+                (
+                    "- EXPLAIN indexes = 1 requires SELECT privilege on the referenced table. The referenced "
+                    "table was not read; the analysis above is table-metadata-only."
+                ),
+                "",
+            ]
+        )
+    elif plan_error:
+        advice.extend(["Evidence gaps:", f"- EXPLAIN indexes = 1 unavailable: {plan_error}", ""])
+
+    report = [
+        "ClickHouse table-design advice (advisory only):",
+        f"- Target: {target_namespace}/{target_pod}.",
+        (
+            "- Evidence: system.tables, system.columns, system.data_skipping_indices, available projection "
+            "metadata, EXPLAIN indexes = 1 when supplied and permitted, and query_log aggregates for the supplied "
+            "hash."
+        ),
+        "- Application rows were not read. EXPLAIN does not execute the query.",
+    ]
+    if evidence_errors:
+        report.extend(["Evidence limitations:", *(f"- {error}" for error in evidence_errors), ""])
+    report.extend(advice)
+    report.append("No changes were made; every design change above is advisory only.")
+    return _clickhouse_tool_output(
+        tool,
+        "\n".join(report),
+        output_mode,
+        metadata={
+            "database": database,
+            "missing_select_grant": missing_select_grant,
+            "namespace": target_namespace,
+            "normalized_query_hash": hash_text or None,
+            "pod": target_pod,
+            "tables": [f"{item[0]}.{item[1]}" for item in targets],
         },
     )
 
