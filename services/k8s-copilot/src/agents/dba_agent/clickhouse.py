@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -85,6 +86,16 @@ _CLICKHOUSE_TABLE_REFERENCE_RE = re.compile(
 _CLICKHOUSE_LARGE_TABLE_BYTES = 10 * 1024 * 1024 * 1024
 _CLICKHOUSE_LARGE_JOIN_BYTES = 1024 * 1024 * 1024
 _CLICKHOUSE_METADATA_LIMIT = 10
+_CLICKHOUSE_REMEDIATION_CATEGORIES = {
+    "query",
+    "table_design",
+    "parts_merges",
+    "mutations",
+    "replication",
+    "memory",
+    "storage",
+    "workload",
+}
 
 
 class ClickHouseUserSQLBlockedError(ValueError):
@@ -187,6 +198,37 @@ class ClickHouseTableEvidence:
     indices: dict[tuple[str, str], list[ClickHouseSkippingIndexMetadata]] = field(default_factory=dict)
     projections: dict[tuple[str, str], list[ClickHouseProjectionMetadata]] = field(default_factory=dict)
     errors: list[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class ClickHouseRemediation:
+    """One advisory, evidence-linked ClickHouse remediation card."""
+
+    id: str
+    category: str
+    title: str
+    evidence: tuple[str, ...]
+    change: str
+    risk: str
+    approver: str
+    operator_command: str = ""
+
+    def render(self) -> list[str]:
+        command_lines = []
+        if self.operator_command:
+            command_lines = [
+                "  - Operator command (operator review and execution only; this agent must never run it): "
+                f"{self.operator_command}",
+            ]
+        return [
+            f"- {self.id} | {self.category} | {self.title}",
+            *(f"  - Triggering measurement: {item}" for item in self.evidence),
+            f"  - Suggested change: {self.change}",
+            f"  - Risk/trade-off: {self.risk}",
+            f"  - Required approver: {self.approver}",
+            *command_lines,
+            "  - No change was applied.",
+        ]
 
 
 CLICKHOUSE_SQL_TEMPLATES: dict[str, ClickHouseSQLTemplate] = {}
@@ -4125,6 +4167,587 @@ def recommend_clickhouse_table_design(
             "normalized_query_hash": hash_text or None,
             "pod": target_pod,
             "tables": [f"{item[0]}.{item[1]}" for item in targets],
+        },
+    )
+
+
+_CLICKHOUSE_REMEDIATION_RISKS = {
+    "query": "Filter, join, or workload changes can alter query semantics, shift load, or reveal a data-volume problem.",
+    "table_design": "Key, partition, index, projection, codec, and TTL changes require rebuild/backfill work and can increase storage, ingest, merge, or planner complexity.",
+    "parts_merges": "Merge and part changes can increase background load and affect ingest or query latency.",
+    "mutations": "Mutations can rewrite parts, consume background capacity, and may be destructive when retried or canceled.",
+    "replication": "Replication and Keeper changes can affect quorum, availability, and write safety.",
+    "memory": "Memory and concurrency changes can shift pressure to disk, connections, or other workloads.",
+    "storage": "Retention and tiering changes affect recoverability, storage cost, and data lifecycle.",
+    "workload": "Connection, quota, and concurrency changes can reject or throttle legitimate workloads.",
+}
+_CLICKHOUSE_REMEDIATION_APPROVERS = {
+    "query": "Service owner and DBA",
+    "table_design": "DBA and table owner",
+    "parts_merges": "DBA and table owner",
+    "mutations": "DBA and table/data owner",
+    "replication": "Database owner and on-call database operator",
+    "memory": "DBA and Kubernetes/service owner",
+    "storage": "DBA and storage/data owner",
+    "workload": "Service owner and DBA",
+}
+
+
+def _clickhouse_remediation_id(category: str, title: str, evidence: tuple[str, ...]) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "_", title.lower()).strip("_")[:48] or "recommendation"
+    digest = hashlib.sha256(f"{category}|{title}|{'|'.join(evidence)}".encode()).hexdigest()[:10]
+    return f"clickhouse.{category}.{slug}.{digest}"
+
+
+def _clickhouse_remediation_card(
+    category: str,
+    title: str,
+    evidence: tuple[str, ...],
+    change: str,
+) -> ClickHouseRemediation:
+    return ClickHouseRemediation(
+        id=_clickhouse_remediation_id(category, title, evidence),
+        category=category,
+        title=title,
+        evidence=evidence,
+        change=change,
+        risk=_CLICKHOUSE_REMEDIATION_RISKS[category],
+        approver=_CLICKHOUSE_REMEDIATION_APPROVERS[category],
+    )
+
+
+def _clickhouse_remediation_from_advisory(
+    category: str,
+    title: str,
+    advisory: str,
+) -> ClickHouseRemediation:
+    text = advisory.strip().lstrip("- ").strip()
+    match = re.search(r"(?i)\bevidence:\s*(.+)$", text, re.DOTALL)
+    if match:
+        change = text[: match.start()].strip().rstrip(";,. ").strip()
+        measurement = match.group(1).strip().rstrip(". ")
+    else:
+        change = text
+        measurement = "The existing diagnostic emitted this finding without a separate structured measurement."
+    card = _clickhouse_remediation_card(category, title, (measurement,), change)
+    if category == "mutations":
+        operator = "Review and manage the mutation from an approved operator session if needed."
+        return ClickHouseRemediation(
+            id=card.id,
+            category=card.category,
+            title=card.title,
+            evidence=card.evidence,
+            change=card.change,
+            risk=card.risk,
+            approver=card.approver,
+            operator_command=operator,
+        )
+    return card
+
+
+def _clickhouse_remediation_query_cards(
+    aggregates: list[ClickHouseQueryLogAggregate],
+) -> list[ClickHouseRemediation]:
+    cards: list[ClickHouseRemediation] = []
+    for aggregate in aggregates:
+        context = f"query_hash={aggregate.query_hash}"
+        marks = _clickhouse_marks_efficiency(aggregate)
+        scan_evidence: list[str] = []
+        if aggregate.read_bytes >= 100 * 1024 * 1024:
+            scan_evidence.append(f"read_bytes={int(aggregate.read_bytes)}")
+        if marks is not None and marks >= 100_000:
+            scan_evidence.append(f"rows_per_mark={marks:.1f}")
+        if scan_evidence:
+            cards.append(
+                _clickhouse_remediation_card(
+                    "query",
+                    "Review key/filter coverage",
+                    (context, "; ".join(scan_evidence)),
+                    "Review predicate and primary/sorting-key coverage for this query shape before considering a design change.",
+                )
+            )
+        if aggregate.peak_memory_usage >= 1024 * 1024 * 1024:
+            cards.append(
+                _clickhouse_remediation_card(
+                    "query",
+                    "Review high-memory query shape",
+                    (context, f"peak_memory_usage={int(aggregate.peak_memory_usage)}"),
+                    "Review joins, sorts, limits, and concurrency for this query shape with the service owner.",
+                )
+            )
+        if aggregate.exception_codes:
+            cards.append(
+                _clickhouse_remediation_card(
+                    "query",
+                    "Investigate failed executions",
+                    (context, f"exception_codes={sorted(aggregate.exception_codes)}"),
+                    "Correlate the failure with the query owner and workload before changing anything.",
+                )
+            )
+    return cards
+
+
+def _clickhouse_remediation_table_cards(
+    table_evidence: ClickHouseTableEvidence,
+    statement: Optional[str],
+    plan_output: Optional[str],
+    aggregate: Optional[ClickHouseQueryLogAggregate],
+) -> list[ClickHouseRemediation]:
+    advice = _clickhouse_table_advice(table_evidence, statement, plan_output, aggregate)
+    cards: list[ClickHouseRemediation] = []
+    query_context = ""
+    if aggregate:
+        query_context = (
+            f"query_hash={aggregate.query_hash}; runs={aggregate.run_count}; "
+            f"p95_duration_ms={aggregate.p95_duration_ms:.0f}; read_rows={int(aggregate.read_rows)}; "
+            f"read_bytes={int(aggregate.read_bytes)}; peak_memory_usage={int(aggregate.peak_memory_usage)}"
+        )
+    plan_summary = _clickhouse_plan_summary(plan_output)
+    current_table = "unknown"
+    for line in advice:
+        if line.startswith("### "):
+            current_table = line[4:].strip()
+            continue
+        if not line.startswith("  - "):
+            continue
+        content = line[4:].strip()
+        if content.startswith("Table evidence:"):
+            continue
+        if ": " not in content:
+            continue
+        title, detail = content.split(": ", 1)
+        risk_match = re.search(r"(?i)\bcost/risk:\s*(.+)$", detail)
+        risk = risk_match.group(1).strip() if risk_match else _CLICKHOUSE_REMEDIATION_RISKS["table_design"]
+        change = detail[: risk_match.start()].strip() if risk_match else detail.strip()
+        evidence = [f"table={current_table}"]
+        if query_context:
+            evidence.append(query_context)
+        if plan_summary:
+            evidence.append("; ".join(plan_summary))
+        elif plan_output is None and statement:
+            evidence.append("EXPLAIN was not collected for this correlation run.")
+        cards.append(
+            ClickHouseRemediation(
+                id=_clickhouse_remediation_id("table_design", title, tuple(evidence)),
+                category="table_design",
+                title=title,
+                evidence=tuple(evidence),
+                change=change,
+                risk=risk,
+                approver=_CLICKHOUSE_REMEDIATION_APPROVERS["table_design"],
+            )
+        )
+    return cards
+
+
+def _clickhouse_remediation_parts_cards(
+    parts_findings: list[str],
+    parts_recommendations: list[str],
+) -> list[ClickHouseRemediation]:
+    cards: list[ClickHouseRemediation] = []
+    for finding, recommendation in zip(parts_findings, parts_recommendations):
+        category = "mutations" if "mutation" in recommendation.lower() else "parts_merges"
+        title = "Failed mutation review" if "Failed mutation" in finding else "Parts/merge evidence review"
+        if "Detached parts" in finding:
+            title = "Detached part review"
+        elif "Running merge" in finding:
+            title = "Long-running merge review"
+        elif "mutation" in finding.lower():
+            title = "Mutation review"
+        cards.append(_clickhouse_remediation_from_advisory(category, title, recommendation))
+    return cards
+
+
+def _clickhouse_remediation_resource_cards(
+    resource_recommendations: list[str],
+) -> list[ClickHouseRemediation]:
+    cards: list[ClickHouseRemediation] = []
+    for advisory in resource_recommendations:
+        text = advisory.strip().lstrip("- ")
+        lowered = text.lower()
+        category = "memory"
+        title = "Review memory pressure"
+        if "disk" in lowered or "retention" in lowered or "tiering" in lowered or "codec" in lowered:
+            category = "storage"
+            title = "Review storage pressure" if "codec" not in lowered else "Review column storage"
+        cards.append(_clickhouse_remediation_from_advisory(category, title, text))
+    return cards
+
+
+def _clickhouse_remediation_replication_cards(
+    replication_recommendations: list[str],
+) -> list[ClickHouseRemediation]:
+    cards: list[ClickHouseRemediation] = []
+    for advisory in replication_recommendations:
+        text = advisory.strip().lstrip("- ")
+        title = "Review replication topology"
+        lowered = text.lower()
+        if "lost keeper" in lowered:
+            title = "Investigate Keeper connectivity"
+        elif "delay" in lowered:
+            title = "Investigate replication delay"
+        elif "backlog" in lowered or "queue" in lowered:
+            title = "Review replication queue pressure"
+        elif "lost parts" in lowered:
+            title = "Investigate lost parts"
+        cards.append(_clickhouse_remediation_from_advisory("replication", title, text))
+    return cards
+
+
+def _clickhouse_remediation_workload_cards(
+    workload_recommendations: list[str],
+) -> list[ClickHouseRemediation]:
+    cards: list[ClickHouseRemediation] = []
+    for advisory in workload_recommendations:
+        text = advisory.strip().lstrip("- ")
+        title = "Review workload evidence"
+        lowered = text.lower()
+        if "long-running query" in lowered:
+            title = "Review long-running query"
+        elif "memory pressure" in lowered:
+            title = "Review query memory pressure"
+        elif "quota" in lowered:
+            title = "Review quota pressure"
+        elif "concurrency" in lowered:
+            title = "Review concurrency and pool sizing"
+        elif "error" in lowered:
+            title = "Review workload errors"
+        cards.append(_clickhouse_remediation_from_advisory("workload", title, text))
+    return cards
+
+
+def _collect_clickhouse_remediation_evidence(
+    namespace: str,
+    pod: str,
+    include_query_analysis: bool,
+    container: Optional[str],
+) -> tuple[dict[str, Any], list[str]]:
+    evidence: dict[str, Any] = {}
+    errors: list[str] = []
+    try:
+        profile_rows, _ = _run_clickhouse_query(
+            namespace, pod, "clickhouse_readonly_profile.v1", container=container
+        )
+        evidence["profile"] = profile_rows
+    except Exception as exc:
+        errors.append(f"clickhouse_readonly_profile.v1: {_clickhouse_redacted_text(exc, 240)}")
+        evidence["profile"] = []
+        return evidence, errors
+
+    version = _clickhouse_string(evidence["profile"][0], "version", default="unknown")
+    evidence["server_version"] = version
+
+    if include_query_analysis:
+        try:
+            logging_rows, _ = _run_clickhouse_query(
+                namespace, pod, "clickhouse_logging.v1", container=container
+            )
+            evidence["query_logging"] = logging_rows
+        except Exception as exc:
+            evidence["query_logging"] = []
+            errors.append(f"clickhouse_logging.v1: {_clickhouse_redacted_text(exc, 240)}")
+        try:
+            start, end = _clickhouse_time_window(60)
+            rows, _ = _run_clickhouse_query(
+                namespace,
+                pod,
+                _clickhouse_query_log_template(version),
+                {
+                    "start_time": start.strftime("%Y-%m-%d %H:%M:%S"),
+                    "end_time": end.strftime("%Y-%m-%d %H:%M:%S"),
+                    "min_duration_ms": 1000,
+                    "limit": 25,
+                    "query_kind": "Select",
+                    "include_distributed": 0,
+                    "sort_by": "total_duration",
+                },
+                container,
+            )
+            evidence["query_log_rows"] = rows
+            evidence["query_aggregates"] = parse_clickhouse_query_log_rows(namespace, pod, rows)
+        except Exception as exc:
+            evidence["query_log_rows"] = []
+            evidence["query_aggregates"] = []
+            errors.append(
+                f"{_clickhouse_query_log_template(version)}: {_clickhouse_redacted_text(exc, 240)}"
+            )
+        try:
+            process_rows, _ = _run_clickhouse_query(
+                namespace,
+                pod,
+                "clickhouse_processes.v1",
+                {"limit": 25, "query_kind": "Select"},
+                container,
+            )
+            evidence["processes"] = process_rows
+        except Exception as exc:
+            evidence["processes"] = []
+            errors.append(f"clickhouse_processes.v1: {_clickhouse_redacted_text(exc, 240)}")
+
+    parts_errors, part_settings, parts, merges, mutations, detached, part_log, server_errors, pool_metrics = (
+        _clickhouse_parts_evidence(namespace, pod, version, None, None, 200, container)
+    )
+    errors.extend(_clickhouse_redacted_text(error, 240) for error in parts_errors)
+    evidence["part_settings"] = part_settings
+    evidence["parts"] = parts
+    evidence["merges"] = merges
+    evidence["mutations"] = mutations
+    evidence["detached_parts"] = detached
+    evidence["part_log"] = part_log
+    evidence["parts_server_errors"] = server_errors
+    evidence["pool_metrics"] = pool_metrics
+
+    try:
+        table_metadata, table_metadata_errors = _clickhouse_table_settings(
+            namespace, pod, None, None, 200, container
+        )
+        errors.extend(_clickhouse_redacted_text(error, 240) for error in table_metadata_errors)
+        evidence["table_metadata"] = table_metadata
+    except Exception as exc:
+        evidence["table_metadata"] = {}
+        errors.append(f"clickhouse_table_metadata.v1: {_clickhouse_redacted_text(exc, 240)}")
+
+    resource_errors, async_metrics, metrics, server_settings, disks, policies, tables, largest_tables, largest_partitions, largest_columns = (
+        _clickhouse_resource_evidence(namespace, pod, None, None, 20, container)
+    )
+    errors.extend(_clickhouse_redacted_text(error, 240) for error in resource_errors)
+    evidence.update(
+        {
+            "async_metrics": async_metrics,
+            "metrics": metrics,
+            "server_settings": server_settings,
+            "disks": disks,
+            "storage_policies": policies,
+            "resource_tables": tables,
+            "largest_tables": largest_tables,
+            "largest_partitions": largest_partitions,
+            "largest_columns": largest_columns,
+        }
+    )
+
+    replication_evidence, replication_errors = _collect_clickhouse_replication_evidence(
+        namespace, pod, container
+    )
+    errors.extend(_clickhouse_redacted_text(error, 240) for error in replication_errors)
+    evidence["replication"] = replication_evidence
+
+    workload_evidence, workload_errors = _collect_clickhouse_workload_evidence(
+        namespace, pod, 60, 25, container
+    )
+    errors.extend(_clickhouse_redacted_text(error, 240) for error in workload_errors)
+    evidence["workload"] = workload_evidence
+    return evidence, errors
+
+
+def _clickhouse_remediation_safe_plan_query(rows: list[dict[str, Any]]) -> Optional[str]:
+    for row in rows:
+        raw_query = _clickhouse_string(row, "normalized_query")
+        if not raw_query:
+            continue
+        if len(raw_query) > _CLICKHOUSE_QUERY_TEXT_LIMIT or _CLICKHOUSE_SECRET_TEXT_RE.search(raw_query):
+            return None
+        redacted = _clickhouse_query_text(raw_query)
+        if redacted.startswith("[redacted"):
+            return None
+        try:
+            _guard_clickhouse_user_sql(raw_query, explain=False)
+        except ClickHouseUserSQLBlockedError:
+            return None
+        return raw_query
+    return None
+
+
+def _clickhouse_remediation_cards(
+    evidence: dict[str, Any],
+    evidence_errors: list[str],
+) -> list[ClickHouseRemediation]:
+    cards: list[ClickHouseRemediation] = []
+    aggregates = list(evidence.get("query_aggregates") or [])
+    cards.extend(_clickhouse_remediation_query_cards(aggregates))
+
+    if aggregates:
+        aggregate = aggregates[0]
+        plan_query = _clickhouse_remediation_safe_plan_query(evidence.get("query_log_rows") or [])
+        statement: Optional[str] = None
+        plan_output: Optional[str] = None
+        plan_error: Optional[str] = None
+        if plan_query:
+            targets = _clickhouse_table_targets_from_sql(plan_query, None)
+            if targets:
+                statement = plan_query
+                table_evidence = _collect_clickhouse_table_evidence(
+                    aggregate.namespace, aggregate.pod, targets
+                )
+                evidence_errors.extend(_clickhouse_redacted_text(error, 240) for error in table_evidence.errors)
+                try:
+                    plan_output = _run_clickhouse_statement(
+                        aggregate.namespace,
+                        aggregate.pod,
+                        _render_clickhouse_plan_statement(plan_query, "indexes"),
+                        operation="clickhouse_remediation_plan_explain",
+                    )
+                except Exception as exc:
+                    plan_error = _clickhouse_redacted_text(exc, 240)
+                cards.extend(
+                    _clickhouse_remediation_table_cards(table_evidence, statement, plan_output, aggregate)
+                )
+                if plan_error:
+                    evidence_errors.append(f"EXPLAIN evidence unavailable: {plan_error}")
+            else:
+                evidence_errors.append(
+                    "No simple table target was available from the leading normalized query; table-design and "
+                    "EXPLAIN correlation was not attempted."
+                )
+        else:
+            evidence_errors.append(
+                "No complete, non-credential-bearing normalized SELECT/WITH was available; EXPLAIN was not run."
+            )
+
+    parts_findings, parts_recommendations = _clickhouse_parts_findings(
+        list(evidence.get("parts") or []),
+        dict(evidence.get("table_metadata") or {}),
+        dict(evidence.get("part_settings") or {}),
+        list(evidence.get("merges") or []),
+        list(evidence.get("mutations") or []),
+        list(evidence.get("detached_parts") or []),
+    )
+    cards.extend(_clickhouse_remediation_parts_cards(parts_findings, parts_recommendations))
+
+    resource_recommendations = _clickhouse_resource_findings(
+        dict(evidence.get("async_metrics") or {}),
+        dict(evidence.get("metrics") or {}),
+        dict(evidence.get("server_settings") or {}),
+        list(evidence.get("disks") or []),
+        dict(evidence.get("resource_tables") or {}),
+        list(evidence.get("largest_tables") or []),
+        list(evidence.get("largest_columns") or []),
+        evidence.get("kubernetes_memory_limit"),
+        20,
+    )[1]
+    cards.extend(_clickhouse_remediation_resource_cards(resource_recommendations))
+
+    replication = dict(evidence.get("replication") or {})
+    cards.extend(
+        _clickhouse_remediation_replication_cards(
+            _clickhouse_replication_recommendations(
+                list(replication.get("replicas") or []),
+                list(replication.get("queue") or []),
+                list(replication.get("distribution") or []),
+                list(replication.get("keeper") or []),
+            )
+        )
+    )
+
+    workload = dict(evidence.get("workload") or {})
+    cards.extend(
+        _clickhouse_remediation_workload_cards(
+            _clickhouse_workload_recommendations(
+                _clickhouse_metrics_map(list(workload.get("metrics") or [])),
+                list(workload.get("processes") or []),
+                _clickhouse_setting_map(list(workload.get("settings") or [])),
+                list(workload.get("errors") or []),
+                list(workload.get("quotas") or []),
+                list(workload.get("query_log") or []),
+            )
+        )
+    )
+    return cards
+
+
+def get_clickhouse_remediation_recommendations(
+    namespace: str,
+    pod: str,
+    include_query_analysis: bool = True,
+    output_mode: str = "human",
+    *,
+    container: Optional[str] = None,
+) -> str:
+    """Correlate existing ClickHouse diagnostics into advisory remediation cards."""
+    tool = "get_clickhouse_remediation_recommendations"
+    try:
+        mode = _clickhouse_output_mode(output_mode)
+        if not isinstance(include_query_analysis, bool):
+            raise ValueError("include_query_analysis must be a boolean.")
+        if not namespace or not pod:
+            raise ValueError("namespace and pod are required for remediation correlation.")
+        from .tools import _load_kubernetes_client
+
+        v1 = _load_kubernetes_client()
+        pods = _clickhouse_pod_candidates(v1, namespace, pod, None)
+    except Exception as exc:
+        return _clickhouse_tool_error(tool, f"Error preparing ClickHouse remediation recommendations: {exc}", mode)
+    if not pods:
+        return _clickhouse_tool_error(
+            tool,
+            "No ClickHouse server pod was found for the requested target.",
+            mode,
+        )
+    pod_item = pods[0]
+    if _clickhouse_pod_kind(pod_item) != "clickhouse":
+        return _clickhouse_tool_error(
+            tool,
+            "The requested pod is not identified as a ClickHouse server pod.",
+            mode,
+        )
+    target_namespace = str(getattr(getattr(pod_item, "metadata", None), "namespace", None) or namespace)
+    target_pod = str(getattr(getattr(pod_item, "metadata", None), "name", None) or pod)
+    try:
+        evidence, evidence_errors = _collect_clickhouse_remediation_evidence(
+            target_namespace, target_pod, include_query_analysis, container
+        )
+        memory_limit, _memory_limit_text = _clickhouse_container_memory_limit(pod_item, container)
+        evidence["kubernetes_memory_limit"] = memory_limit
+        cards = _clickhouse_remediation_cards(evidence, evidence_errors)
+    except Exception as exc:
+        return _clickhouse_tool_error(
+            tool,
+            f"Error collecting ClickHouse remediation evidence: {_clickhouse_redacted_text(exc, 240)}",
+            mode,
+        )
+
+    version = evidence.get("server_version", "unknown")
+    section = [
+        f"### {target_namespace}/{target_pod} (server {version})",
+        "- Evidence sources: existing bounded ClickHouse slow-query, process, table-design/catalog, EXPLAIN "
+        "(when available), parts/merges/mutations, resource/storage, replication/topology, and workload collectors.",
+        "- All sources use the existing safe template registry and readonly=1 profile check.",
+        "",
+        "Evidence-linked advisory recommendation cards:",
+    ]
+    if cards:
+        for card in cards:
+            section.extend(card.render())
+    else:
+        section.append("- No threshold-crossing recommendation is supported by the available evidence.")
+    section.extend(["", "Evidence gaps:"])
+    if evidence_errors:
+        section.extend(f"- {_clickhouse_redacted_text(error, 320)}" for error in evidence_errors)
+    else:
+        section.append("- None in the bounded sources this tool attempted.")
+    section.extend(
+        [
+            "",
+            "Operator command labeling: any operator command text is for operator review and execution only. "
+            "This agent never runs mutation, repair, restart, or configuration commands.",
+            "All recommendations are advisory. No change was applied.",
+        ]
+    )
+    report = [
+        "ClickHouse remediation recommendations (advisory only):",
+        "",
+        *"\n".join(section).splitlines(),
+        "No changes were made; this analysis is advisory only.",
+    ]
+    return _clickhouse_tool_output(
+        tool,
+        "\n".join(report),
+        mode,
+        metadata={
+            "include_query_analysis": include_query_analysis,
+            "namespace": target_namespace,
+            "pod": target_pod,
+            "recommendations": [card.__dict__ for card in cards],
+            "evidence_errors": evidence_errors,
         },
     )
 

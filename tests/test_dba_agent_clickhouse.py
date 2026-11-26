@@ -1316,3 +1316,257 @@ def test_recommend_clickhouse_table_design_rejects_unsafe_sql_before_catalog_or_
 
     assert result.startswith("Error preparing ClickHouse table-design analysis")
     assert "FORMAT" in result
+
+
+def test_clickhouse_remediation_card_renders_operator_command_and_advisory_fields() -> None:
+    card = clickhouse._clickhouse_remediation_from_advisory(
+        "mutations",
+        "Failed mutation review",
+        "Investigate the failed mutation with the table owner. Evidence: mutation_id=mutation-1; latest_fail_reason=bad row expression.",
+    )
+    rendered = "\n".join(card.render())
+
+    assert card.category == "mutations"
+    assert card.id.startswith("clickhouse.mutations.")
+    assert "mutation_id=mutation-1" in rendered
+    assert "Suggested change: Investigate the failed mutation" in rendered
+    assert "Risk/trade-off:" in rendered
+    assert "Required approver: DBA and table/data owner" in rendered
+    assert "Operator command (operator review and execution only" in rendered
+    assert "No change was applied." in rendered
+
+
+def _clickhouse_remediation_test_evidence() -> dict:
+    table_evidence = clickhouse.ClickHouseTableEvidence(namespace="analytics", pod="clickhouse-0")
+    table_evidence.tables[("analytics", "events")] = clickhouse.ClickHouseTableMetadata(
+        database="analytics",
+        name="events",
+        engine="MergeTree",
+        sorting_key="event_time",
+        partition_key="toYYYYMM(event_time)",
+        total_bytes=12 * 1024 * 1024 * 1024,
+    )
+    table_evidence.columns[("analytics", "events")] = [
+        clickhouse.ClickHouseColumnMetadata(name="user_id", type="String")
+    ]
+    aggregate = clickhouse.ClickHouseQueryLogAggregate(
+        namespace="analytics",
+        pod="clickhouse-0",
+        query_hash="42",
+        run_count=3,
+        total_duration_ms=9000,
+        p95_duration_ms=3500,
+        read_rows=1_000_000,
+        read_bytes=200 * 1024 * 1024,
+        peak_memory_usage=2 * 1024 * 1024 * 1024,
+        exception_codes={60},
+    )
+    return {
+        "server_version": "23.8.1.1",
+        "profile": [{"readonly": 1, "version": "23.8.1.1"}],
+        "query_logging": [{"query_logging": "1", "flush_interval": "1000", "query_log_engine_full": "TTL event_time"}],
+        "query_log_rows": [
+            {"normalized_query": "SELECT user_id FROM analytics.events WHERE user_id = 1", "normalized_query_hash": 42}
+        ],
+        "query_aggregates": [aggregate],
+        "processes": [{"query_id": "running", "elapsed": 400, "memory_usage": 2 * 1024 * 1024 * 1024}],
+        "table_metadata": {
+            ("analytics", "events"): {
+                "database": "analytics",
+                "table": "events",
+                "engine": "MergeTree",
+                "engine_full": "MergeTree ORDER BY event_time SETTINGS parts_to_throw_insert=300, parts_to_delay_throw=150",
+            }
+        },
+        "part_settings": {"parts_to_throw_insert": "1200", "parts_to_delay_throw": "600"},
+        "parts": [
+            {
+                "database": "analytics",
+                "table": "events",
+                "partition": "202611",
+                "active_parts": 420,
+                "avg_part_bytes": 1024 * 1024,
+            }
+        ],
+        "merges": [
+            {
+                "database": "analytics",
+                "table": "events",
+                "elapsed": 4500,
+                "progress": 0.25,
+                "total_size_bytes_compressed": 500,
+                "source_part_names": ["a", "b"],
+            }
+        ],
+        "mutations": [
+            {
+                "database": "analytics",
+                "table": "events",
+                "mutation_id": "mutation-1",
+                "create_time": "2026-11-20 08:00:00",
+                "is_done": 0,
+                "parts_to_do": 3,
+                "latest_fail_reason": "bad expression",
+            }
+        ],
+        "detached_parts": [{"database": "analytics", "table": "events", "reason": "broken"}],
+        "part_log": [],
+        "parts_server_errors": [],
+        "pool_metrics": {"BackgroundMergesAndMutationsPoolTask": 2},
+        "async_metrics": {"MemoryTracking": 16 * 1024 * 1024 * 1024, "OSSMemoryAvailable": 1024 * 1024 * 1024},
+        "metrics": {},
+        "server_settings": {"max_server_memory_usage": "16GiB"},
+        "disks": [{"name": "default", "path": "/data", "free_space": 10, "total_space": 100, "keep_free_space": 20}],
+        "storage_policies": [],
+        "resource_tables": {},
+        "largest_tables": [
+            {"database": "analytics", "table": "events", "total_bytes": 120 * 1024 * 1024 * 1024}
+        ],
+        "largest_partitions": [],
+        "largest_columns": [
+            {
+                "database": "analytics",
+                "table": "events",
+                "column": "user_id",
+                "compressed_bytes": 100,
+                "uncompressed_bytes": 80,
+                "max_rows": 1,
+            }
+        ],
+        "kubernetes_memory_limit": 32 * 1024 * 1024 * 1024,
+        "replication": {
+            "replicas": [
+                {
+                    "database": "analytics",
+                    "table": "events",
+                    "is_readonly": 1,
+                    "absolute_delay": 60,
+                    "queue_size": 20,
+                    "lost_parts": 2,
+                }
+            ],
+            "queue": [{"node_name": "queue-1", "attempts": 5, "postpone_reason": "too many parts"}],
+            "distribution": [{"data_files": 20}],
+            "keeper": [{"is_connected": 0}],
+        },
+        "workload": {
+            "metrics": [{"metric": "Query", "value": 100}],
+            "processes": [{"query_id": "long", "elapsed": 400, "memory_usage": 2 * 1024 * 1024 * 1024}],
+            "settings": [{"name": "max_concurrent_queries", "value": "50"}],
+            "errors": [{"error_code": 60, "name": "TABLE_ALREADY_EXISTS", "value": 1}],
+            "quotas": [
+                {"quota_name": "analytics", "num_queries": 100, "max_queries": 100}
+            ],
+            "query_log": [{"error_count": 2}],
+        },
+    }, table_evidence
+
+
+def test_get_clickhouse_remediation_recommendations_correlates_all_categories(
+    monkeypatch,
+) -> None:
+    evidence, table_evidence = _clickhouse_remediation_test_evidence()
+    statement_calls: list[str] = []
+
+    def fake_statement(_namespace, _pod, sql, container=None, operation=""):
+        statement_calls.append(sql)
+        return "Parts: 20\nMarks: 30"
+
+    monkeypatch.setattr(clickhouse, "_clickhouse_pod_candidates", lambda *_args, **_kwargs: [_pod("clickhouse-0")])
+    monkeypatch.setattr(tools, "_load_kubernetes_client", lambda: SimpleNamespace(api_client=object()))
+    monkeypatch.setattr(clickhouse, "_collect_clickhouse_remediation_evidence", lambda *_args, **_kwargs: (evidence, []))
+    monkeypatch.setattr(clickhouse, "_clickhouse_container_memory_limit", lambda *_args, **_kwargs: (32 * 1024 * 1024 * 1024, "32Gi"))
+    monkeypatch.setattr(clickhouse, "_collect_clickhouse_table_evidence", lambda *_args, **_kwargs: table_evidence)
+    monkeypatch.setattr(clickhouse, "_run_clickhouse_statement", fake_statement)
+
+    result = clickhouse.get_clickhouse_remediation_recommendations(
+        "analytics", "clickhouse-0", output_mode="json"
+    )
+    payload = json.loads(result)
+    report = payload["data"]["report"]
+    categories = {card["category"] for card in payload["metadata"]["recommendations"]}
+
+    assert categories == {
+        "query",
+        "table_design",
+        "parts_merges",
+        "mutations",
+        "replication",
+        "memory",
+        "storage",
+        "workload",
+    }
+    assert payload["tool"] == "get_clickhouse_remediation_recommendations"
+    assert payload["metadata"]["evidence_errors"] == []
+    assert all(card["change"] for card in payload["metadata"]["recommendations"])
+    assert all(card["risk"] for card in payload["metadata"]["recommendations"])
+    assert all(card["approver"] for card in payload["metadata"]["recommendations"])
+    assert statement_calls == [
+        "EXPLAIN indexes = 1 SELECT user_id FROM analytics.events WHERE user_id = 1"
+    ]
+    assert "Triggering measurement:" in report
+    assert "Operator command labeling" in report
+    assert "No change was applied." in report
+    assert "No changes were made; this analysis is advisory only." in report
+
+
+def test_get_clickhouse_remediation_recommendations_reports_gaps_and_no_assumptions(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(clickhouse, "_clickhouse_pod_candidates", lambda *_args, **_kwargs: [_pod("clickhouse-0")])
+    monkeypatch.setattr(tools, "_load_kubernetes_client", lambda: SimpleNamespace(api_client=object()))
+    monkeypatch.setattr(
+        clickhouse,
+        "_collect_clickhouse_remediation_evidence",
+        lambda *_args, **_kwargs: ({"server_version": "unknown"}, ["clickhouse_logging.v1: unavailable"]),
+    )
+    monkeypatch.setattr(clickhouse, "_clickhouse_container_memory_limit", lambda *_args, **_kwargs: (None, "absent"))
+
+    result = clickhouse.get_clickhouse_remediation_recommendations(
+        "analytics", "clickhouse-0", include_query_analysis=False, output_mode="human"
+    )
+
+    assert "No threshold-crossing recommendation is supported" in result
+    assert "Evidence gaps:" in result
+    assert "clickhouse_logging.v1: unavailable" in result
+    assert "No change was applied." in result
+    assert "No changes were made; this analysis is advisory only." in result
+
+
+def test_get_clickhouse_remediation_uses_registry_templates_only_and_hides_credentials(
+    monkeypatch,
+) -> None:
+    used_templates: set[str] = set()
+
+    def fake_run(_namespace, _pod, template_id, params=None, container=None):
+        used_templates.add(template_id)
+        assert template_id in clickhouse.CLICKHOUSE_SQL_TEMPLATES
+        if template_id == "clickhouse_readonly_profile.v1":
+            return [{"readonly": 1, "version": "23.8.1.1"}], ""
+        if template_id == "clickhouse_query_log.v1":
+            return [
+                {
+                    "normalized_query": "SELECT user_id FROM events WHERE password = 'secret'",
+                    "normalized_query_hash": 42,
+                }
+            ], ""
+        return [], ""
+
+    def fail_statement(*_args, **_kwargs):
+        raise AssertionError("credential-bearing or unsafe SQL must not reach EXPLAIN")
+
+    monkeypatch.setattr(clickhouse, "_clickhouse_pod_candidates", lambda *_args, **_kwargs: [_pod("clickhouse-0")])
+    monkeypatch.setattr(tools, "_load_kubernetes_client", lambda: SimpleNamespace(api_client=object()))
+    monkeypatch.setattr(clickhouse, "_run_clickhouse_query", fake_run)
+    monkeypatch.setattr(clickhouse, "_run_clickhouse_statement", fail_statement)
+
+    result = clickhouse.get_clickhouse_remediation_recommendations(
+        "analytics", "clickhouse-0", output_mode="json"
+    )
+    payload = json.loads(result)
+
+    assert used_templates.issubset(set(clickhouse.CLICKHOUSE_SQL_TEMPLATES))
+    assert "secret" not in result.lower()
+    assert "password = " not in result
+    assert any("non-credential-bearing normalized SELECT/WITH" in error for error in payload["metadata"]["evidence_errors"])
+    assert all(card["evidence"] for card in payload["metadata"]["recommendations"])
