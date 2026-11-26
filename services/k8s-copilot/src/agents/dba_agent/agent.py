@@ -12,6 +12,8 @@ from .tools import (
     get_redis_remediation_recommendations,
     get_redis_snapshot_diff,
     recommend_mysql_indexes,
+    get_clickhouse_parts_report,
+    get_clickhouse_resource_report,
     get_clickhouse_slow_queries,
     get_clickhouse_replication_report,
     get_clickhouse_workload_report,
@@ -32,6 +34,8 @@ Available tools:
 - get_clickhouse_slow_queries: Read only system.query_log and system.processes for slow/expensive query evidence and advisory recommendations.
 - get_clickhouse_replication_report: Read replica-local system.clusters, system.replicas, replication queues, and Keeper connection evidence for advisory topology analysis.
 - get_clickhouse_workload_report: Read bounded system metrics, processes, errors, query_log aggregates, and quota usage for advisory workload and concurrency analysis.
+- get_clickhouse_parts_report: Read only system.parts, merge, mutation, detached-part, part-log, and error evidence for MergeTree forensics.
+- get_clickhouse_resource_report: Read only system memory/cache/disk/storage-policy evidence and metadata-only table, partition, and column size leaders.
 - get_mysql_slow_queries: Read recent slow-query entries from database pod logs, or from an operator-allowlisted file via a read-only tail exec.
 - get_mysql_query_plan: Run EXPLAIN for one read-only SQL statement.
 - recommend_mysql_indexes: Analyze a query plan and existing indexes, then suggest indexes without applying them.
@@ -94,6 +98,20 @@ For Redis/Valkey trends and snapshot deltas:
 3. Use get_redis_snapshot_diff only for a bounded before/after comparison. The tool waits for interval_minutes (1-60) and re-reads INFO at both snapshots. Ask before a long interval and avoid simultaneous fan-out.
 4. Snapshot diffs retain selected numeric INFO fields and role evidence only; they do not persist credentials, secrets, or raw command output.
 
+For ClickHouse parts, merges, and mutations:
+1. Use get_clickhouse_parts_report only. Prefer namespace and pod; pass database and table only as valid unquoted identifiers.
+2. The tool reads bounded active-part aggregates, MergeTree thresholds, running merges, mutations, detached parts, recent part-log activity, and recent errors. If system.part_log is disabled or a column is absent, say the evidence is unavailable rather than inferring it.
+3. Compare active part counts with parts_to_delay_throw and parts_to_throw_insert from server defaults or table engine SETTINGS, and report small-part ratios and average part size. Do not request OPTIMIZE, SYSTEM, DROP, ALTER, DETACH, ATTACH, or any mutation command.
+4. Report merge progress, elapsed time, source/output size, and background-pool activity. Flag old, stuck, and failed mutations with age, parts_to_do, and latest_fail_reason.
+5. Every recommendation must cite the triggering evidence, name the operational trade-off, and say that no change was applied. Cluster-level conclusions require every shard.
+
+For ClickHouse memory, disk, and storage forensics:
+1. Use get_clickhouse_resource_report only. Prefer namespace and pod; top_n is bounded metadata ranking, not a data scan.
+2. The tool reads selected asynchronous/current metrics, server settings, disks, storage policies, and table/partition/column metadata from system.parts and system.parts_columns. It never scans application data.
+3. Compare observed memory metrics with server memory settings and the Kubernetes container memory limit. Report cache sizes and hit rates only when exposed.
+4. Report disk free/total/keep_free_space, storage-policy tiering, and PVC capacity when the disk path matches a mounted claim. Flag pressure with the observed evidence and do not delete or move parts.
+5. Suggest codecs, LowCardinality, TTL, tiering, and external aggregation/sorting only as advisory changes, each with evidence and no claim that anything was applied.
+
 For ClickHouse slow and expensive query analysis:
 1. Use get_clickhouse_slow_queries only. Prefer namespace and pod. The tool runs a startup getSetting('readonly') check and only proceeds when it is exactly 1.
 2. It reads system.query_log and system.processes with typed query parameters and a bounded time window. By default it excludes copilot_dba and distributed sub-queries. Enable distributed sub-queries only when the user explicitly asks for a broader view.
@@ -143,6 +161,8 @@ The tool reads Kubernetes pod logs by default for MySQL/MariaDB, which must have
         get_redis_snapshot_diff,
         get_redis_remediation_recommendations,
         collect_database_idle_assessment,
+        get_clickhouse_parts_report,
+        get_clickhouse_resource_report,
         get_clickhouse_slow_queries,
         get_clickhouse_replication_report,
         get_clickhouse_workload_report,
