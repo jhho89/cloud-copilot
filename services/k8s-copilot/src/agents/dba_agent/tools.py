@@ -2609,7 +2609,11 @@ def get_redis_client_report(
     )
 
 
-from .clickhouse import get_clickhouse_slow_queries  # noqa: E402
+from .clickhouse import (  # noqa: E402
+    get_clickhouse_parts_report,
+    get_clickhouse_resource_report,
+    get_clickhouse_slow_queries,
+)
 
 
 def _parse_config_get_value(output: str, name: str) -> Optional[str]:
@@ -3676,7 +3680,7 @@ def recommend_mysql_indexes(
     return recommendations
 
 
-def _redis_memory_quantity(value: object) -> Optional[int]:
+def _memory_quantity(value: object) -> Optional[int]:
     """Parse a Kubernetes memory quantity into bytes without relying on a shell."""
     text = str(value or "").strip()
     match = re.fullmatch(r"([0-9]+(?:\.[0-9]+)?)\s*([kmgtp]i?b?)", text, re.IGNORECASE)
@@ -3714,7 +3718,7 @@ def _redis_memory_quantity(value: object) -> Optional[int]:
     return int(number * multiplier)
 
 
-def _redis_container_memory_limit(
+def _container_memory_limit(
     pod: client.V1Pod,
     selected_container: Optional[str] = None,
 ) -> tuple[Optional[int], str]:
@@ -3742,7 +3746,11 @@ def _redis_container_memory_limit(
     label = selected.name or "database"
     if memory_value is None:
         return None, f"absent for container {label}"
-    return _redis_memory_quantity(memory_value), f"{memory_value} on container {label}"
+    return _memory_quantity(memory_value), f"{memory_value} on container {label}"
+
+
+_redis_memory_quantity = _memory_quantity
+_redis_container_memory_limit = _container_memory_limit
 
 
 def _format_redis_bytes(value: Optional[float]) -> str:
@@ -4597,7 +4605,7 @@ def get_redis_remediation_recommendations(
                 include_bigkeys,
                 interval,
             )
-            evidence["pod_memory_limit"] = _redis_container_memory_limit(pod_item, container)
+            evidence["pod_memory_limit"] = _container_memory_limit(pod_item, container)
             recommendations = _redis_remediations_from_evidence(evidence)
             section = [
                 f"### {label} (CLI: {cli})",

@@ -742,6 +742,21 @@ def test_clickhouse_report_templates_remain_registry_only_and_readonly() -> None
         "clickhouse_errors.v1",
         "clickhouse_quotas_usage.v1",
         "clickhouse_workload_query_log.v1",
+        "clickhouse_parts_summary.v1",
+        "clickhouse_merges.v1",
+        "clickhouse_mutations.v1",
+        "clickhouse_detached_parts.v1",
+        "clickhouse_part_log.v1",
+        "clickhouse_merge_tree_settings.v1",
+        "clickhouse_table_metadata.v1",
+        "clickhouse_async_metrics.v1",
+        "clickhouse_resource_metrics.v1",
+        "clickhouse_server_settings.v1",
+        "clickhouse_disks.v1",
+        "clickhouse_storage_policies.v1",
+        "clickhouse_largest_tables.v1",
+        "clickhouse_largest_partitions.v1",
+        "clickhouse_largest_columns.v1",
     }
     assert expected.issubset(set(clickhouse.CLICKHOUSE_SQL_TEMPLATES))
     for template_id in expected:
@@ -751,3 +766,284 @@ def test_clickhouse_report_templates_remain_registry_only_and_readonly() -> None
         }
         sql, _ = clickhouse.render_clickhouse_template(template_id, params)
         assert sql.lstrip().upper().startswith("SELECT")
+
+
+def test_get_clickhouse_parts_reports_too_many_parts_mutations_and_advisory_only(monkeypatch) -> None:
+    pod = _pod("clickhouse-0")
+    pod_list = SimpleNamespace(items=[pod])
+    api = SimpleNamespace(
+        list_namespaced_pod=lambda **_kwargs: pod_list,
+        read_namespaced_pod=lambda **_kwargs: pod,
+    )
+
+    def fake_run(_namespace, _pod_name, template_id, params=None, container=None):
+        assert params is None or isinstance(params, dict)
+        if template_id == "clickhouse_readonly_profile.v1":
+            return [{"readonly": "1", "version": "23.8.1.1"}], ""
+        if template_id == "clickhouse_table_metadata.v1":
+            return [
+                {
+                    "database": "analytics",
+                    "table": "events",
+                    "engine": "MergeTree",
+                    "engine_full": "MergeTree ORDER BY event_date SETTINGS index_granularity=8192, parts_to_throw_insert=300, parts_to_delay_throw=150",
+                    "partition_key": "toYYYYMM(event_date)",
+                    "sorting_key": "event_date",
+                }
+            ], ""
+        if template_id == "clickhouse_merge_tree_settings.v1":
+            return [
+                {"name": "parts_to_delay_throw", "value": "600", "changed": 0},
+                {"name": "parts_to_throw_insert", "value": "1200", "changed": 0},
+            ], ""
+        if template_id == "clickhouse_parts_summary.v1":
+            return [
+                {
+                    "database": "analytics",
+                    "table": "events",
+                    "partition": "202611",
+                    "active_parts": 420,
+                    "total_bytes": 1_200_000_000,
+                    "total_rows": 100,
+                    "avg_part_bytes": 1_048_576,
+                    "largest_part_bytes": 2_097_152,
+                    "newest_part_time": "2026-11-26 08:00:00",
+                }
+            ], ""
+        if template_id == "clickhouse_merges.v1":
+            return [
+                {
+                    "database": "analytics",
+                    "table": "events",
+                    "elapsed": 4500,
+                    "progress": 0.25,
+                    "num_parts": 8,
+                    "rows_read": 1000,
+                    "bytes_read_uncompressed": 1_000_000,
+                    "total_size_bytes_compressed": 500_000,
+                    "source_part_names": ["all_1_1", "all_2_2", "all_3_3"],
+                    "result_part_name": "all_1_3",
+                }
+            ], ""
+        if template_id == "clickhouse_mutations.v1":
+            return [
+                {
+                    "database": "analytics",
+                    "table": "events",
+                    "mutation_id": "mutation-1",
+                    "command": "ALTER TABLE events DELETE WHERE bad = 1",
+                    "create_time": "2026-11-20 08:00:00",
+                    "is_done": 0,
+                    "parts_to_do": 3,
+                    "latest_fail_time": "2026-11-25 08:00:00",
+                    "latest_fail_reason": "Mutation was not applied to some parts",
+                }
+            ], ""
+        if template_id == "clickhouse_detached_parts.v1":
+            return [
+                {
+                    "database": "analytics",
+                    "table": "events",
+                    "partition": "202611",
+                    "name": "bad-part",
+                    "reason": "broken",
+                    "disk_name": "default",
+                },
+                {
+                    "database": "analytics",
+                    "table": "events",
+                    "partition": "202611",
+                    "name": "manual-part",
+                    "reason": "manual detach",
+                    "disk_name": "default",
+                },
+            ], ""
+        if template_id == "clickhouse_part_log.v1":
+            return [], ""
+        if template_id == "clickhouse_errors.v1":
+            return [], ""
+        if template_id == "clickhouse_resource_metrics.v1":
+            return [
+                {"metric": "BackgroundMergesAndMutationsPoolTask", "value": 2},
+                {"metric": "BackgroundPoolTask", "value": 1},
+            ], ""
+        return [], ""
+
+    monkeypatch.setattr(tools, "_load_kubernetes_client", lambda: api)
+    monkeypatch.setattr(clickhouse, "_run_clickhouse_query", fake_run)
+
+    result = clickhouse.get_clickhouse_parts_report(
+        "analytics",
+        "clickhouse-0",
+        database="analytics",
+        table="events",
+        output_mode="human",
+    )
+
+    assert "analytics/clickhouse-0 (server 23.8.1.1)" in result
+    assert "Too many parts at throw threshold" in result
+    assert "parts_to_throw_insert=300" in result
+    assert "Small-part evidence: 1/1 partitions" in result
+    assert "Running merge: analytics.events progress=25.0%; elapsed=4500.0s" in result
+    assert "Failed mutation" in result
+    assert "mutation_id=mutation-1" in result
+    assert "parts_to_do=3" in result
+    assert "latest_fail_reason=Mutation was not applied to some parts" in result
+    assert "Detached parts: analytics.events reason=broken count=1" in result
+    assert "Batch inserts or consolidate small parts" in result
+    assert "part_log may be disabled, absent, or outside the retained window" in result
+    assert "No mutation, merge, detach, DROP, ALTER, SYSTEM command" in result
+    assert "No changes were made" in result
+
+
+def test_get_clickhouse_resource_reports_pressure_pvc_and_handles_missing_columns(monkeypatch) -> None:
+    pod = _pod("clickhouse-0")
+    pod.spec.containers[0].resources = SimpleNamespace(limits={"memory": "32Gi"})
+    pod.spec.containers[0].volume_mounts = [SimpleNamespace(name="data", mount_path="/var/lib/clickhouse")]
+    pod_list = SimpleNamespace(items=[pod])
+    claim = SimpleNamespace(
+        metadata=SimpleNamespace(name="data"),
+        spec=SimpleNamespace(resources=SimpleNamespace(requests={"storage": "100Gi"})),
+    )
+    api = SimpleNamespace(
+        list_namespaced_pod=lambda **_kwargs: pod_list,
+        read_namespaced_pod=lambda **_kwargs: pod,
+        list_namespaced_persistent_volume_claim=lambda **_kwargs: SimpleNamespace(items=[claim]),
+    )
+
+    def fake_run(_namespace, _pod_name, template_id, params=None, container=None):
+        if template_id == "clickhouse_readonly_profile.v1":
+            return [{"readonly": "1", "version": "22.3.6.29"}], ""
+        if template_id == "clickhouse_async_metrics.v1":
+            return [
+                {"metric": "MemoryTrackingForAllocations", "value": 16_106_127_360},
+                {"metric": "MemoryResident", "value": 15_033_165_524},
+                {"metric": "OSSMemoryAvailable", "value": 2_147_483_648},
+                {"metric": "OSSMemoryTotal", "value": 34_359_738_368},
+                {"metric": "MarkCacheBytes", "value": 1_073_741_824},
+            ], ""
+        if template_id == "clickhouse_resource_metrics.v1":
+            return [{"metric": "QueryCacheHits", "value": 80}, {"metric": "QueryCacheMisses", "value": 20}], ""
+        if template_id == "clickhouse_server_settings.v1":
+            return [{"name": "max_server_memory_usage", "value": "16GiB"}], ""
+        if template_id == "clickhouse_disks.v1":
+            return [
+                {
+                    "name": "default",
+                    "path": "/var/lib/clickhouse/data",
+                    "type": "local",
+                    "free_space": 10_737_418_240,
+                    "total_space": 107_374_182_400,
+                    "keep_free_space": 10_737_418_240,
+                    "is_read_only": 0,
+                }
+            ], ""
+        if template_id == "clickhouse_storage_policies.v1":
+            return [
+                {
+                    "policy_name": "hot_cold",
+                    "volume_name": "hot",
+                    "volume_index": 0,
+                    "disk_name": "default",
+                    "path": "/var/lib/clickhouse/data",
+                    "move_factor": 0.1,
+                    "prefer_not_to_merge": 0,
+                    "perform_ttl_move_on_insert": 1,
+                }
+            ], ""
+        if template_id == "clickhouse_largest_tables.v1":
+            return [
+                {
+                    "database": "analytics",
+                    "table": "events",
+                    "active_parts": 12,
+                    "total_bytes": 214_748_364_800,
+                    "total_rows": 1_000_000,
+                    "avg_part_bytes": 17_895_697_066,
+                }
+            ], ""
+        if template_id == "clickhouse_largest_partitions.v1":
+            return [
+                {
+                    "database": "analytics",
+                    "table": "events",
+                    "partition": "202611",
+                    "active_parts": 3,
+                    "total_bytes": 100_663_296,
+                    "total_rows": 500_000,
+                }
+            ], ""
+        if template_id == "clickhouse_largest_columns.v1":
+            raise RuntimeError("Unknown table system.parts_columns")
+        if template_id == "clickhouse_table_metadata.v1":
+            return [
+                {
+                    "database": "analytics",
+                    "table": "events",
+                    "engine": "MergeTree",
+                    "engine_full": "MergeTree ORDER BY event_date",
+                    "partition_key": "toYYYYMM(event_date)",
+                    "sorting_key": "event_date",
+                }
+            ], ""
+        return [], ""
+
+    monkeypatch.setattr(tools, "_load_kubernetes_client", lambda: api)
+    monkeypatch.setattr(clickhouse, "_run_clickhouse_query", fake_run)
+
+    result = clickhouse.get_clickhouse_resource_report(
+        "analytics",
+        "clickhouse-0",
+        top_n=10,
+        output_mode="human",
+    )
+
+    assert "analytics/clickhouse-0 (server 22.3.6.29)" in result
+    assert "MemoryTrackingForAllocations" not in result
+    assert "MemoryTracking=16106127360" in result
+    assert "Memory usage ratio=93.8%" in result
+    assert "server limit=16.0GiB and Kubernetes limit=32.0GiB" in result
+    assert "Query cache hits/misses=80.0/20.0; hit_rate=80.0%" in result
+    assert "Cache MarkCacheBytes=1.0GiB" in result
+    assert "Disk default: free=10.0GiB/100.0GiB=90.0%" in result
+    assert "Review disk pressure and retention" in result
+    assert "at or below keep_free_space" in result
+    assert "policy=hot_cold" in result
+    assert "100.0GiB (100Gi on PVC data in analytics/clickhouse-0)" in result
+    assert "analytics.events engine=MergeTree" in result
+    assert "partition=202611" in result
+    assert "system.parts_columns is unavailable" in result
+    assert "Review retention or tiering" in result
+    assert "no TTL expression" in result
+    assert "never scans application data" not in result
+    assert "No configuration, disk, part, TTL, codec, cache, or Kubernetes" in result
+    assert "No changes were made" in result
+
+
+def test_get_clickhouse_parts_json_output_is_stable_advisory_envelope(monkeypatch) -> None:
+    pod = _pod("clickhouse-json")
+    pod_list = SimpleNamespace(items=[pod])
+    api = SimpleNamespace(
+        list_namespaced_pod=lambda **_kwargs: pod_list,
+        read_namespaced_pod=lambda **_kwargs: pod,
+    )
+
+    def fake_run(_namespace, _pod_name, template_id, params=None, container=None):
+        if template_id == "clickhouse_readonly_profile.v1":
+            return [{"readonly": "1", "version": "23.8.1.1"}], ""
+        if template_id == "clickhouse_parts_summary.v1":
+            return [], ""
+        return [], ""
+
+    monkeypatch.setattr(tools, "_load_kubernetes_client", lambda: api)
+    monkeypatch.setattr(clickhouse, "_run_clickhouse_query", fake_run)
+
+    payload = json.loads(
+        clickhouse.get_clickhouse_parts_report("analytics", "clickhouse-json", output_mode="json")
+    )
+
+    assert payload["schema_version"] == clickhouse.CLICKHOUSE_STRUCTURED_SCHEMA_VERSION
+    assert payload["tool"] == "get_clickhouse_parts_report"
+    assert payload["status"] == "ok"
+    assert payload["metadata"]["database"] is None
+    assert payload["data"]["report"].endswith("No changes were made; this analysis is advisory only.")

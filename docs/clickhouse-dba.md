@@ -34,6 +34,18 @@ GRANT SELECT ON system.zookeeper_connection TO copilot_dba;
 GRANT SELECT ON system.metrics TO copilot_dba;
 GRANT SELECT ON system.errors TO copilot_dba;
 GRANT SELECT ON system.quotas_usage TO copilot_dba;
+GRANT SELECT ON system.parts TO copilot_dba;
+GRANT SELECT ON system.parts_columns TO copilot_dba;
+GRANT SELECT ON system.merge_tree_settings TO copilot_dba;
+GRANT SELECT ON system.merges TO copilot_dba;
+GRANT SELECT ON system.mutations TO copilot_dba;
+GRANT SELECT ON system.detached_parts TO copilot_dba;
+GRANT SELECT ON system.part_log TO copilot_dba;
+GRANT SELECT ON system.errors TO copilot_dba;
+GRANT SELECT ON system.metrics TO copilot_dba;
+GRANT SELECT ON system.asynchronous_metrics TO copilot_dba;
+GRANT SELECT ON system.disks TO copilot_dba;
+GRANT SELECT ON system.storage_policies TO copilot_dba;
 ```
 
 Operators may grant SELECT on application tables for other read-only analysis, but the foundation does not require it. Keep the ClickHouse user's `readonly` profile set to `1` and no `allow_ddl` bypass. The client config should look like:
@@ -83,3 +95,21 @@ Recommendations are evidence-linked and advisory. The report does not request Ke
 The report shows query and merge counters; HTTP, TCP, interserver, MySQL, and PostgreSQL connection counters; pool/task counts; running queries; long-running or memory-heavy queries; recent and cumulative top errors; and quota usage against its limits. Recent load is grouped by user, client name, HTTP user agent, and initial address where those columns exist. Query text is produced by `normalizeQuery`, truncated, and write/DDL/maintenance/access-management text is redacted rather than echoed. Secret-shaped client attributes are redacted as well.
 
 Use the report to discuss client pool sizing, per-user concurrency, quotas, and misbehaving consumers with service owners. Every recommendation names its triggering evidence. The tool never kills a query, changes a setting or quota, drops a connection, or takes any database or Kubernetes action.
+
+## Parts, merges, and mutations
+
+`get_clickhouse_parts_report` uses the same readonly profile check and bounded registry queries. It reads active-part aggregates from `system.parts`, MergeTree defaults from `system.merge_tree_settings`, table engine metadata from `system.tables`, running merges from `system.merges`, mutations from `system.mutations`, detached parts from `system.detached_parts`, recent activity from `system.part_log` when enabled, and recent failures from `system.errors`. Each source is treated independently; a missing or legacy table becomes an explicit evidence gap rather than an invented result.
+
+The report compares per-partition active part counts with `parts_to_delay_throw` and `parts_to_throw_insert`, using a table override from `engine_full` when present and the server default otherwise. It reports average part size and partitions with an average active part of at most 8 MiB as small-part evidence. It also reports merge progress, elapsed time, source/output size, and background-pool task counts. Mutations are flagged as failed, old after six hours, or stuck after 24 hours, together with age, `parts_to_do`, and `latest_fail_reason`. Detached parts are grouped by reason. Part-log rows are bounded to the last 24 hours and cannot be used to invent a longer trend.
+
+The tool may recommend insert batching, partition/granularity review, merge-pool review, investigation of stuck/failed mutations, or investigation of detached parts. It never runs or suggests issuing a mutation, `OPTIMIZE`, `DETACH`, `ATTACH`, `DROP`, `ALTER`, `SYSTEM`, or `KILL` command. Every recommendation is advisory and evidence-linked.
+
+## Resource, disk, and storage forensics
+
+`get_clickhouse_resource_report` reads selected values from `system.asynchronous_metrics`, `system.metrics`, `system.server_settings`, `system.disks`, and `system.storage_policies`. It reports tracking/resident memory when exposed, the lower of the ClickHouse server memory limit and the selected Kubernetes container memory limit, cache sizes where exposed, and query-cache hit rate only when hit and miss counters are available.
+
+Storage reporting uses disk free/total space, `keep_free_space`, storage-policy volume and tiering metadata, and the PVC request matched by disk path to a pod volume mount. The disk and PVC values are different evidence layers: ClickHouse sees filesystem use while Kubernetes reports the configured PVC capacity. Missing mounts, ambiguous paths, or absent claims are reported as evidence gaps.
+
+For size leaders, the report uses only metadata from `system.parts` and `system.parts_columns`. It ranks active tables and partitions by bytes, rows, and part count, and ranks columns by compressed bytes with a compression ratio from compressed versus uncompressed metadata when available. TTL presence comes from `system.tables.engine_full`; the tool does not scan application data.
+
+The tool may recommend memory headroom investigation, external aggregation or sorting, column codecs, `LowCardinality`, retention/TTL review, storage tiering, or disk-pressure investigation. It never deletes, moves, detaches, or mutates data and never changes ClickHouse or Kubernetes configuration. Missing asynchronous metrics or older table layouts are reported as unavailable evidence rather than inferred.

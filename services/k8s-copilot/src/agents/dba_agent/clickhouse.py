@@ -340,6 +340,33 @@ FORMAT JSONEachRow""",
 )
 _register_template(
     ClickHouseSQLTemplate(
+        "clickhouse_parts_summary.v1",
+        1,
+        "Aggregate active MergeTree parts by table and partition.",
+        """SELECT
+    database,
+    table,
+    partition,
+    count() AS active_parts,
+    sum(bytes_on_disk) AS total_bytes,
+    sum(rows) AS total_rows,
+    avg(bytes_on_disk) AS avg_part_bytes,
+    max(bytes_on_disk) AS largest_part_bytes,
+    max(modification_time) AS newest_part_time
+FROM system.parts
+WHERE active = 1
+  AND (empty({database:String}) OR database = {database:String})
+  AND (empty({table:String}) OR table = {table:String})
+GROUP BY database, table, partition
+ORDER BY active_parts DESC, total_bytes DESC, database ASC, table ASC, partition ASC
+LIMIT {limit:UInt64}
+FORMAT JSONEachRow""",
+        required_params=("limit",),
+        optional_params=("database", "table"),
+    )
+)
+_register_template(
+    ClickHouseSQLTemplate(
         "clickhouse_replication_queue.v1",
         1,
         "Read bounded replication-queue entries, retries, exceptions, and postponement reasons.",
@@ -360,6 +387,29 @@ FROM system.replication_queue
 ORDER BY last_attempt_time DESC, database ASC, table ASC, node_name ASC
 LIMIT 200
 FORMAT JSONEachRow""",
+    )
+)
+_register_template(
+    ClickHouseSQLTemplate(
+        "clickhouse_merges.v1",
+        1,
+        "Read a bounded snapshot of running merges.",
+        """SELECT
+    database,
+    table,
+    elapsed,
+    progress,
+    num_parts,
+    rows_read,
+    bytes_read_uncompressed,
+    total_size_bytes_compressed,
+    source_part_names,
+    result_part_name
+FROM system.merges
+ORDER BY elapsed DESC, database ASC, table ASC
+LIMIT {limit:UInt64}
+FORMAT JSONEachRow""",
+        required_params=("limit",),
     )
 )
 _register_template(
@@ -385,6 +435,31 @@ FORMAT JSONEachRow""",
 )
 _register_template(
     ClickHouseSQLTemplate(
+        "clickhouse_mutations.v1",
+        1,
+        "Read pending, old, and failed table mutations.",
+        """SELECT
+    database,
+    table,
+    mutation_id,
+    command,
+    create_time,
+    is_done,
+    parts_to_do,
+    latest_fail_time,
+    latest_fail_reason
+FROM system.mutations
+WHERE (empty({database:String}) OR database = {database:String})
+  AND (empty({table:String}) OR table = {table:String})
+ORDER BY is_done ASC, create_time ASC
+LIMIT {limit:UInt64}
+FORMAT JSONEachRow""",
+        required_params=("limit",),
+        optional_params=("database", "table"),
+    )
+)
+_register_template(
+    ClickHouseSQLTemplate(
         "clickhouse_keeper_connection.v1",
         1,
         "Read the local Keeper/ZooKeeper connection state when the system table is present.",
@@ -404,6 +479,152 @@ FORMAT JSONEachRow""",
 )
 _register_template(
     ClickHouseSQLTemplate(
+        "clickhouse_detached_parts.v1",
+        1,
+        "Read detached MergeTree part metadata grouped by reason.",
+        """SELECT
+    database,
+    table,
+    partition,
+    name,
+    reason,
+    disk_name
+FROM system.detached_parts
+WHERE (empty({database:String}) OR database = {database:String})
+  AND (empty({table:String}) OR table = {table:String})
+ORDER BY database ASC, table ASC, partition ASC, name ASC
+LIMIT {limit:UInt64}
+FORMAT JSONEachRow""",
+        required_params=("limit",),
+        optional_params=("database", "table"),
+    )
+)
+_register_template(
+    ClickHouseSQLTemplate(
+        "clickhouse_part_log.v1",
+        1,
+        "Read recent part creation, merge, and mutation activity.",
+        """SELECT
+    database,
+    table,
+    event_type,
+    count() AS event_count,
+    sum(rows) AS rows_changed,
+    sum(bytes) AS bytes_changed,
+    avg(duration_ms) AS avg_duration_ms,
+    max(event_time) AS latest_event_time
+FROM system.part_log
+WHERE event_date >= toDate(now() - INTERVAL 24 HOUR)
+  AND event_time >= now() - INTERVAL 24 HOUR
+  AND (empty({database:String}) OR database = {database:String})
+  AND (empty({table:String}) OR table = {table:String})
+GROUP BY database, table, event_type
+ORDER BY latest_event_time DESC, event_count DESC
+LIMIT {limit:UInt64}
+FORMAT JSONEachRow""",
+        required_params=("limit",),
+        optional_params=("database", "table"),
+    )
+)
+_register_template(
+    ClickHouseSQLTemplate(
+        "clickhouse_parts_errors.v1",
+        1,
+        "Read recent server errors that may explain merge or storage issues.",
+        """SELECT
+    name,
+    code,
+    text,
+    value AS count,
+    last_error_time,
+    last_error_message
+FROM system.errors
+WHERE value > 0 AND last_error_time >= now() - INTERVAL 24 HOUR
+ORDER BY last_error_time DESC, value DESC
+LIMIT {limit:UInt64}
+FORMAT JSONEachRow""",
+        required_params=("limit",),
+    )
+)
+_register_template(
+    ClickHouseSQLTemplate(
+        "clickhouse_merge_tree_settings.v1",
+        1,
+        "Read MergeTree defaults used for too-many-parts comparisons.",
+        """SELECT
+    name,
+    value,
+    changed,
+    description,
+    type
+FROM system.merge_tree_settings
+WHERE name IN (
+    'parts_to_delay_throw',
+    'parts_to_throw_insert',
+    'max_parts_to_delay_merge',
+    'max_parts_to_merge_at_once',
+    'min_bytes_for_wide_part',
+    'min_rows_for_wide_part',
+    'index_granularity'
+)
+ORDER BY name
+FORMAT JSONEachRow""",
+    )
+)
+_register_template(
+    ClickHouseSQLTemplate(
+        "clickhouse_table_metadata.v1",
+        1,
+        "Read table engine, TTL, key, and per-table settings evidence.",
+        """SELECT
+    database,
+    table,
+    engine,
+    engine_full,
+    partition_key,
+    sorting_key
+FROM system.tables
+WHERE database != 'system'
+  AND (empty({database:String}) OR database = {database:String})
+  AND (empty({table:String}) OR table = {table:String})
+ORDER BY database ASC, table ASC
+LIMIT {limit:UInt64}
+FORMAT JSONEachRow""",
+        required_params=("limit",),
+        optional_params=("database", "table"),
+    )
+)
+_register_template(
+    ClickHouseSQLTemplate(
+        "clickhouse_async_metrics.v1",
+        1,
+        "Read selected memory and cache metrics.",
+        """SELECT
+    metric,
+    value
+FROM system.asynchronous_metrics
+WHERE metric IN (
+    'MemoryTracking',
+    'MemoryTrackingForAllocations',
+    'MemoryResident',
+    'MemoryShared',
+    'MemoryVirtual',
+    'OSSMemoryAvailable',
+    'OSSMemoryTotal',
+    'MarkCacheBytes',
+    'UncompressedCacheBytes',
+    'CompressedReadBufferCacheBytes',
+    'CacheSizeInBytes',
+    'QueryCacheHits',
+    'QueryCacheMisses',
+    'QueryCacheEntries'
+)
+ORDER BY metric
+FORMAT JSONEachRow""",
+    )
+)
+_register_template(
+    ClickHouseSQLTemplate(
         "clickhouse_metrics.v1",
         1,
         "Read bounded server metric counters from system.metrics.",
@@ -414,6 +635,29 @@ _register_template(
 FROM system.metrics
 ORDER BY metric
 LIMIT 200
+FORMAT JSONEachRow""",
+    )
+)
+_register_template(
+    ClickHouseSQLTemplate(
+        "clickhouse_resource_metrics.v1",
+        1,
+        "Read current memory, merge-pool, and query-cache metrics.",
+        """SELECT
+    metric,
+    value
+FROM system.metrics
+WHERE metric IN (
+    'MemoryTracking',
+    'MemoryTrackingForAllocations',
+    'BackgroundPoolTask',
+    'BackgroundMergesAndMutationsPoolTask',
+    'Merge',
+    'Mutation',
+    'QueryCacheHits',
+    'QueryCacheMisses'
+)
+ORDER BY metric
 FORMAT JSONEachRow""",
     )
 )
@@ -462,6 +706,31 @@ WHERE name IN (
     'max_concurrent_insert_queries',
     'max_io_threads',
     'max_sessions_for_user'
+    )
+ORDER BY name
+FORMAT JSONEachRow""",
+    )
+)
+_register_template(
+    ClickHouseSQLTemplate(
+        "clickhouse_server_settings.v1",
+        1,
+        "Read server memory and background-pool settings.",
+        """SELECT
+    name,
+    value,
+    type,
+    changed
+FROM system.server_settings
+WHERE name IN (
+    'max_server_memory_usage',
+    'max_server_memory_usage_to_ram_ratio',
+    'max_thread_pool_size',
+    'background_pool_size',
+    'background_merges_mutations_concurrency_scale',
+    'background_merges_mutations_scheduling_policy',
+    'max_uncompressed_cache_size',
+    'mark_cache_size'
 )
 ORDER BY name
 FORMAT JSONEachRow""",
@@ -484,6 +753,67 @@ ORDER BY value DESC, name ASC
 LIMIT {limit:UInt64}
 FORMAT JSONEachRow""",
         required_params=("limit",),
+    )
+)
+_register_template(
+    ClickHouseSQLTemplate(
+        "clickhouse_disks.v1",
+        1,
+        "Read configured disk free space, total capacity, and keep-free thresholds.",
+        """SELECT
+    name,
+    path,
+    type,
+    free_space,
+    total_space,
+    keep_free_space,
+    is_read_only
+FROM system.disks
+ORDER BY name
+FORMAT JSONEachRow""",
+    )
+)
+_register_template(
+    ClickHouseSQLTemplate(
+        "clickhouse_storage_policies.v1",
+        1,
+        "Read storage-policy volume and tiering evidence.",
+        """SELECT
+    policy_name,
+    volume_name,
+    volume_index,
+    disk_name,
+    path,
+    move_factor,
+    prefer_not_to_merge,
+    perform_ttl_move_on_insert
+FROM system.storage_policies
+ORDER BY policy_name ASC, volume_index ASC, disk_name ASC
+FORMAT JSONEachRow""",
+    )
+)
+_register_template(
+    ClickHouseSQLTemplate(
+        "clickhouse_largest_tables.v1",
+        1,
+        "Rank active-table storage by metadata in system.parts.",
+        """SELECT
+    database,
+    table,
+    count() AS active_parts,
+    sum(bytes_on_disk) AS total_bytes,
+    sum(rows) AS total_rows,
+    avg(bytes_on_disk) AS avg_part_bytes
+FROM system.parts
+WHERE active = 1
+  AND (empty({database:String}) OR database = {database:String})
+  AND (empty({table:String}) OR table = {table:String})
+GROUP BY database, table
+ORDER BY total_bytes DESC, active_parts DESC, database ASC, table ASC
+LIMIT {limit:UInt64}
+FORMAT JSONEachRow""",
+        required_params=("limit",),
+        optional_params=("database", "table"),
     )
 )
 _register_template(
@@ -557,6 +887,55 @@ FORMAT JSONEachRow""",
             "end_time",
             "limit",
         ),
+    )
+)
+_register_template(
+    ClickHouseSQLTemplate(
+        "clickhouse_largest_partitions.v1",
+        1,
+        "Rank active partitions by metadata in system.parts.",
+        """SELECT
+    database,
+    table,
+    partition,
+    count() AS active_parts,
+    sum(bytes_on_disk) AS total_bytes,
+    sum(rows) AS total_rows
+FROM system.parts
+WHERE active = 1
+  AND (empty({database:String}) OR database = {database:String})
+  AND (empty({table:String}) OR table = {table:String})
+GROUP BY database, table, partition
+ORDER BY total_bytes DESC, database ASC, table ASC, partition ASC
+LIMIT {limit:UInt64}
+FORMAT JSONEachRow""",
+        required_params=("limit",),
+        optional_params=("database", "table"),
+    )
+)
+_register_template(
+    ClickHouseSQLTemplate(
+        "clickhouse_largest_columns.v1",
+        1,
+        "Rank column storage from system.parts_columns metadata only.",
+        """SELECT
+    database,
+    table,
+    column,
+    sum(column_data_compressed_bytes) AS compressed_bytes,
+    sum(column_data_uncompressed_bytes) AS uncompressed_bytes,
+    max(rows) AS max_rows,
+    if(sum(column_data_compressed_bytes) = 0, null, sum(column_data_uncompressed_bytes) / sum(column_data_compressed_bytes)) AS compression_ratio
+FROM system.parts_columns
+WHERE active = 1
+  AND (empty({database:String}) OR database = {database:String})
+  AND (empty({table:String}) OR table = {table:String})
+GROUP BY database, table, column
+ORDER BY compressed_bytes DESC, database ASC, table ASC, column ASC
+LIMIT {limit:UInt64}
+FORMAT JSONEachRow""",
+        required_params=("limit",),
+        optional_params=("database", "table"),
     )
 )
 
@@ -883,6 +1262,900 @@ def _run_clickhouse_query(
     )
     return _parse_json_each_row(output), output
 
+
+_CLICKHOUSE_MEMORY_CACHE_METRICS = (
+    "MemoryTracking",
+    "MemoryTrackingForAllocations",
+    "MemoryResident",
+    "MemoryShared",
+    "MemoryVirtual",
+    "OSSMemoryAvailable",
+    "OSSMemoryTotal",
+    "MarkCacheBytes",
+    "UncompressedCacheBytes",
+    "CompressedReadBufferCacheBytes",
+    "CacheSizeInBytes",
+)
+_CLICKHOUSE_HIT_MISS_METRICS = ("QueryCacheHits", "QueryCacheMisses")
+_CLICKHOUSE_PART_SETTINGS = (
+    "parts_to_delay_throw",
+    "parts_to_throw_insert",
+    "max_parts_to_delay_merge",
+    "max_parts_to_merge_at_once",
+)
+
+
+def _clickhouse_timestamp(value: object) -> Optional[datetime]:
+    if value is None or value == "":
+        return None
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    text = str(value).replace("Z", "+00:00").strip()
+    for candidate in (text, text.split(".")[0].replace(" ", "T", 1)):
+        try:
+            parsed = datetime.fromisoformat(candidate)
+            return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+    return None
+
+
+def _clickhouse_number_or_none(row: Mapping[str, Any], *names: str) -> Optional[float]:
+    for name in names:
+        if name not in row or row[name] is None or str(row[name]).strip() == "":
+            continue
+        try:
+            return float(row[name])
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def _clickhouse_metric_map(rows: list[dict[str, Any]]) -> dict[str, float]:
+    metrics: dict[str, float] = {}
+    for row in rows:
+        name = _clickhouse_string(row, "metric", "name")
+        value = _clickhouse_number_or_none(row, "value")
+        if name and value is not None:
+            metrics[name] = value
+    return metrics
+
+
+def _clickhouse_setting_map(rows: list[dict[str, Any]]) -> dict[str, str]:
+    return {
+        _clickhouse_string(row, "name"): _clickhouse_string(row, "value")
+        for row in rows
+        if _clickhouse_string(row, "name")
+    }
+
+
+def _clickhouse_parse_engine_settings(engine_full: object) -> dict[str, str]:
+    """Extract only known scalar engine SETTINGS; never parse SQL into a command."""
+    text = str(engine_full or "")
+    settings: dict[str, str] = {}
+    match = re.search(r"(?i)\bSETTINGS\s+(.*)$", text)
+    if not match:
+        return settings
+    for item in re.finditer(r"(?i)([a-z_][a-z0-9_]*)\s*=\s*('[^']*'|[^\s,]+)", match.group(1)):
+        name = item.group(1).lower()
+        value = item.group(2).strip("'")
+        if name in _CLICKHOUSE_PART_SETTINGS or name in {"index_granularity", "min_bytes_for_wide_part"}:
+            settings[name] = value
+    return settings
+
+
+def _clickhouse_container_memory_limit(
+    pod: Any,
+    selected_container: Optional[str] = None,
+) -> tuple[Optional[int], str]:
+    from .tools import _container_memory_limit
+
+    return _container_memory_limit(pod, selected_container)
+
+
+def _clickhouse_pvc_capacity(
+    v1: Any,
+    pod: Any,
+    disk_path: str,
+) -> tuple[Optional[int], str]:
+    """Match one ClickHouse disk path to a mounted PVC and return its capacity."""
+    if not disk_path.startswith("/"):
+        return None, "not an absolute disk path"
+    mounts: list[tuple[str, str]] = []
+    for container in getattr(getattr(pod, "spec", None), "containers", None) or []:
+        for volume_mount in getattr(container, "volume_mounts", None) or []:
+            claim_name = getattr(volume_mount, "name", None)
+            if claim_name:
+                mounts.append((str(volume_mount.mount_path).rstrip("/"), str(claim_name)))
+    if not mounts:
+        return None, "no volume mounts found"
+    matches = [
+        (mount_path, claim_name)
+        for mount_path, claim_name in mounts
+        if disk_path == mount_path or disk_path.startswith(f"{mount_path}/")
+    ]
+    if not matches:
+        return None, "disk path does not match a container volume mount"
+    if len(matches) > 1:
+        return None, f"ambiguous with {len(matches)} volume mounts"
+    _, claim_name = matches[0]
+    namespace = str(getattr(getattr(pod, "metadata", None), "namespace", "") or "")
+    pod_name = str(getattr(getattr(pod, "metadata", None), "name", "") or "")
+    if not namespace:
+        return None, "pod namespace unavailable"
+    claims = v1.list_namespaced_persistent_volume_claim(
+        namespace=namespace,
+        field_selector=f"metadata.name={claim_name}",
+    )
+    items = list(getattr(claims, "items", None) or [])
+    if not items:
+        return None, f"PVC {claim_name} not found"
+    spec = getattr(getattr(items[0], "spec", None), "resources", None)
+    storage = dict(getattr(spec, "requests", None) or {}).get("storage")
+    if storage is None:
+        return None, f"PVC {claim_name} storage request unavailable"
+    from .tools import _memory_quantity
+
+    return _memory_quantity(storage), f"{storage} on PVC {claim_name} in {namespace}/{pod_name}"
+
+
+def _clickhouse_report_query(
+    namespace: str,
+    pod_name: str,
+    template_id: str,
+    params: dict[str, Any],
+    container: Optional[str],
+    missing_hint: str,
+) -> list[dict[str, Any]]:
+    try:
+        rows, _ = _run_clickhouse_query(namespace, pod_name, template_id, params, container)
+        return rows
+    except Exception as exc:
+        message = str(exc).lower()
+        if "unknown table" in message or "not found" in message or "no such table" in message:
+            raise RuntimeError(missing_hint) from exc
+        if "unknown expression identifier" in message or "unknown identifier" in message:
+            raise RuntimeError(missing_hint) from exc
+        raise
+
+
+def _clickhouse_bytes(value: Optional[float]) -> str:
+    if value is None:
+        return "unknown"
+    value = float(value)
+    units = ("B", "KiB", "MiB", "GiB", "TiB", "PiB")
+    scaled = value
+    index = 0
+    while scaled >= 1024 and index < len(units) - 1:
+        scaled /= 1024
+        index += 1
+    return f"{scaled:.1f}{units[index]}"
+
+
+def _clickhouse_table_label(database: str, table: str, partition: Optional[str] = None) -> str:
+    base = f"{database or 'unknown'}.{table or 'unknown'}"
+    return f"{base} partition={partition}" if partition else base
+
+
+def _clickhouse_percent(value: Optional[float]) -> str:
+    return f"{value * 100:.1f}%" if value is not None else "unavailable"
+
+
+def _clickhouse_age_text(value: Optional[datetime]) -> str:
+    if value is None:
+        return "unknown"
+    seconds = max(0.0, (datetime.now(timezone.utc) - value).total_seconds())
+    if seconds < 60:
+        return f"{seconds:.0f}s"
+    if seconds < 3600:
+        return f"{seconds / 60:.1f}m"
+    if seconds < 86400:
+        return f"{seconds / 3600:.1f}h"
+    return f"{seconds / 86400:.1f}d"
+
+
+def _clickhouse_limit_setting(value: object) -> Optional[int]:
+    if value is None or str(value).strip() == "":
+        return None
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return None
+
+
+def _clickhouse_parts_evidence(
+    namespace: str,
+    pod_name: str,
+    version: str,
+    database: Optional[str],
+    table: Optional[str],
+    limit: int,
+    container: Optional[str],
+) -> tuple[
+    list[str],
+    dict[str, str],
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+    dict[str, float],
+]:
+    """Collect every parts/merge/mutation table independently so one gap does not erase the rest."""
+    filters = {"database": database or "", "table": table or "", "limit": limit}
+    errors: list[str] = []
+    settings_rows: list[dict[str, Any]] = []
+    parts: list[dict[str, Any]] = []
+    merges: list[dict[str, Any]] = []
+    mutations: list[dict[str, Any]] = []
+    detached: list[dict[str, Any]] = []
+    part_log: list[dict[str, Any]] = []
+    server_errors: list[dict[str, Any]] = []
+    pool_metrics: dict[str, float] = {}
+
+    def query(template_id: str, missing_hint: str, params: dict[str, Any] | None = None):
+        return _clickhouse_report_query(
+            namespace,
+            pod_name,
+            template_id,
+            params or {},
+            container,
+            missing_hint,
+        )
+
+    for template_id, hint in (
+        ("clickhouse_merge_tree_settings.v1", "system.merge_tree_settings is unavailable."),
+        ("clickhouse_parts_summary.v1", "system.parts is unavailable or cannot be read."),
+        ("clickhouse_merges.v1", "system.merges is unavailable or uses an older column layout."),
+        ("clickhouse_mutations.v1", "system.mutations is unavailable or cannot be read."),
+        ("clickhouse_detached_parts.v1", "system.detached_parts is unavailable or cannot be read."),
+        ("clickhouse_part_log.v1", "system.part_log is disabled or unavailable."),
+        ("clickhouse_parts_errors.v1", "system.errors is unavailable or cannot be read."),
+        ("clickhouse_resource_metrics.v1", "system.metrics is unavailable or cannot be read."),
+    ):
+        try:
+            rows = query(template_id, hint, filters)
+            if template_id == "clickhouse_merge_tree_settings.v1":
+                settings_rows = rows
+            elif template_id == "clickhouse_parts_summary.v1":
+                parts = rows
+            elif template_id == "clickhouse_merges.v1":
+                merges = rows
+            elif template_id == "clickhouse_mutations.v1":
+                mutations = rows
+            elif template_id == "clickhouse_detached_parts.v1":
+                detached = rows
+            elif template_id == "clickhouse_part_log.v1":
+                part_log = rows
+            elif template_id == "clickhouse_parts_errors.v1":
+                server_errors = rows
+            else:
+                pool_metrics = _clickhouse_metric_map(rows)
+        except Exception as exc:
+            errors.append(f"{template_id}: {exc}")
+    return errors, _clickhouse_setting_map(settings_rows), parts, merges, mutations, detached, part_log, server_errors, pool_metrics
+
+
+def _clickhouse_table_settings(
+    namespace: str,
+    pod_name: str,
+    database: Optional[str],
+    table: Optional[str],
+    limit: int,
+    container: Optional[str],
+) -> tuple[dict[tuple[str, str], dict[str, Any]], list[str]]:
+    try:
+        rows = _clickhouse_report_query(
+            namespace,
+            pod_name,
+            "clickhouse_table_metadata.v1",
+            {"database": database or "", "table": table or "", "limit": limit},
+            container,
+            "system.tables is unavailable or cannot be read.",
+        )
+        return {(row.get("database"), row.get("table")): row for row in rows}, []
+    except Exception as exc:
+        return {}, [f"clickhouse_table_metadata.v1: {exc}"]
+
+
+def _clickhouse_parts_findings(
+    parts: list[dict[str, Any]],
+    table_metadata: dict[tuple[str, str], dict[str, Any]],
+    settings: dict[str, str],
+    merges: list[dict[str, Any]],
+    mutations: list[dict[str, Any]],
+    detached: list[dict[str, Any]],
+) -> tuple[list[str], list[str]]:
+    findings: list[str] = []
+    recommendations: list[str] = []
+    if parts:
+        small_partitions = [row for row in parts if (_clickhouse_number_or_none(row, "avg_part_bytes") or 0) <= 8 * 1024 * 1024]
+        if small_partitions:
+            smallest = min(small_partitions, key=lambda row: _clickhouse_number_or_none(row, "avg_part_bytes") or 0)
+            ratio = len(small_partitions) / len(parts)
+            findings.append(
+                f"Small-part evidence: {len(small_partitions)}/{len(parts)} partitions have average active part size "
+                f"<= 8.0MiB; smallest is {_clickhouse_table_label(str(smallest.get('database', '')), str(smallest.get('table', '')), str(smallest.get('partition', '')))} "
+                f"with avg={_clickhouse_bytes(_clickhouse_number_or_none(smallest, 'avg_part_bytes'))}."
+            )
+            recommendations.append(
+                f"Batch inserts or consolidate small parts for high-partition tables. Evidence: {ratio * 100:.1f}% of "
+                "reported partitions average <= 8.0MiB per active part. Changes require load modeling and owner review; nothing was applied."
+            )
+        partitions = sorted(parts, key=lambda row: _clickhouse_number_or_none(row, "active_parts") or 0, reverse=True)
+        for row in partitions[:5]:
+            key = (row.get("database"), row.get("table"))
+            metadata = table_metadata.get(key, {})
+            per_table = _clickhouse_parse_engine_settings(metadata.get("engine_full"))
+            delay = _clickhouse_limit_setting(
+                per_table.get("parts_to_delay_throw", settings.get("parts_to_delay_throw"))
+            )
+            throw = _clickhouse_limit_setting(
+                per_table.get("parts_to_throw_insert", settings.get("parts_to_throw_insert"))
+            )
+            active = _clickhouse_number_or_none(row, "active_parts") or 0
+            if throw is not None and active >= throw:
+                findings.append(
+                    f"Too many parts at throw threshold: {_clickhouse_table_label(str(row.get('database', '')), str(row.get('table', '')), str(row.get('partition', '')))} "
+                    f"has {int(active)} active parts; parts_to_throw_insert={throw}."
+                )
+                recommendations.append(
+                    f"Investigate insert pressure before writes for {_clickhouse_table_label(str(row.get('database', '')), str(row.get('table', '')), str(row.get('partition', '')))}. "
+                    f"Evidence: active_parts={int(active)} and parts_to_throw_insert={throw}. This is advisory; do not issue OPTIMIZE or SYSTEM commands from this agent."
+                )
+            elif delay is not None and active >= delay:
+                findings.append(
+                    f"Too many parts at delay threshold: {_clickhouse_table_label(str(row.get('database', '')), str(row.get('table', '')), str(row.get('partition', '')))} "
+                    f"has {int(active)} active parts; parts_to_delay_throw={delay}."
+                )
+
+    for row in merges[:5]:
+        progress = _clickhouse_number_or_none(row, "progress")
+        elapsed = _clickhouse_number_or_none(row, "elapsed") or 0
+        size = _clickhouse_number_or_none(row, "total_size_bytes_compressed")
+        source_count = len(row.get("source_part_names") or [])
+        findings.append(
+            f"Running merge: {_clickhouse_table_label(str(row.get('database', '')), str(row.get('table', '')))} "
+            f"progress={_clickhouse_percent(progress)}; elapsed={elapsed:.1f}s; source_parts={source_count}; "
+            f"output_size={_clickhouse_bytes(size)}."
+        )
+        if elapsed >= 3600:
+            recommendations.append(
+                "Review merge concurrency and partition size before changing background pools. Evidence: a reported merge has "
+                f"elapsed={elapsed:.1f}s. Pool changes can increase load; no setting was changed."
+            )
+
+    for row in mutations[:10]:
+        create_time = _clickhouse_timestamp(row.get("create_time"))
+        age = _clickhouse_age_text(create_time)
+        parts_to_do = _clickhouse_number_or_none(row, "parts_to_do") or 0
+        fail_reason = _clickhouse_string(row, "latest_fail_reason")
+        done = row.get("is_done")
+        if fail_reason:
+            findings.append(
+                f"Failed mutation: {_clickhouse_table_label(str(row.get('database', '')), str(row.get('table', '')))} "
+                f"mutation_id={row.get('mutation_id')}; age={age}; parts_to_do={int(parts_to_do)}; latest_fail_reason={fail_reason}."
+            )
+            recommendations.append(
+                f"Investigate the failed mutation with the table owner before retrying. Evidence: mutation_id={row.get('mutation_id')} "
+                f"has parts_to_do={int(parts_to_do)} and latest_fail_reason={fail_reason}. No KILL or retry command was issued."
+            )
+        elif not done and (create_time is not None and (datetime.now(timezone.utc) - create_time).total_seconds() >= 6 * 3600):
+            state = "stuck" if (datetime.now(timezone.utc) - create_time).total_seconds() >= 24 * 3600 else "old"
+            findings.append(
+                f"{state.capitalize()} mutation: {_clickhouse_table_label(str(row.get('database', '')), str(row.get('table', '')))} "
+                f"mutation_id={row.get('mutation_id')}; age={age}; parts_to_do={int(parts_to_do)}."
+            )
+            recommendations.append(
+                f"Review merge/mutation capacity and the mutation's table context. Evidence: mutation_id={row.get('mutation_id')} "
+                f"is {age} old with parts_to_do={int(parts_to_do)}. No mutation was canceled, retried, or forced."
+            )
+
+    if detached:
+        grouped: dict[tuple[str, str, str], int] = {}
+        for row in detached:
+            key = (
+                str(row.get("database", "unknown")),
+                str(row.get("table", "unknown")),
+                str(row.get("reason", "unknown")),
+            )
+            grouped[key] = grouped.get(key, 0) + 1
+        for (database, table, reason), count in sorted(grouped.items()):
+            findings.append(
+                f"Detached parts: {database}.{table} reason={reason or 'unknown'} count={count}."
+            )
+            recommendations.append(
+                f"Inspect detached parts with the table owner and confirm recovery procedures. Evidence: {database}.{table} has "
+                f"{count} detached part(s) with reason={reason or 'unknown'}. No ATTACH, DROP, or filesystem command was issued."
+            )
+    return findings, recommendations
+
+
+def get_clickhouse_parts_report(
+    namespace: Optional[str] = None,
+    pod: Optional[str] = None,
+    database: Optional[str] = None,
+    table: Optional[str] = None,
+    output_mode: str = "human",
+    *,
+    container: Optional[str] = None,
+    label_selector: Optional[str] = None,
+) -> str:
+    """Report active parts, merges, mutations, detached parts, and part activity."""
+    tool = "get_clickhouse_parts_report"
+    mode = "human"
+    try:
+        mode = _clickhouse_output_mode(output_mode)
+        limit = _clamp_clickhouse_number(200, 200, 1, 1000)
+        if database is not None:
+            _validate_clickhouse_identifier(database, "database")
+        if table is not None:
+            _validate_clickhouse_identifier(table, "table")
+        from .tools import _load_kubernetes_client
+
+        v1 = _load_kubernetes_client()
+        pods = _clickhouse_pod_candidates(v1, namespace, pod, label_selector)
+    except Exception as exc:
+        return _clickhouse_tool_error(tool, f"Error preparing ClickHouse parts analysis: {exc}", mode)
+    if not pods:
+        return _clickhouse_tool_error(
+            tool,
+            "No ClickHouse server pods found. Use find_database_pods with 'clickhouse' to confirm labels.",
+            mode,
+        )
+
+    sections: list[str] = []
+    errors: list[str] = []
+    for pod_item in pods:
+        target_namespace = pod_item.metadata.namespace
+        target_pod = pod_item.metadata.name
+        label = f"{target_namespace}/{target_pod}"
+        try:
+            profile_rows, _ = _run_clickhouse_query(
+                target_namespace,
+                target_pod,
+                "clickhouse_readonly_profile.v1",
+                container=container,
+            )
+            version = _clickhouse_string(profile_rows[0], "version", default="unknown")
+            table_metadata, metadata_errors = _clickhouse_table_settings(
+                target_namespace,
+                target_pod,
+                database,
+                table,
+                limit,
+                container,
+            )
+            evidence_errors, settings, parts, merges, mutations, detached, part_log, server_errors, pool_metrics = _clickhouse_parts_evidence(
+                target_namespace,
+                target_pod,
+                version,
+                database,
+                table,
+                limit,
+                container,
+            )
+            errors.extend(f"{label} {error}" for error in [*metadata_errors, *evidence_errors])
+            findings, recommendations = _clickhouse_parts_findings(
+                parts,
+                table_metadata,
+                settings,
+                merges,
+                mutations,
+                detached,
+            )
+            section = [
+                f"### {label} (server {version})",
+                f"- Evidence: system.parts, system.merge_tree_settings, system.merges, system.mutations, "
+                f"system.detached_parts, system.part_log (when enabled), and system.errors; limit={limit}.",
+                f"- Background pool: BackgroundMergesAndMutationsPoolTask={int(pool_metrics.get('BackgroundMergesAndMutationsPoolTask', 0))}; "
+                f"BackgroundPoolTask={int(pool_metrics.get('BackgroundPoolTask', 0))}.",
+                "",
+            ]
+            if findings:
+                section.extend(["Evidence findings:", *(f"- {finding}" for finding in findings)])
+            else:
+                section.append("No part-count, running-merge, mutation, or detached-part threshold was crossed in the bounded evidence.")
+            section.append("")
+            section.append("Part activity (last 24h):")
+            if part_log:
+                for row in part_log[:10]:
+                    event_count = _clickhouse_number_or_none(row, "event_count") or 0
+                    bytes_changed = _clickhouse_number_or_none(row, "bytes_changed")
+                    bytes_text = _clickhouse_bytes(bytes_changed)
+                    throughput_text = (
+                        f"avg_bytes_per_second={bytes_changed / (24 * 3600):.1f}; " if bytes_changed is not None else ""
+                    )
+                    section.append(
+                        f"- {_clickhouse_table_label(str(row.get('database', '')), str(row.get('table', '')))} "
+                        f"event_type={row.get('event_type') or 'unknown'} count={int(event_count)}; "
+                        f"rate_per_hour={event_count / 24:.1f}; "
+                        f"rows={int(_clickhouse_number_or_none(row, 'rows_changed') or 0)}; "
+                        f"bytes={bytes_text}; {throughput_text}"
+                        f"avg_duration_ms={_clickhouse_number_or_none(row, 'avg_duration_ms') or 0:.1f}."
+                    )
+            else:
+                section.append("- unavailable; part_log may be disabled, absent, or outside the retained window.")
+            if server_errors:
+                section.extend(["Recent server errors:", ""])
+                for row in server_errors[:10]:
+                    section.append(
+                        f"- {row.get('name') or 'unknown'} code={row.get('code')} count={row.get('count')}; "
+                        f"message={_clickhouse_string(row, 'last_error_message', 'text')[:240]}."
+                    )
+            if recommendations:
+                section.extend(["Evidence-linked advisory recommendations:", *(f"- {item}" for item in recommendations)])
+            else:
+                section.append("No recommendation is supported by this pod's evidence.")
+            section.extend(
+                [
+                    "",
+                    "All recommendations are advisory. No mutation, merge, detach, DROP, ALTER, SYSTEM command, or "
+                    "ClickHouse setting was changed.",
+                    "",
+                ]
+            )
+            sections.append("\n".join(section))
+        except Exception as exc:
+            errors.append(f"{label}: {exc}")
+
+    if not sections and errors:
+        return _clickhouse_tool_error(tool, "; ".join(errors), mode)
+    report = ["ClickHouse parts, merges, and mutations analysis (advisory only):", "", *"\n".join(sections).splitlines()]
+    if errors:
+        report.extend(["Skipped or partial evidence:", *(f"- {error}" for error in errors), ""])
+    report.append("No changes were made; this analysis is advisory only.")
+    return _clickhouse_tool_output(
+        tool,
+        "\n".join(report),
+        mode,
+        metadata={
+            "namespace": namespace,
+            "pod": pod,
+            "database": database,
+            "table": table,
+            "limit": limit,
+        },
+    )
+
+
+def _clickhouse_resource_evidence(
+    namespace: str,
+    pod_name: str,
+    database: Optional[str],
+    table: Optional[str],
+    top_n: int,
+    container: Optional[str],
+) -> tuple[
+    list[str],
+    dict[str, float],
+    dict[str, float],
+    dict[str, str],
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+    dict[tuple[str, str], dict[str, Any]],
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+]:
+    filters = {"database": database or "", "table": table or "", "limit": top_n}
+    errors: list[str] = []
+    async_metrics: dict[str, float] = {}
+    metrics: dict[str, float] = {}
+    server_settings: dict[str, str] = {}
+    disks: list[dict[str, Any]] = []
+    policies: list[dict[str, Any]] = []
+    tables: dict[tuple[str, str], dict[str, Any]] = {}
+    largest_tables: list[dict[str, Any]] = []
+    largest_partitions: list[dict[str, Any]] = []
+    largest_columns: list[dict[str, Any]] = []
+
+    def query(template_id: str, missing_hint: str):
+        return _clickhouse_report_query(
+            namespace,
+            pod_name,
+            template_id,
+            filters,
+            container,
+            missing_hint,
+        )
+
+    for template_id, hint in (
+        ("clickhouse_async_metrics.v1", "system.asynchronous_metrics is unavailable."),
+        ("clickhouse_resource_metrics.v1", "system.metrics is unavailable."),
+        ("clickhouse_server_settings.v1", "system.server_settings is unavailable."),
+        ("clickhouse_disks.v1", "system.disks is unavailable."),
+        ("clickhouse_storage_policies.v1", "system.storage_policies is unavailable."),
+        ("clickhouse_largest_tables.v1", "system.parts is unavailable."),
+        ("clickhouse_largest_partitions.v1", "system.parts is unavailable."),
+        ("clickhouse_largest_columns.v1", "system.parts_columns is unavailable or does not expose column-size columns."),
+    ):
+        try:
+            rows = query(template_id, hint)
+            if template_id == "clickhouse_async_metrics.v1":
+                async_metrics = _clickhouse_metric_map(rows)
+            elif template_id == "clickhouse_resource_metrics.v1":
+                metrics = _clickhouse_metric_map(rows)
+            elif template_id == "clickhouse_server_settings.v1":
+                server_settings = _clickhouse_setting_map(rows)
+            elif template_id == "clickhouse_disks.v1":
+                disks = rows
+            elif template_id == "clickhouse_storage_policies.v1":
+                policies = rows
+            elif template_id == "clickhouse_largest_tables.v1":
+                largest_tables = rows
+            elif template_id == "clickhouse_largest_partitions.v1":
+                largest_partitions = rows
+            else:
+                largest_columns = rows
+        except Exception as exc:
+            errors.append(f"{template_id}: {exc}")
+    try:
+        metadata_rows = query("clickhouse_table_metadata.v1", "system.tables is unavailable.")
+        tables = {(row.get("database"), row.get("table")): row for row in metadata_rows}
+    except Exception as exc:
+        errors.append(f"clickhouse_table_metadata.v1: {exc}")
+    return errors, async_metrics, metrics, server_settings, disks, policies, tables, largest_tables, largest_partitions, largest_columns
+
+
+def _clickhouse_memory_quantity(value: object) -> Optional[int]:
+    from .tools import _memory_quantity
+
+    return _memory_quantity(value)
+
+
+def _clickhouse_resource_findings(
+    async_metrics: dict[str, float],
+    metrics: dict[str, float],
+    server_settings: dict[str, str],
+    disks: list[dict[str, Any]],
+    tables: dict[tuple[str, str], dict[str, Any]],
+    largest_tables: list[dict[str, Any]],
+    largest_columns: list[dict[str, Any]],
+    kubernetes_limit: Optional[int],
+    top_n: int,
+) -> tuple[list[str], list[str]]:
+    findings: list[str] = []
+    recommendations: list[str] = []
+    tracking = async_metrics.get("MemoryTrackingForAllocations", async_metrics.get("MemoryTracking"))
+    resident = async_metrics.get("MemoryResident")
+    available = async_metrics.get("OSSMemoryAvailable")
+    os_total = async_metrics.get("OSSMemoryTotal")
+    server_limit = _clickhouse_memory_quantity(server_settings.get("max_server_memory_usage"))
+    if tracking is not None:
+        findings.append(f"MemoryTracking={int(tracking)}.")
+    if resident is not None:
+        findings.append(f"MemoryResident={int(resident)}.")
+    if available is not None:
+        findings.append(f"OSSMemoryAvailable={int(available)}.")
+    if os_total is not None:
+        findings.append(f"OSSMemoryTotal={int(os_total)}.")
+    if server_limit is not None:
+        findings.append(f"max_server_memory_usage={_clickhouse_bytes(server_limit)}.")
+    if available is not None and server_limit is not None:
+        findings.append(
+            f"Memory headroom evidence: OSSMemoryAvailable={int(available)}; server max_server_memory_usage={_clickhouse_bytes(server_limit)}."
+        )
+
+    observed_values = [value for value in (tracking, resident) if value is not None]
+    limit_values = [value for value in (server_limit, kubernetes_limit) if value is not None]
+    if observed_values and limit_values:
+        observed = max(observed_values)
+        active_limit = min(limit_values)
+        ratio = observed / active_limit
+        findings.append(
+            f"Memory usage ratio={ratio * 100:.1f}% against the lower of server limit="
+            f"{_clickhouse_bytes(server_limit)} and Kubernetes limit={_clickhouse_bytes(kubernetes_limit)}."
+        )
+        if ratio >= 0.8:
+            recommendations.append(
+                f"Investigate concurrency and query memory before increasing limits. Evidence: observed={_clickhouse_bytes(observed)} "
+                f"is {ratio * 100:.1f}% of {_clickhouse_bytes(active_limit)}. Consider external aggregation/sorting only after "
+                "workload review; no server setting was changed."
+            )
+
+    hits = metrics.get("QueryCacheHits", async_metrics.get("QueryCacheHits"))
+    misses = metrics.get("QueryCacheMisses", async_metrics.get("QueryCacheMisses"))
+    if hits is not None or misses is not None:
+        total = (hits or 0) + (misses or 0)
+        hit_rate = hits / total if total and hits is not None else None
+        findings.append(
+            f"Query cache hits/misses={hits if hits is not None else 'unknown'}/"
+            f"{misses if misses is not None else 'unknown'}; hit_rate={_clickhouse_percent(hit_rate)}."
+        )
+    for name in ("MarkCacheBytes", "UncompressedCacheBytes", "CompressedReadBufferCacheBytes", "CacheSizeInBytes"):
+        value = async_metrics.get(name)
+        if value is not None:
+            findings.append(f"Cache {name}={_clickhouse_bytes(value)}.")
+
+    for row in disks[:10]:
+        name = str(row.get("name") or "unknown")
+        free = _clickhouse_number_or_none(row, "free_space")
+        total = _clickhouse_number_or_none(row, "total_space")
+        keep_free = _clickhouse_number_or_none(row, "keep_free_space")
+        used_ratio = (total - free) / total if free is not None and total and total > 0 else None
+        findings.append(
+            f"Disk {name}: free={_clickhouse_bytes(free)}/{_clickhouse_bytes(total)}={_clickhouse_percent(used_ratio) if used_ratio is not None else 'used unknown'}; "
+            f"keep_free_space={_clickhouse_bytes(keep_free)}; path={row.get('path') or 'unknown'}."
+        )
+        if used_ratio is not None and used_ratio >= 0.85:
+            recommendations.append(
+                f"Review disk pressure and retention for ClickHouse disk {name}. Evidence: used_ratio={used_ratio * 100:.1f}%. "
+                "Do not detach or delete parts from this agent; changes require owner approval."
+            )
+        if keep_free is not None and free is not None and free <= keep_free:
+            recommendations.append(
+                f"Disk {name} is at or below keep_free_space. Evidence: free={_clickhouse_bytes(free)}, "
+                f"keep_free_space={_clickhouse_bytes(keep_free)}. Investigate retention and tiering with the storage owner; nothing was changed."
+            )
+
+    if largest_columns:
+        top = largest_columns[0]
+        compressed = _clickhouse_number_or_none(top, "compressed_bytes")
+        uncompressed = _clickhouse_number_or_none(top, "uncompressed_bytes")
+        compression = uncompressed / compressed if compressed else None
+        compression_text = f"{compression:.2f}:1" if compression is not None else "unavailable"
+        findings.append(
+            f"Largest reported column: {top.get('database') or 'unknown'}.{top.get('table') or 'unknown'} "
+            f"column={top.get('column') or 'unknown'}; compressed={_clickhouse_bytes(compressed)}; "
+            f"compression_ratio={compression_text}; max_rows={int(_clickhouse_number_or_none(top, 'max_rows') or 0)}."
+        )
+        if compression is not None and compression < 2.0:
+            recommendations.append(
+                f"Review column codec and cardinality before changing storage. Evidence: compression_ratio={compression:.2f}:1 for "
+                f"{top.get('column')}. Test codecs offline; no ALTER or data scan was performed."
+            )
+
+    for row in largest_tables[:top_n]:
+        metadata = tables.get((row.get("database"), row.get("table")), {})
+        has_ttl = bool(re.search(r"(?i)\bTTL\b", str(metadata.get("engine_full") or "")))
+        total_bytes = _clickhouse_number_or_none(row, "total_bytes")
+        if total_bytes is not None and total_bytes >= 100 * 1024 * 1024 * 1024 and not has_ttl:
+            recommendations.append(
+                f"Review retention or tiering for {row.get('database')}.{row.get('table')}. Evidence: total_bytes="
+                f"{_clickhouse_bytes(total_bytes)} and no TTL expression in system.tables.engine_full. Data deletion requires owner approval."
+            )
+    return findings, recommendations
+
+
+def get_clickhouse_resource_report(
+    namespace: Optional[str] = None,
+    pod: Optional[str] = None,
+    top_n: int = 20,
+    output_mode: str = "human",
+    *,
+    container: Optional[str] = None,
+    label_selector: Optional[str] = None,
+) -> str:
+    """Report ClickHouse memory, disks, storage tiers, and metadata-only storage leaders."""
+    tool = "get_clickhouse_resource_report"
+    mode = "human"
+    try:
+        mode = _clickhouse_output_mode(output_mode)
+        top_n = _clamp_clickhouse_number(top_n, 20, 1, 100)
+        from .tools import _load_kubernetes_client
+
+        v1 = _load_kubernetes_client()
+        pods = _clickhouse_pod_candidates(v1, namespace, pod, label_selector)
+    except Exception as exc:
+        return _clickhouse_tool_error(tool, f"Error preparing ClickHouse resource analysis: {exc}", mode)
+    if not pods:
+        return _clickhouse_tool_error(
+            tool,
+            "No ClickHouse server pods found. Use find_database_pods with 'clickhouse' to confirm labels.",
+            mode,
+        )
+
+    sections: list[str] = []
+    errors: list[str] = []
+    for pod_item in pods:
+        target_namespace = pod_item.metadata.namespace
+        target_pod = pod_item.metadata.name
+        label = f"{target_namespace}/{target_pod}"
+        try:
+            profile_rows, _ = _run_clickhouse_query(
+                target_namespace,
+                target_pod,
+                "clickhouse_readonly_profile.v1",
+                container=container,
+            )
+            version = _clickhouse_string(profile_rows[0], "version", default="unknown")
+            evidence_errors, async_metrics, metrics, server_settings, disks, policies, tables, largest_tables, largest_partitions, largest_columns = _clickhouse_resource_evidence(
+                target_namespace,
+                target_pod,
+                None,
+                None,
+                top_n,
+                container,
+            )
+            errors.extend(f"{label} {error}" for error in evidence_errors)
+            memory_limit, memory_limit_text = _clickhouse_container_memory_limit(pod_item, container)
+            findings, recommendations = _clickhouse_resource_findings(
+                async_metrics,
+                metrics,
+                server_settings,
+                disks,
+                tables,
+                largest_tables,
+                largest_columns,
+                memory_limit,
+                top_n,
+            )
+            findings.append(
+                f"Kubernetes container memory limit={_clickhouse_bytes(memory_limit)} ({memory_limit_text})."
+            )
+            section = [
+                f"### {label} (server {version})",
+                f"- Evidence: system.asynchronous_metrics, system.metrics, system.server_settings, system.disks, "
+                f"system.storage_policies, system.tables, system.parts, and system.parts_columns (when available).",
+                "",
+            ]
+            if findings:
+                section.extend(["Evidence findings:", *(f"- {finding}" for finding in findings)])
+            else:
+                section.append("No resource threshold was crossed in the available evidence.")
+            if largest_tables:
+                section.extend(["", f"Largest active tables (top {len(largest_tables)}):"])
+                for row in largest_tables:
+                    metadata = tables.get((row.get("database"), row.get("table")), {})
+                    engine = metadata.get("engine", "unknown")
+                    section.append(
+                        f"- {_clickhouse_table_label(str(row.get('database', '')), str(row.get('table', '')))} "
+                        f"engine={engine}; bytes={_clickhouse_bytes(_clickhouse_number_or_none(row, 'total_bytes'))}; "
+                        f"rows={int(_clickhouse_number_or_none(row, 'total_rows') or 0)}; "
+                        f"active_parts={int(_clickhouse_number_or_none(row, 'active_parts') or 0)}."
+                    )
+            if largest_partitions:
+                section.extend(["", f"Largest active partitions (top {len(largest_partitions)}):"])
+                for row in largest_partitions:
+                    section.append(
+                        f"- {_clickhouse_table_label(str(row.get('database', '')), str(row.get('table', '')), str(row.get('partition', '')))} "
+                        f"bytes={_clickhouse_bytes(_clickhouse_number_or_none(row, 'total_bytes'))}; "
+                        f"rows={int(_clickhouse_number_or_none(row, 'total_rows') or 0)}."
+                    )
+            if policies:
+                section.extend(["", "Storage policies:"])
+                for row in policies:
+                    section.append(
+                        f"- policy={row.get('policy_name') or 'unknown'}; volume={row.get('volume_name') or 'unknown'}; "
+                        f"disk={row.get('disk_name') or 'unknown'}; move_factor={row.get('move_factor') or 'unknown'}."
+                    )
+            disks_with_paths = [row for row in disks if row.get("path")]
+            if disks_with_paths:
+                section.extend(["", "PVC capacity:"])
+                for row in disks_with_paths:
+                    disk_name = str(row.get("name") or "unknown")
+                    capacity, capacity_text = _clickhouse_pvc_capacity(v1, pod_item, str(row.get("path")))
+                    section.append(f"- {disk_name}: {_clickhouse_bytes(capacity)} ({capacity_text}).")
+            if recommendations:
+                section.extend(["Evidence-linked advisory recommendations:", *(f"- {item}" for item in recommendations)])
+            else:
+                section.append("No recommendation is supported by this pod's evidence.")
+            section.extend(
+                [
+                    "",
+                    "All recommendations are advisory. No configuration, disk, part, TTL, codec, cache, or Kubernetes "
+                    "resource was changed.",
+                    "",
+                ]
+            )
+            sections.append("\n".join(section))
+        except Exception as exc:
+            errors.append(f"{label}: {exc}")
+
+    if not sections and errors:
+        return _clickhouse_tool_error(tool, "; ".join(errors), mode)
+    report = ["ClickHouse resource and storage analysis (advisory only):", "", *"\n".join(sections).splitlines()]
+    if errors:
+        report.extend(["Skipped or partial evidence:", *(f"- {error}" for error in errors), ""])
+    report.append("No changes were made; this analysis is advisory only.")
+    return _clickhouse_tool_output(
+        tool,
+        "\n".join(report),
+        mode,
+        metadata={"namespace": namespace, "pod": pod, "top_n": top_n},
+    )
 
 def _clickhouse_time_window(minutes: int) -> tuple[datetime, datetime]:
     end = datetime.now(timezone.utc).replace(microsecond=0)
