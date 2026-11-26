@@ -146,6 +146,18 @@ For common discovery labels, exporter prerequisites, TLS limitations, CLI availa
 
 `get_clickhouse_remediation_recommendations` reuses the existing ClickHouse registry queries, catalog/table-design collectors, and safe `EXPLAIN` path. It introduces no query form and requires no additional RBAC. Recommendations are advisory cards only; operator command text, when present, is for operator execution and the agent never runs it.
 
+## ClickHouse metrics and snapshot mode
+
+`get_clickhouse_metrics_trends` reads existing Cloud Monitoring/Managed Prometheus series only. It recognizes a native ClickHouse Prometheus endpoint with `prometheus.io/*` annotations or port 9363, Altinity operator metrics, or an existing GMP/GKE pipeline carrying the `ClickHouseProfileEvents_*`, `ClickHouseMetrics_*`, `ClickHouseAsyncMetrics_*`, or `chi_clickhouse_*` families. It never falls back to pod/exec for trends and never installs an exporter. If no source is discoverable, it reports the prerequisite. Set `DBA_CLICKHOUSE_METRICS_PROJECT_ID` when the default workload credentials do not identify the monitoring project.
+
+`get_clickhouse_snapshot_diff` makes two bounded reads of selected `system.events`, `system.metrics`, and `system.asynchronous_metrics` values 1-60 minutes apart through the existing versioned registry and readonly profile check. It retains only selected numeric fields and never persists credentials, secrets, raw application data, or query text.
+
+No ClickHouse metrics or snapshot tool changes configuration, resources, or data.
+
+## ClickHouse structured output
+
+ClickHouse tools accept `output_mode='human'` (the default, preserving existing Markdown) or `output_mode='json'`. JSON uses `schema_version: cloud-copilot.dba.clickhouse.v1`, `generated_at`, `tool`, `status`, `data.report`, and bounded metadata. Failures use `status: error` and an `errors` array. The envelope excludes credentials, secrets, and raw application data. Pass JSON verbatim to dashboards or automation.
+
 Each recommendation states the measurement that triggered it, a suggested change, and the risk or trade-off, and explicitly says that no change was applied. Evidence gaps are labeled rather than filled with assumptions. Cluster evidence is shard-local, so one pod's report does not describe a multi-shard cluster; Kubernetes role labels remain hints. The tool may also read Sentinel views for topology context when Sentinel pods are selected or discovered.
 
 The report compares `INFO memory maxmemory` with the selected database container's Kubernetes memory limit when that limit is present, but it never changes a resource limit or Redis setting. Recommendations can include `SCAN` iteration, bounded collection reads, `UNLINK`, client pipelining, TTL review, eviction-policy trade-offs, defragmentation suitability, persistence/fork mitigation, replica-based backups, client ownership/backpressure, and cluster-health stabilization. All are advisory; the tool executes no remediation.

@@ -19,6 +19,8 @@ from .tools import (
     recommend_clickhouse_table_design,
     get_clickhouse_replication_report,
     get_clickhouse_workload_report,
+    get_clickhouse_metrics_trends,
+    get_clickhouse_snapshot_diff,
     get_clickhouse_remediation_recommendations,
 )
 from .idle_metrics import collect_database_idle_assessment
@@ -39,6 +41,8 @@ Available tools:
 - recommend_clickhouse_table_design: Correlate table/column/index/projection/EXPLAIN/slow-query evidence into advisory table design.
 - get_clickhouse_replication_report: Read replica-local system.clusters, system.replicas, replication queues, and Keeper connection evidence for advisory topology analysis.
 - get_clickhouse_workload_report: Read bounded system metrics, processes, errors, query_log aggregates, and quota usage for advisory workload and concurrency analysis.
+- get_clickhouse_metrics_trends: Use discovered ClickHouse Prometheus/Altinity or Cloud Monitoring series for workload, replication, memory, parts, and disk trends without pod/exec.
+- get_clickhouse_snapshot_diff: Compare two bounded, read-only ClickHouse metric snapshots and report selected numeric deltas.
 - get_clickhouse_remediation_recommendations: Correlate existing ClickHouse evidence into advisory remediation cards without applying changes.
 - get_clickhouse_parts_report: Read only system.parts, merge, mutation, detached-part, part-log, and error evidence for MergeTree forensics.
 - get_clickhouse_resource_report: Read only system memory/cache/disk/storage-policy evidence and metadata-only table, partition, and column size leaders.
@@ -111,6 +115,12 @@ For ClickHouse parts, merges, and mutations:
 4. Report merge progress, elapsed time, source/output size, and background-pool activity. Flag old, stuck, and failed mutations with age, parts_to_do, and latest_fail_reason.
 5. Every recommendation must cite the triggering evidence, name the operational trade-off, and say that no change was applied. Cluster-level conclusions require every shard.
 
+For ClickHouse metrics trends and snapshot deltas:
+1. For workload, replication, memory, parts, or disk questions over time, use get_clickhouse_metrics_trends first. It requires an existing ClickHouse native Prometheus endpoint, Altinity metrics exporter, or Google Managed Prometheus/GKE series. If none is discoverable, say metrics are a prerequisite rather than substituting pod/exec.
+2. The trend tool is read-only and never installs an exporter, reads pod/exec, or changes database or Kubernetes state. Set DBA_CLICKHOUSE_METRICS_PROJECT_ID when the default workload credentials do not identify the monitoring project.
+3. Treat counter decreases as restart/reset evidence and never report negative counter rates.
+4. Use get_clickhouse_snapshot_diff only for a bounded before/after comparison on one pod. It takes two selected numeric reads 1-60 minutes apart, waits between them, and retains no credentials, secrets, raw application data, or query text.
+
 For ClickHouse memory, disk, and storage forensics:
 1. Use get_clickhouse_resource_report only. Prefer namespace and pod; top_n is bounded metadata ranking, not a data scan.
 2. The tool reads selected asynchronous/current metrics, server settings, disks, storage policies, and table/partition/column metadata from system.parts and system.parts_columns. It never scans application data.
@@ -159,6 +169,10 @@ For Redis/Valkey output:
 1. Every Redis/Valkey diagnostic supports output_mode='human' (default) or output_mode='json'. JSON is a stable envelope with schema_version, tool, status, generated_at, data.report, and metadata/errors; keep the human Markdown text unchanged unless the user asks for JSON.
 2. When JSON is requested, return the JSON verbatim to tooling and do not reformat it into prose. Preserve empty/unavailable fields and evidence errors rather than inventing values.
 
+For ClickHouse output:
+1. Every ClickHouse tool supports output_mode='human' (default) or output_mode='json'. JSON is a stable envelope with schema_version, tool, status, generated_at, data.report, and bounded metadata/errors; keep the human Markdown text unchanged unless the user asks for JSON.
+2. When JSON is requested, return the JSON verbatim to tooling and preserve explicit evidence gaps rather than inventing values.
+
 For idle database cost engineering:
 1. Use collect_database_idle_assessment for idle-cost questions over one to 31 days. It supports mysql, mariadb, redis, and valkey, and JSON is the machine-readable default. Return every matching workload in data.workloads; do not truncate after the first workload.
 2. It is metrics-only. It uses Cloud Monitoring/Managed Prometheus trends and read-only Kubernetes metadata; it never uses pod/exec as a metrics fallback, never installs exporters, and never changes Kubernetes or database state.
@@ -188,6 +202,8 @@ The tool reads Kubernetes pod logs by default for MySQL/MariaDB, which must have
         recommend_clickhouse_table_design,
         get_clickhouse_replication_report,
         get_clickhouse_workload_report,
+        get_clickhouse_metrics_trends,
+        get_clickhouse_snapshot_diff,
         get_clickhouse_remediation_recommendations,
     ],
 )

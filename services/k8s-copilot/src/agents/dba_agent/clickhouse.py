@@ -4,9 +4,12 @@ import hashlib
 import json
 import os
 import re
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, Mapping, Optional
+
+from .idle_metrics import read_monitoring_series, resolve_metrics_project_id
 
 
 CLICKHOUSE_STRUCTURED_SCHEMA_VERSION = "cloud-copilot.dba.clickhouse.v1"
@@ -96,6 +99,106 @@ _CLICKHOUSE_REMEDIATION_CATEGORIES = {
     "storage",
     "workload",
 }
+_CLICKHOUSE_METRICS_HOURS_MAX = 168
+_CLICKHOUSE_SNAPSHOT_INTERVAL_MAX_MINUTES = 60
+
+CLICKHOUSE_METRIC_ALIASES: dict[str, tuple[str, ...]] = {
+    "queries_total": (
+        "ClickHouseProfileEvents_Query",
+        "chi_clickhouse_event_query",
+        "chi_clickhouse_event_Query",
+    ),
+    "select_queries_total": (
+        "ClickHouseProfileEvents_SelectQuery",
+        "chi_clickhouse_event_select_query",
+        "chi_clickhouse_event_SelectQuery",
+    ),
+    "insert_queries_total": (
+        "ClickHouseProfileEvents_InsertQuery",
+        "chi_clickhouse_event_insert_query",
+        "chi_clickhouse_event_InsertQuery",
+    ),
+    "inserted_rows_total": (
+        "ClickHouseProfileEvents_InsertedRows",
+        "chi_clickhouse_event_inserted_rows",
+        "chi_clickhouse_event_InsertedRows",
+    ),
+    "merged_rows_total": (
+        "ClickHouseProfileEvents_MergedRows",
+        "chi_clickhouse_event_merged_rows",
+        "chi_clickhouse_event_MergedRows",
+    ),
+    "failed_queries_total": (
+        "ClickHouseProfileEvents_FailedQuery",
+        "chi_clickhouse_event_failed_query",
+        "chi_clickhouse_event_FailedQuery",
+    ),
+    "query_concurrency": (
+        "ClickHouseMetrics_Query",
+        "ClickHouseAsyncMetrics_Query",
+        "chi_clickhouse_metric_query",
+    ),
+    "connection_concurrency": (
+        "ClickHouseMetrics_Connection",
+        "ClickHouseAsyncMetrics_Connection",
+        "chi_clickhouse_metric_connection",
+    ),
+    "memory_tracking_bytes": (
+        "ClickHouseAsyncMetrics_MemoryTracking",
+        "chi_clickhouse_metric_memory_tracking",
+        "chi_clickhouse_metric_memory",
+    ),
+    "parts_count": (
+        "ClickHouseAsyncMetrics_TotalPartsOfMergeTree",
+        "ClickHouseAsyncMetrics_TotalParts",
+        "chi_clickhouse_metric_total_parts",
+        "chi_clickhouse_metric_parts",
+    ),
+    "merges_running": (
+        "ClickHouseMetrics_Merge",
+        "ClickHouseAsyncMetrics_Merge",
+        "chi_clickhouse_metric_merge",
+    ),
+    "replication_delay_seconds": (
+        "ClickHouseAsyncMetrics_AbsoluteDelay",
+        "chi_clickhouse_metric_absolute_delay",
+        "chi_clickhouse_metric_replication_delay",
+    ),
+    "replication_queue_size": (
+        "ClickHouseMetrics_ReplicaQueueSize",
+        "ClickHouseAsyncMetrics_ReplicaQueueSize",
+        "chi_clickhouse_metric_replica_queue_size",
+        "chi_clickhouse_metric_replication_queue",
+    ),
+    "read_only_replicas": (
+        "ClickHouseAsyncMetrics_ReadOnlyReplica",
+        "ClickHouseAsyncMetrics_IsReadOnly",
+        "chi_clickhouse_metric_read_only_replica",
+        "chi_clickhouse_metric_is_read_only",
+    ),
+    "disk_free_bytes": (
+        "ClickHouseAsyncMetrics_DiskFree_default",
+        "ClickHouseAsyncMetrics_DiskFree_data",
+        "chi_clickhouse_metric_disk_free",
+    ),
+}
+CLICKHOUSE_METRIC_KINDS: dict[str, str] = {
+    "queries_total": "counter",
+    "select_queries_total": "counter",
+    "insert_queries_total": "counter",
+    "inserted_rows_total": "counter",
+    "merged_rows_total": "counter",
+    "failed_queries_total": "counter",
+    "query_concurrency": "gauge",
+    "connection_concurrency": "gauge",
+    "memory_tracking_bytes": "gauge",
+    "parts_count": "gauge",
+    "merges_running": "gauge",
+    "replication_delay_seconds": "gauge",
+    "replication_queue_size": "gauge",
+    "read_only_replicas": "gauge",
+    "disk_free_bytes": "gauge",
+}
 
 
 class ClickHouseUserSQLBlockedError(ValueError):
@@ -108,6 +211,10 @@ class ClickHouseReadOnlyProfileError(RuntimeError):
 
 class ClickHouseCliUnavailableError(RuntimeError):
     """Raised when neither supported ClickHouse client invocation is present."""
+
+
+class ClickHouseMetricsUnavailableError(RuntimeError):
+    """Raised when no existing ClickHouse metrics pipeline is discoverable."""
 
 
 @dataclass(frozen=True)
@@ -245,6 +352,52 @@ _register_template(
         1,
         "Check the mounted client's read-only profile and server version.",
         "SELECT getSetting('readonly') AS readonly, version() AS version FORMAT JSONEachRow",
+    )
+)
+_register_template(
+    ClickHouseSQLTemplate(
+        "clickhouse_snapshot_events.v1",
+        1,
+        "Read selected cumulative events for a bounded snapshot diff.",
+        """SELECT event, value
+FROM system.events
+WHERE event IN ('Query', 'SelectQuery', 'InsertQuery', 'FailedQuery', 'InsertedRows', 'MergedRows')
+ORDER BY event ASC
+FORMAT JSONEachRow""",
+    )
+)
+_register_template(
+    ClickHouseSQLTemplate(
+        "clickhouse_snapshot_metrics.v1",
+        1,
+        "Read selected current metrics for a bounded snapshot diff.",
+        """SELECT metric, value
+FROM system.metrics
+WHERE metric IN ('Query', 'Connection', 'Merge', 'Mutation', 'ReplicatedFetch', 'ReplicatedSend')
+ORDER BY metric ASC
+FORMAT JSONEachRow""",
+    )
+)
+_register_template(
+    ClickHouseSQLTemplate(
+        "clickhouse_snapshot_async_metrics.v1",
+        1,
+        "Read selected asynchronous metrics for a bounded snapshot diff.",
+        """SELECT metric, value
+FROM system.asynchronous_metrics
+WHERE metric IN (
+    'MemoryTracking',
+    'TotalPartsOfMergeTree',
+    'TotalParts',
+    'AbsoluteDelay',
+    'ReplicaQueueSize',
+    'ReadOnlyReplica',
+    'IsReadOnly',
+    'DiskFree_default',
+    'DiskFree_data'
+)
+ORDER BY metric ASC
+FORMAT JSONEachRow""",
     )
 )
 _register_template(
@@ -3485,6 +3638,193 @@ def _clickhouse_pod_candidates(
     return [item for item in pod_list.items if _clickhouse_pod_kind(item) == "clickhouse"]
 
 
+def _clickhouse_metrics_endpoint_evidence(pod: Any) -> list[dict[str, Any]]:
+    """Return bounded Kubernetes evidence for an already-configured endpoint."""
+    metadata = getattr(pod, "metadata", None)
+    annotations = dict(getattr(metadata, "annotations", None) or {})
+    scrape = str(annotations.get("prometheus.io/scrape", "")).lower() in {"true", "1", "yes"}
+    port = str(annotations.get("prometheus.io/port") or "").strip()
+    path = str(annotations.get("prometheus.io/path") or "/metrics").strip() or "/metrics"
+    evidence: list[dict[str, Any]] = []
+    if scrape:
+        evidence.append(
+            {
+                "source": "clickhouse_native_prometheus",
+                "container": "",
+                "port": port or "9363",
+                "path": path,
+                "scrape_enabled": "true",
+            }
+        )
+    if not evidence:
+        for container in getattr(getattr(pod, "spec", None), "containers", None) or []:
+            container_name = str(getattr(container, "name", "") or "")
+            image = str(getattr(container, "image", "") or "")
+            for port_item in getattr(container, "ports", None) or []:
+                port_number = getattr(port_item, "container_port", None)
+                port_name = str(getattr(port_item, "name", "") or "").lower()
+                if int(port_number or 0) == 9363 or "prometheus" in port_name or "metrics" in port_name:
+                    evidence.append(
+                        {
+                            "source": "clickhouse_native_prometheus",
+                            "container": container_name,
+                            "image": image,
+                            "port": str(port_number or ""),
+                            "path": path,
+                            "scrape_enabled": "true" if scrape else "unknown",
+                        }
+                    )
+                    break
+    labels = dict(getattr(metadata, "labels", None) or {})
+    name = str(getattr(metadata, "name", "") or "")
+    altinity = any("clickhouse.altinity.com" in label for label in labels) or name.startswith("chi-")
+    if altinity:
+        evidence.append(
+            {
+                "source": "altinity_operator_metrics",
+                "container": "",
+                "port": "",
+                "path": "/metrics",
+                "scrape_enabled": "unknown",
+            }
+        )
+    return evidence[:4]
+
+
+def _resolve_clickhouse_metrics_project_id(requested: Optional[str]) -> str:
+    if requested:
+        return str(requested)
+    configured = os.getenv("DBA_CLICKHOUSE_METRICS_PROJECT_ID")
+    if configured:
+        return configured
+    return resolve_metrics_project_id(None)
+
+
+def _read_clickhouse_monitoring_series(
+    project_id: str,
+    start_time: datetime,
+    end_time: datetime,
+    target_namespace: str,
+    target_pod: str,
+) -> dict[str, dict[str, Any]]:
+    return read_monitoring_series(
+        project_id,
+        start_time,
+        end_time,
+        [(target_namespace, target_pod)],
+        CLICKHOUSE_METRIC_ALIASES,
+        CLICKHOUSE_METRIC_KINDS,
+        descriptor_prefix="prometheus.googleapis.com/",
+    )
+
+
+def _clickhouse_counter_change(
+    samples: list[Any],
+    window_seconds: float,
+) -> tuple[float, int]:
+    """Difference counters per series and count decreases as restart evidence."""
+    grouped: dict[tuple[tuple[str, str], ...], list[Any]] = {}
+    for sample in samples:
+        grouped.setdefault(tuple(sorted(getattr(sample, "labels", {}).items())), []).append(sample)
+
+    positive_delta = 0.0
+    restarts = 0
+    for series in grouped.values():
+        series.sort(key=lambda sample: sample.timestamp)
+        previous: Optional[float] = None
+        for sample in series:
+            value = float(sample.value)
+            if previous is not None:
+                if value < previous:
+                    restarts += 1
+                positive_delta += max(0.0, value - previous)
+                previous = value
+            else:
+                previous = value
+    if restarts == 0 and len(grouped) == 1:
+        series = next(iter(grouped.values()))
+        positive_delta = max(0.0, float(series[-1].value) - float(series[0].value))
+    if positive_delta > 0 and window_seconds > 0:
+        return positive_delta, restarts
+    return 0.0, restarts
+
+
+def _clickhouse_metric_change(
+    metric: Optional[dict[str, Any]],
+    window_seconds: float,
+) -> dict[str, Any]:
+    if not metric or not metric.get("samples"):
+        return {"available": False, "reason": "metric not reported"}
+    samples = list(metric["samples"])
+    result: dict[str, Any] = {
+        "available": True,
+        "metric_type": metric["metric_type"],
+        "kind": metric["kind"],
+        "sample_count": len(samples),
+        "window_seconds": window_seconds,
+    }
+    if metric["kind"] == "counter":
+        change, restarts = _clickhouse_counter_change(samples, window_seconds)
+        result.update({"first": float(samples[0].value), "latest": float(samples[-1].value), "change": change})
+        if window_seconds > 0:
+            result["rate_per_second"] = change / window_seconds
+        if restarts:
+            result["restarts"] = restarts
+            result["note"] = "counter decrease treated as restart or reset evidence; no negative rate was calculated"
+    else:
+        first = float(samples[0].value)
+        latest = float(samples[-1].value)
+        result.update(
+            {
+                "first": first,
+                "latest": latest,
+                "change": latest - first,
+                "mean": sum(float(sample.value) for sample in samples) / len(samples),
+            }
+        )
+    return result
+
+
+def _clickhouse_trends_from_metrics(
+    metrics: dict[str, dict[str, Any]],
+    start_time: datetime,
+    end_time: datetime,
+) -> dict[str, Any]:
+    window_seconds = max(1.0, (end_time - start_time).total_seconds())
+    trends: dict[str, Any] = {}
+    for name in (
+        "queries_total",
+        "select_queries_total",
+        "insert_queries_total",
+        "inserted_rows_total",
+        "merged_rows_total",
+        "failed_queries_total",
+        "query_concurrency",
+        "connection_concurrency",
+        "memory_tracking_bytes",
+        "parts_count",
+        "merges_running",
+        "replication_delay_seconds",
+        "replication_queue_size",
+        "read_only_replicas",
+        "disk_free_bytes",
+    ):
+        trends[name] = _clickhouse_metric_change(metrics.get(name), window_seconds)
+
+    for logical, rate_name in (
+        ("queries_total", "queries_per_second"),
+        ("select_queries_total", "select_queries_per_second"),
+        ("insert_queries_total", "insert_queries_per_second"),
+        ("inserted_rows_total", "inserted_rows_per_second"),
+        ("merged_rows_total", "merged_rows_per_second"),
+        ("failed_queries_total", "failed_queries_per_second"),
+    ):
+        change = trends[logical]
+        if change["available"] and change.get("rate_per_second") is not None:
+            trends[rate_name] = change["rate_per_second"]
+    return trends
+
+
 def _clickhouse_processes_report(
     namespace: str,
     pod: str,
@@ -4751,3 +5091,317 @@ def get_clickhouse_remediation_recommendations(
         },
     )
 
+
+
+def get_clickhouse_metrics_trends(
+    namespace: Optional[str] = None,
+    pod: Optional[str] = None,
+    hours: int = 24,
+    project_id: Optional[str] = None,
+    output_mode: str = "human",
+) -> str:
+    """Report ClickHouse trends from an existing Prometheus-compatible pipeline.
+
+    This tool reads Cloud Monitoring/Managed Prometheus only. It never uses
+    pod/exec as a trend fallback, installs an exporter, or changes state.
+    """
+    tool = "get_clickhouse_metrics_trends"
+    try:
+        mode = _clickhouse_output_mode(output_mode)
+        window_hours = _clamp_clickhouse_number(hours, 24, 1, _CLICKHOUSE_METRICS_HOURS_MAX)
+        if pod and not namespace:
+            raise ValueError("A namespace is required when pod is specified.")
+        from .tools import _load_kubernetes_client
+
+        v1 = _load_kubernetes_client()
+        pods = _clickhouse_pod_candidates(v1, namespace, pod, None)
+        if not pods:
+            raise ClickHouseMetricsUnavailableError(
+                "No ClickHouse server pods found. Use find_database_pods with 'clickhouse' to confirm labels."
+            )
+        selected = pods[0]
+        target_namespace = str(getattr(getattr(selected, "metadata", None), "namespace", None) or namespace)
+        target_pod = str(getattr(getattr(selected, "metadata", None), "name", None) or pod)
+        endpoint_evidence = _clickhouse_metrics_endpoint_evidence(selected)
+        end_time = datetime.now(timezone.utc)
+        start_time = end_time - timedelta(hours=window_hours)
+        project = _resolve_clickhouse_metrics_project_id(project_id)
+        metrics = _read_clickhouse_monitoring_series(project, start_time, end_time, target_namespace, target_pod)
+        if not metrics:
+            raise ClickHouseMetricsUnavailableError(
+                "No matching ClickHouse Prometheus or Altinity metric series were found. "
+                "Enable the native Prometheus endpoint or Altinity metrics exporter in the existing "
+                "Google Managed Prometheus/GKE pipeline; pod/exec is not a trend fallback."
+            )
+        trends = _clickhouse_trends_from_metrics(metrics, start_time, end_time)
+    except ClickHouseMetricsUnavailableError as exc:
+        return _clickhouse_tool_error(tool, f"Metrics unavailable: {exc}", output_mode)
+    except Exception as exc:
+        return _clickhouse_tool_error(tool, f"Error reading ClickHouse metrics trends: {exc}", output_mode)
+
+    reset_count = sum(int(item.get("restarts", 0)) for item in trends.values() if isinstance(item, dict))
+    lines = [
+        f"ClickHouse metrics trends for {target_namespace}/{target_pod}:",
+        f"- Window: last {window_hours} hours (metrics-only; no pod/exec was used).",
+        "- Source: existing Google Cloud Monitoring/Managed Prometheus data.",
+    ]
+    if endpoint_evidence:
+        lines.append(
+            "- Endpoint evidence: " + ", ".join(sorted({item["source"] for item in endpoint_evidence})) + "."
+        )
+    else:
+        lines.append("- Endpoint evidence: none in pod metadata; series came from the existing monitoring pipeline.")
+    for name, data in trends.items():
+        if not isinstance(data, dict):
+            continue
+        if not data.get("available"):
+            lines.append(f"- {name}: unavailable ({(data or {}).get('reason', 'unavailable')}).")
+            continue
+        line = f"- {name}: latest={float(data['latest']):.6g}, change={float(data['change']):.6g}, samples={data['sample_count']}"
+        if data.get("rate_per_second") is not None:
+            line += f", rate={float(data['rate_per_second']):.6g}/s"
+        if data.get("mean") is not None:
+            line += f", mean={float(data['mean']):.6g}"
+        if data.get("restarts"):
+            line += f", restarts={int(data['restarts'])}"
+        lines.append(line)
+    derived_rates = [
+        f"- {name}: {float(value):.6g}/s"
+        for name, value in trends.items()
+        if isinstance(value, float)
+    ]
+    if derived_rates:
+        lines.extend(["", "Derived rates:", *derived_rates])
+    if reset_count:
+        lines.append(f"- Counter decreases observed: {reset_count}; rates are non-negative and treat decreases as restart/reset evidence.")
+    lines.extend(
+        [
+            "",
+            "Trends are observations, not causal proof. Use the existing pod-local ClickHouse reports for point-in-time forensics.",
+            "No changes were made; this analysis is advisory only.",
+        ]
+    )
+    report = "\n".join(lines)
+    return _clickhouse_tool_output(
+        tool,
+        report,
+        mode,
+        metadata={
+            "namespace": target_namespace,
+            "pod": target_pod,
+            "hours": window_hours,
+            "metrics_source": "cloud_monitoring",
+            "endpoint_discovered": bool(endpoint_evidence),
+            "endpoint_evidence": endpoint_evidence,
+            "metrics_reported": sorted(metrics),
+            "counter_resets": reset_count,
+            "trends": trends,
+        },
+    )
+
+
+_CLICKHOUSE_SNAPSHOT_EVENT_KEYS: dict[str, tuple[str, ...]] = {
+    "queries": ("Query",),
+    "select_queries": ("SelectQuery",),
+    "insert_queries": ("InsertQuery",),
+    "failed_queries": ("FailedQuery",),
+    "inserted_rows": ("InsertedRows",),
+    "merged_rows": ("MergedRows",),
+}
+_CLICKHOUSE_SNAPSHOT_METRIC_KEYS: dict[str, tuple[str, ...]] = {
+    "query_concurrency": ("Query",),
+    "connection_concurrency": ("Connection",),
+    "merges_running": ("Merge",),
+    "mutations_running": ("Mutation",),
+    "memory_tracking_bytes": ("MemoryTracking",),
+    "parts_count": ("TotalPartsOfMergeTree", "TotalParts"),
+    "replication_delay_seconds": ("AbsoluteDelay",),
+    "replication_queue_size": ("ReplicaQueueSize",),
+    "read_only_replicas": ("ReadOnlyReplica", "IsReadOnly"),
+    "disk_free_bytes": ("DiskFree_default", "DiskFree_data"),
+}
+
+
+def _clickhouse_snapshot_values(
+    rows: list[dict[str, Any]],
+    key_name: str,
+) -> dict[str, float]:
+    values: dict[str, float] = {}
+    for row in rows:
+        name = _clickhouse_string(row, key_name, "name")
+        value = _clickhouse_number_or_none(row, "value")
+        if name and value is not None:
+            values[name] = value
+    return values
+
+
+def _clickhouse_snapshot_selected(
+    values: Mapping[str, float],
+    keys: tuple[str, ...],
+) -> Optional[float]:
+    for key in keys:
+        if key in values and values[key] is not None:
+            return float(values[key])
+    return None
+
+
+def _read_clickhouse_snapshot(
+    namespace: str,
+    pod: str,
+    container: Optional[str],
+) -> tuple[dict[str, Any], list[str]]:
+    """Read only bounded selected numeric values for one snapshot."""
+    snapshot: dict[str, Any] = {}
+    errors: list[str] = []
+    sources = (
+        ("events", "clickhouse_snapshot_events.v1", "event"),
+        ("metrics", "clickhouse_snapshot_metrics.v1", "metric"),
+        ("asynchronous_metrics", "clickhouse_snapshot_async_metrics.v1", "metric"),
+    )
+    for source, template_id, key_name in sources:
+        try:
+            rows, _ = _run_clickhouse_query(namespace, pod, template_id, container=container)
+            snapshot[source] = _clickhouse_snapshot_values(rows, key_name)
+        except Exception as exc:
+            snapshot[source] = {}
+            errors.append(f"{source}: {_clickhouse_redacted_text(exc, 240)}")
+    return snapshot, errors
+
+
+def _clickhouse_snapshot_delta(
+    first: dict[str, Any],
+    second: dict[str, Any],
+    interval_seconds: float,
+) -> dict[str, Any]:
+    deltas: dict[str, Any] = {}
+
+    for name, keys in _CLICKHOUSE_SNAPSHOT_EVENT_KEYS.items():
+        first_values = first.get("events") or {}
+        second_values = second.get("events") or {}
+        first_value = _clickhouse_snapshot_selected(first_values, keys)
+        second_value = _clickhouse_snapshot_selected(second_values, keys)
+        if first_value is None or second_value is None:
+            deltas[name] = {"available": False, "reason": "selected value unavailable"}
+            continue
+        change = max(0.0, second_value - first_value)
+        reset = second_value < first_value
+        result: dict[str, Any] = {"available": True, "first": first_value, "second": second_value, "change": change}
+        if interval_seconds > 0:
+            result["rate_per_second"] = change / interval_seconds
+        if reset:
+            result["restart_or_reset"] = True
+            result["note"] = "counter decrease treated as restart or reset evidence; no negative rate"
+        deltas[name] = result
+
+    for name, keys in _CLICKHOUSE_SNAPSHOT_METRIC_KEYS.items():
+        first_value = _clickhouse_snapshot_selected(first.get("metrics") or {}, keys)
+        second_value = _clickhouse_snapshot_selected(second.get("metrics") or {}, keys)
+        if first_value is None:
+            first_value = _clickhouse_snapshot_selected(first.get("asynchronous_metrics") or {}, keys)
+        if second_value is None:
+            second_value = _clickhouse_snapshot_selected(second.get("asynchronous_metrics") or {}, keys)
+        if first_value is None or second_value is None:
+            deltas[name] = {"available": False, "reason": "selected value unavailable"}
+            continue
+        change = second_value - first_value
+        result = {
+            "available": True,
+            "first": first_value,
+            "second": second_value,
+            "change": change,
+        }
+        if interval_seconds > 0:
+            result["rate_per_second"] = change / interval_seconds
+        deltas[name] = result
+    return deltas
+
+
+def get_clickhouse_snapshot_diff(
+    namespace: str,
+    pod: str,
+    interval_minutes: int = 5,
+    output_mode: str = "human",
+    *,
+    container: Optional[str] = None,
+) -> str:
+    """Compare two bounded ClickHouse read-only snapshots taken minutes apart."""
+    tool = "get_clickhouse_snapshot_diff"
+    try:
+        mode = _clickhouse_output_mode(output_mode)
+        interval = _clamp_clickhouse_number(
+            interval_minutes,
+            5,
+            1,
+            _CLICKHOUSE_SNAPSHOT_INTERVAL_MAX_MINUTES,
+        )
+        if not namespace or not pod:
+            raise ValueError("namespace and pod are required for a snapshot diff.")
+        from .tools import _load_kubernetes_client
+
+        v1 = _load_kubernetes_client()
+        pods = _clickhouse_pod_candidates(v1, namespace, pod, None)
+        if not pods:
+            raise RuntimeError("No ClickHouse server pod was found for the requested target.")
+        selected = pods[0]
+        target_namespace = str(getattr(getattr(selected, "metadata", None), "namespace", None) or namespace)
+        target_pod = str(getattr(getattr(selected, "metadata", None), "name", None) or pod)
+        first, first_errors = _read_clickhouse_snapshot(target_namespace, target_pod, container)
+        time.sleep(interval * 60)
+        second, second_errors = _read_clickhouse_snapshot(target_namespace, target_pod, container)
+        deltas = _clickhouse_snapshot_delta(first, second, interval * 60)
+    except Exception as exc:
+        return _clickhouse_tool_error(tool, f"Error preparing ClickHouse snapshot diff: {exc}", output_mode)
+
+    errors = [*first_errors, *second_errors]
+    lines = [
+        f"ClickHouse snapshot diff for {target_namespace}/{target_pod}:",
+        f"- Interval: {interval} minutes (bounded; only selected numeric fields were retained).",
+        "- Sources: system.events, system.metrics, and system.asynchronous_metrics where readable.",
+        "",
+        "Selected deltas:",
+    ]
+    for name, data in deltas.items():
+        if not data.get("available"):
+            lines.append(f"- {name}: unavailable ({data.get('reason', 'unavailable')}).")
+            continue
+        line = f"- {name}: {data['first']:.6g} -> {data['second']:.6g} (change={data['change']:.6g}"
+        if data.get("rate_per_second") is not None:
+            line += f", rate={data['rate_per_second']:.6g}/s"
+        line += ")"
+        if data.get("note"):
+            line += f"; {data['note']}"
+        lines.append(line)
+    lines.extend(["", "Evidence gaps:"])
+    if errors:
+        lines.extend(f"- {_clickhouse_redacted_text(error, 320)}" for error in errors)
+    else:
+        lines.append("- None in the selected sources.")
+    lines.extend(
+        [
+            "",
+            "This comparison is observational, not causal proof. It contains no query text, credentials, secrets, or raw application data.",
+            "No changes were made; this analysis is advisory only.",
+        ]
+    )
+    report = "\n".join(lines)
+    return _clickhouse_tool_output(
+        tool,
+        report,
+        mode,
+        metadata={
+            "namespace": target_namespace,
+            "pod": target_pod,
+            "interval_minutes": interval,
+            "snapshots": [
+                {
+                    "retained_sources": sorted(source for source, values in first.items() if values),
+                    "deltas": deltas,
+                },
+                {
+                    "retained_sources": sorted(source for source, values in second.items() if values),
+                    "deltas": deltas,
+                },
+            ],
+            "evidence_errors": errors,
+        },
+    )
