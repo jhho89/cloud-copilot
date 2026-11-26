@@ -21,6 +21,13 @@ from .idle_metrics import (
     read_monitoring_series,
     resolve_metrics_project_id,
 )
+from .clickhouse import (
+    _CLICKHOUSE_DATABASE_TYPES,
+    _clickhouse_installation_access,
+    _clickhouse_pod_kind,
+    _clickhouse_topology_hints,
+)
+from .clickhouse import _CLICKHOUSE_KEEPER_DATABASE_TYPES
 
 
 _AUDIT_LOGGER = logging.getLogger("cloud_copilot.dba_agent")
@@ -209,6 +216,7 @@ def find_database_pods(
     db_type: str = "mysql",
     namespace: Optional[str] = None,
     label_selector: Optional[str] = None,
+    installation_name: Optional[str] = None,
 ) -> str:
     """Lists database pods by image, container name, or pod labels.
 
@@ -216,8 +224,11 @@ def find_database_pods(
     app.kubernetes.io/name=mysql or app=mysql.
     """
     db_type = db_type.lower()
-    if db_type not in {"mysql", "mariadb", *_REDIS_DATABASE_TYPES}:
-        return "Unsupported database type. This tool supports mysql, mariadb, redis, and valkey."
+    if db_type not in {"mysql", "mariadb", *_REDIS_DATABASE_TYPES, *_CLICKHOUSE_DATABASE_TYPES}:
+        return (
+            "Unsupported database type. This tool supports mysql, mariadb, redis, valkey, "
+            "clickhouse, clickhouse-keeper, and keeper."
+        )
 
     try:
         v1 = _load_kubernetes_client()
@@ -238,8 +249,14 @@ def find_database_pods(
         container_values = []
         for container in pod.spec.containers or []:
             container_values.extend([container.name or "", container.image or ""])
-        haystack = " ".join([pod.metadata.name or "", *labels.keys(), *labels.values(), *container_values])
-        if db_type in haystack.lower():
+        haystack = _pod_identity(pod)
+        if db_type in _CLICKHOUSE_KEEPER_DATABASE_TYPES and "keeper" in haystack:
+            should_match = True
+        elif db_type == "clickhouse" and _clickhouse_pod_kind(pod) == "clickhouse":
+            should_match = True
+        else:
+            should_match = db_type not in _CLICKHOUSE_DATABASE_TYPES and db_type in haystack
+        if should_match:
             phase = pod.status.phase if pod.status else "Unknown"
             description = f"{pod.metadata.namespace}/{pod.metadata.name} (Status: {phase}"
             if db_type in _REDIS_DATABASE_TYPES:
@@ -253,13 +270,38 @@ def find_database_pods(
                     topology_parts.append(f"role={topology['role']}")
                 if topology_parts:
                     description += f"; {', '.join(topology_parts)}"
+            elif db_type in _CLICKHOUSE_DATABASE_TYPES:
+                topology = _clickhouse_topology_hints(pod)
+                ordered_keys = ["statefulset", "ordinal", "shard", "replica", "keeper_shard", "keeper_replica"]
+                topology_parts = []
+                for key in ordered_keys:
+                    if key in topology:
+                        topology_parts.append(f"{key}={topology[key]}")
+                for key in ("cluster", "keeper_cluster", "app_name", "component", "instance", "part_of"):
+                    if key in topology:
+                        topology_parts.append(f"{key}={topology[key]}")
+                if topology_parts:
+                    description += f"; {', '.join(topology_parts)}"
             description += ")"
             matches.append(description)
+
+    installation_lines, installation_errors = _clickhouse_installation_access(
+        v1,
+        db_type,
+        namespace,
+        installation_name,
+        {item.metadata.namespace for item in pod_list.items},
+    )
+    matches.extend(installation_lines)
+    matches.extend(installation_errors)
 
     if not matches:
         selector = f" and label selector {label_selector!r}" if label_selector else ""
         scope = namespace or "cluster-wide"
-        return f"No {db_type} pods found {scope}{selector}. Try find_database_pods with a label_selector."
+        result = f"No {db_type} pods found {scope}{selector}. Try find_database_pods with a label_selector."
+        if installation_lines or installation_errors:
+            result += "\n" + "\n".join([*installation_lines, *installation_errors])
+        return result
 
     return "\n".join(matches)
 
@@ -2565,6 +2607,9 @@ def get_redis_client_report(
         output_mode,
         metadata={"namespace": namespace, "pod": pod, "nodes_reported": len(sections)},
     )
+
+
+from .clickhouse import get_clickhouse_slow_queries  # noqa: E402
 
 
 def _parse_config_get_value(output: str, name: str) -> Optional[str]:

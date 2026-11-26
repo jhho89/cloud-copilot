@@ -1,6 +1,6 @@
 # DBA agent read-only access
 
-The DBA agent is diagnostic-only. It does not execute application SQL, create or alter database objects, mutate pods, or restart workloads. For MySQL/MariaDB, `EXPLAIN` is the only query execution supported and destructive statements are rejected before execution. For Redis/Valkey, only the explicit read-only diagnostic commands below are allowed.
+The DBA agent is diagnostic-only. It does not execute application SQL, create or alter database objects, mutate pods, or restart workloads. For MySQL/MariaDB, `EXPLAIN` is the only query execution supported and destructive statements are rejected before execution. For Redis/Valkey, only the explicit read-only diagnostic commands below are allowed. For ClickHouse, the agent executes only versioned registry SQL, checks `getSetting('readonly') = 1`, and treats all recommendations as advisory.
 
 ## Kubernetes RBAC
 
@@ -22,6 +22,12 @@ rules:
   - apiGroups: [""]
     resources: ["pods/exec"]
     verbs: ["create", "get"]
+  # Optional: discovery of Altinity ClickHouseInstallations. Omit this rule
+  # when the agent should rely on pod labels alone; it reports denial instead
+  # of failing the pod discovery result.
+  - apiGroups: ["clickhouse.altinity.com"]
+    resources: ["clickhouseinstallations"]
+    verbs: ["get", "list"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
@@ -38,7 +44,7 @@ roleRef:
   name: dba-copilot-readonly
 ```
 
-Do not grant `secrets`, `deployments`, `statefulsets`, pod deletion, pod patching, or database write access. Keep cluster-wide pod discovery disabled unless there is a documented need for it.
+Do not grant `secrets`, `deployments`, `statefulsets`, pod deletion, pod patching, or database write access. Keep cluster-wide pod discovery disabled unless there is a documented need for it. The optional `clickhouseinstallations` rule is read-only and namespaced; do not grant create, patch, update, delete, or cluster scope.
 
 Where your Kubernetes distribution enforces `resourceNames` for `pods/exec`, list the database pod names in the `pods/exec` rule and omit `list`/`watch` if discovery is handled externally. Verify the restriction in your environment because enforcement of resource names for connect subresources varies.
 
