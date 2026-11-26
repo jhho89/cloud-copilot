@@ -19,6 +19,7 @@ from .tools import (
     recommend_clickhouse_table_design,
     get_clickhouse_replication_report,
     get_clickhouse_workload_report,
+    get_clickhouse_remediation_recommendations,
 )
 from .idle_metrics import collect_database_idle_assessment
 from dotenv import load_dotenv
@@ -38,6 +39,7 @@ Available tools:
 - recommend_clickhouse_table_design: Correlate table/column/index/projection/EXPLAIN/slow-query evidence into advisory table design.
 - get_clickhouse_replication_report: Read replica-local system.clusters, system.replicas, replication queues, and Keeper connection evidence for advisory topology analysis.
 - get_clickhouse_workload_report: Read bounded system metrics, processes, errors, query_log aggregates, and quota usage for advisory workload and concurrency analysis.
+- get_clickhouse_remediation_recommendations: Correlate existing ClickHouse evidence into advisory remediation cards without applying changes.
 - get_clickhouse_parts_report: Read only system.parts, merge, mutation, detached-part, part-log, and error evidence for MergeTree forensics.
 - get_clickhouse_resource_report: Read only system memory/cache/disk/storage-policy evidence and metadata-only table, partition, and column size leaders.
 - get_mysql_slow_queries: Read recent slow-query entries from database pod logs, or from an operator-allowlisted file via a read-only tail exec.
@@ -146,6 +148,13 @@ For ClickHouse workload, concurrency, and errors:
 4. Aggregate recent load by user, client_name, http_user_agent, and initial_address when available. Show normalizeQuery output truncated, redact write/DDL/maintenance/access-management text, and never echo credentials, secrets, tokens, or application data.
 5. Advise on client pool sizing, per-user concurrency, quotas, and misbehaving consumers only with triggering evidence and explicit risk/trade-off context. Do not issue KILL, change settings or quotas, or claim any connection/configuration action was taken.
 
+For ClickHouse remediation recommendations:
+1. Use get_clickhouse_remediation_recommendations for one server pod when the user wants correlated, advisory next steps. It reuses the existing bounded query, table-design/catalog, EXPLAIN, parts/merges/mutations, resource/storage, replication/topology, and workload collectors and adds no query form.
+2. Present every recommendation card with its triggering measurement, suggested change, risk/trade-off, required approver, and the explicit fact that no change was applied.
+3. If a source is absent, unreadable, stale, or does not contain enough evidence, report that evidence gap rather than filling it with an assumption. Cluster-wide conclusions still require separate pod-local runs.
+4. Any operator-runnable command text is clearly labeled for operator execution; never run it. The tool may collect a safe EXPLAIN for a complete normalized SELECT/WITH, but it never executes the query or any remediation.
+5. Never run or request OPTIMIZE, SYSTEM, DROP, DETACH, ATTACH, ALTER, KILL, mutation retry, Keeper mutation, restart, or configuration changes through this agent.
+
 For Redis/Valkey output:
 1. Every Redis/Valkey diagnostic supports output_mode='human' (default) or output_mode='json'. JSON is a stable envelope with schema_version, tool, status, generated_at, data.report, and metadata/errors; keep the human Markdown text unchanged unless the user asks for JSON.
 2. When JSON is requested, return the JSON verbatim to tooling and do not reformat it into prose. Preserve empty/unavailable fields and evidence errors rather than inventing values.
@@ -179,6 +188,7 @@ The tool reads Kubernetes pod logs by default for MySQL/MariaDB, which must have
         recommend_clickhouse_table_design,
         get_clickhouse_replication_report,
         get_clickhouse_workload_report,
+        get_clickhouse_remediation_recommendations,
     ],
 )
 

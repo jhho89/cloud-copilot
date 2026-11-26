@@ -77,6 +77,7 @@ Coordinates specialized sub-agents to solve complex troubleshooting workflows. U
 - `get_redis_metrics_trends()` - Report metrics-backed hit rate, memory, eviction, client, and ops/sec trends when a Redis exporter/monitoring pipeline is discoverable
 - `get_redis_snapshot_diff()` - Compare two read-only INFO snapshots taken a bounded number of minutes apart
 - `get_redis_remediation_recommendations()` - Correlate read-only diagnostics into evidence-linked advisory changes
+- `get_clickhouse_remediation_recommendations()` - Correlate ClickHouse diagnostics into evidence-linked advisory remediation cards
 - `collect_database_idle_assessment()` - Assess idle database cost for MySQL/MariaDB/Redis/Valkey using Cloud Monitoring, existing exporters, and read-only Kubernetes metadata
 
 Slow-query analysis reads the container's `stdout`/`stderr` by default. A read-only file mode is also available when an operator allowlists an absolute slow-log path; it uses a shell-free `tail` exec and emits audit metadata without SQL or credentials. See [docs/dba-rbac.md](../docs/dba-rbac.md) for RBAC, file prerequisites, and replica-selection guidance.
