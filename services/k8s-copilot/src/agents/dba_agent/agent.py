@@ -15,6 +15,8 @@ from .tools import (
     get_clickhouse_parts_report,
     get_clickhouse_resource_report,
     get_clickhouse_slow_queries,
+    get_clickhouse_query_plan,
+    recommend_clickhouse_table_design,
     get_clickhouse_replication_report,
     get_clickhouse_workload_report,
 )
@@ -32,6 +34,8 @@ DbaAgent = Agent(
 Available tools:
 - find_database_pods: Discover MySQL/MariaDB/Redis/Valkey/ClickHouse/Keeper/ZooKeeper-compatible pods by image, container name, or labels.
 - get_clickhouse_slow_queries: Read only system.query_log and system.processes for slow/expensive query evidence and advisory recommendations.
+- get_clickhouse_query_plan: Collect EXPLAIN indexes/actions/pipeline/estimate output without executing user SQL.
+- recommend_clickhouse_table_design: Correlate table/column/index/projection/EXPLAIN/slow-query evidence into advisory table design.
 - get_clickhouse_replication_report: Read replica-local system.clusters, system.replicas, replication queues, and Keeper connection evidence for advisory topology analysis.
 - get_clickhouse_workload_report: Read bounded system metrics, processes, errors, query_log aggregates, and quota usage for advisory workload and concurrency analysis.
 - get_clickhouse_parts_report: Read only system.parts, merge, mutation, detached-part, part-log, and error evidence for MergeTree forensics.
@@ -120,6 +124,13 @@ For ClickHouse slow and expensive query analysis:
 5. Every recommendation must identify its evidence, state risk/trade-off context, and explicitly say that no change was applied. Never suggest or run KILL, SYSTEM, OPTIMIZE, ALTER, INSERT, or other mutating statements.
 6. Keeper/ZooKeeper pods may be discovered for topology context, but system.query_log lives on ClickHouse server pods, not Keeper pods.
 
+For ClickHouse query plans and table design:
+1. Use get_clickhouse_query_plan for one SELECT or WITH statement. Select mode='indexes' by default; use mode='actions' for action details, mode='pipeline' for pipeline shape, and mode='estimate' only when the user wants row/mark estimates. EXPLAIN never executes the query.
+2. Use recommend_clickhouse_table_design when a query or query hash needs table-design guidance. It reads only system catalogs, data-skipping/projection metadata, EXPLAIN indexes=1, and an existing query_log aggregate. It never reads application rows or applies changes.
+3. If EXPLAIN reports a missing SELECT privilege, report that grant gap and present table-metadata-only advice instead of guessing at a plan.
+4. Discuss sorting keys, partition pruning, data-skipping indexes, projections, FINAL, join order/memory, large IN subqueries, LowCardinality candidates, and codec/compression only when the evidence supports them. Explain rebuild/backfill, storage, ingest/merge, and query-planner risks.
+5. Never suggest or generate ALTER TABLE, CREATE INDEX, OPTIMIZE, or other DDL/maintenance statements. No change is applied.
+
 For ClickHouse replication and topology:
 1. Use get_clickhouse_replication_report. Prefer namespace and pod. The report is replica-local even when it can see configured cluster membership; a single pod cannot prove cluster-wide health.
 2. It reads only bounded local views of system.clusters, system.replicas, system.replication_queue, system.distribution_queue, and system.zookeeper_connection where available. It repeats the exact readonly=1 startup check before every query.
@@ -164,6 +175,8 @@ The tool reads Kubernetes pod logs by default for MySQL/MariaDB, which must have
         get_clickhouse_parts_report,
         get_clickhouse_resource_report,
         get_clickhouse_slow_queries,
+        get_clickhouse_query_plan,
+        recommend_clickhouse_table_design,
         get_clickhouse_replication_report,
         get_clickhouse_workload_report,
     ],

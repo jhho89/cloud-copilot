@@ -24,6 +24,9 @@ The profile must be exactly `readonly = 1`. The tool runs `SELECT getSetting('re
 GRANT SELECT ON system.query_log TO copilot_dba;
 GRANT SELECT ON system.processes TO copilot_dba;
 GRANT SELECT ON system.tables TO copilot_dba;
+GRANT SELECT ON system.columns TO copilot_dba;
+GRANT SELECT ON system.data_skipping_indices TO copilot_dba;
+GRANT SELECT ON system.projections TO copilot_dba;
 GRANT SELECT ON system.settings TO copilot_dba;
 GRANT SELECT ON system.server_settings TO copilot_dba;
 GRANT SELECT ON system.clusters TO copilot_dba;
@@ -47,6 +50,8 @@ GRANT SELECT ON system.asynchronous_metrics TO copilot_dba;
 GRANT SELECT ON system.disks TO copilot_dba;
 GRANT SELECT ON system.storage_policies TO copilot_dba;
 ```
+
+`system.projections` is optional on older ClickHouse versions. If it is unavailable, table-design analysis continues with the other catalog evidence and reports the limitation.
 
 Operators may grant SELECT on application tables for other read-only analysis, but the foundation does not require it. Keep the ClickHouse user's `readonly` profile set to `1` and no `allow_ddl` bypass. The client config should look like:
 
@@ -113,3 +118,13 @@ Storage reporting uses disk free/total space, `keep_free_space`, storage-policy 
 For size leaders, the report uses only metadata from `system.parts` and `system.parts_columns`. It ranks active tables and partitions by bytes, rows, and part count, and ranks columns by compressed bytes with a compression ratio from compressed versus uncompressed metadata when available. TTL presence comes from `system.tables.engine_full`; the tool does not scan application data.
 
 The tool may recommend memory headroom investigation, external aggregation or sorting, column codecs, `LowCardinality`, retention/TTL review, storage tiering, or disk-pressure investigation. It never deletes, moves, detaches, or mutates data and never changes ClickHouse or Kubernetes configuration. Missing asynchronous metrics or older table layouts are reported as unavailable evidence rather than inferred.
+
+## Query plans and table design
+
+`get_clickhouse_query_plan` accepts one validated `SELECT` or `WITH` statement and one of these modes: `indexes`, `actions`, `pipeline`, or `estimate`. It emits `EXPLAIN indexes = 1`, `EXPLAIN actions = 1`, `EXPLAIN PIPELINE`, or `EXPLAIN ESTIMATE` respectively. None of these modes executes the user query. The mandatory `readonly=1` check, direct argv, fixed timeouts, and audit logging remain unchanged.
+
+`EXPLAIN indexes = 1` may require `SELECT` privilege on referenced application tables. If it fails with a privilege error, the tool reports the missing grant rather than inventing a plan. `EXPLAIN ESTIMATE` provides read estimates from table metadata and is still not an execution.
+
+`recommend_clickhouse_table_design` combines `system.tables`, `system.columns`, `system.data_skipping_indices`, available `system.projections`, `EXPLAIN indexes = 1`, and an existing `system.query_log` aggregate when `normalized_query_hash` is supplied. It can use an explicit `database.table`, simple table references from the guarded query, or the table references in the normalized query associated with a hash.
+
+The recommendation is advisory only. It can discuss sorting keys, partition pruning, data-skipping indexes, projections, `FINAL`, join order and memory, large `IN` subqueries, `LowCardinality` candidates, and codec/compression choices. Every suggestion names its evidence and cost/risk: table redesigns may require rebuild or backfill, indexes and projections add storage and merge work, codec choices can trade CPU for storage, and planner behavior must be verified. It does not read application data, generate `ALTER TABLE`, suggest a direct `CREATE INDEX`, run `OPTIMIZE`, or change any database state.

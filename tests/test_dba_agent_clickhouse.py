@@ -1047,3 +1047,272 @@ def test_get_clickhouse_parts_json_output_is_stable_advisory_envelope(monkeypatc
     assert payload["status"] == "ok"
     assert payload["metadata"]["database"] is None
     assert payload["data"]["report"].endswith("No changes were made; this analysis is advisory only.")
+
+@pytest.mark.parametrize(
+    ("mode", "expected_prefix"),
+    [
+        ("indexes", "EXPLAIN indexes = 1 SELECT"),
+        ("actions", "EXPLAIN actions = 1 SELECT"),
+        ("pipeline", "EXPLAIN PIPELINE SELECT"),
+        ("estimate", "EXPLAIN ESTIMATE SELECT"),
+    ],
+)
+def test_get_clickhouse_query_plan_supports_all_non_executing_modes(
+    monkeypatch, mode, expected_prefix
+) -> None:
+    captured: dict[str, str] = {}
+
+    def fake_statement(namespace, pod, sql, container=None, operation=""):
+        captured.update(namespace=namespace, pod=pod, sql=sql, operation=operation)
+        return "plan evidence"
+
+    monkeypatch.setattr(clickhouse, "_clickhouse_pod_candidates", lambda *_args, **_kwargs: [_pod("clickhouse-0")])
+    monkeypatch.setattr(tools, "_load_kubernetes_client", lambda: SimpleNamespace(api_client=object()))
+    monkeypatch.setattr(clickhouse, "_run_clickhouse_statement", fake_statement)
+
+    result = clickhouse.get_clickhouse_query_plan(
+        "analytics",
+        "clickhouse-0",
+        "SELECT count() FROM events",
+        "analytics",
+        mode,
+    )
+
+    assert captured["sql"].startswith(expected_prefix)
+    assert captured["operation"] == "clickhouse_query_plan"
+    assert "ClickHouse query plan (advisory only)" in result
+    assert "was not executed" in result
+    assert "plan evidence" in result
+    assert "No changes were made" in result
+
+
+def test_get_clickhouse_query_plan_rejects_invalid_and_unsafe_sql(monkeypatch) -> None:
+    def fail_statement(*_args, **_kwargs):
+        raise AssertionError("unsafe SQL must not reach the ClickHouse client")
+
+    monkeypatch.setattr(clickhouse, "_run_clickhouse_statement", fail_statement)
+    for mode, sql in (
+        ("execute", "SELECT 1"),
+        ("indexes", "INSERT INTO events VALUES (1)"),
+        ("indexes", "SELECT 1; SELECT 2"),
+        ("indexes", "SELECT 1 SETTINGS max_threads=1"),
+    ):
+        result = clickhouse.get_clickhouse_query_plan(
+            "analytics", "clickhouse-0", sql, mode=mode
+        )
+        assert result.startswith("Error preparing ClickHouse query plan")
+
+
+def test_collect_clickhouse_table_evidence_parses_catalog_metadata(monkeypatch) -> None:
+    def fake_run(_namespace, _pod, template_id, params=None, container=None):
+        if template_id == "clickhouse_table.v1":
+            return [
+                {
+                    "database": "analytics",
+                    "name": "events",
+                    "engine": "MergeTree",
+                    "engine_full": "MergeTree ORDER BY event_time",
+                    "sorting_key": "event_time",
+                    "primary_key": "event_time",
+                    "partition_key": "toYYYYMM(event_time)",
+                    "sampling_key": "",
+                    "total_rows": 100,
+                    "total_bytes": 2048,
+                }
+            ], ""
+        if template_id == "clickhouse_columns.v1":
+            return [
+                {
+                    "name": "event_time",
+                    "type": "DateTime",
+                    "compression_codec": "ZSTD(1)",
+                    "default_kind": "",
+                    "default_expression": "",
+                    "is_in_partition_key": 1,
+                    "is_in_sorting_key": 1,
+                    "is_in_primary_key": 1,
+                    "is_in_sampling_key": 0,
+                }
+            ], ""
+        if template_id == "clickhouse_data_skipping_indices.v1":
+            return [{"name": "idx_user", "type": "bloom_filter", "expr": "user_id", "granularity": "3", "is_built": 1}], ""
+        return [{"name": "events_daily", "columns": "event_time", "sorting_key": "event_time"}], ""
+
+    monkeypatch.setattr(clickhouse, "_run_clickhouse_query", fake_run)
+    evidence = clickhouse._collect_clickhouse_table_evidence(
+        "analytics", "clickhouse-0", [("analytics", "events")]
+    )
+
+    assert evidence.tables[("analytics", "events")].sorting_key == "event_time"
+    assert evidence.columns[("analytics", "events")][0].in_sorting_key is True
+    assert evidence.indices[("analytics", "events")][0].type == "bloom_filter"
+    assert evidence.projections[("analytics", "events")][0].name == "events_daily"
+    assert evidence.errors == []
+
+
+def _clickhouse_table_evidence() -> clickhouse.ClickHouseTableEvidence:
+    evidence = clickhouse.ClickHouseTableEvidence(namespace="analytics", pod="clickhouse-0")
+    table = clickhouse.ClickHouseTableMetadata(
+        database="analytics",
+        name="events",
+        engine="MergeTree",
+        sorting_key="event_time",
+        partition_key="toYYYYMM(event_time)",
+        total_rows=1_000_000,
+        total_bytes=12 * 1024 * 1024 * 1024,
+    )
+    evidence.tables[("analytics", "events")] = table
+    evidence.columns[("analytics", "events")] = [
+        clickhouse.ClickHouseColumnMetadata(name="user_id", type="String"),
+        clickhouse.ClickHouseColumnMetadata(name="amount", type="Float64", codec="ZSTD(1)"),
+    ]
+    evidence.indices[("analytics", "events")] = [
+        clickhouse.ClickHouseSkippingIndexMetadata(
+            name="idx_time", type="minmax", expr="event_time", is_built=True
+        )
+    ]
+    evidence.projections[("analytics", "events")] = []
+    return evidence
+
+
+def test_clickhouse_table_advice_covers_requested_design_topics() -> None:
+    sql = (
+        "SELECT user_id, count() FROM analytics.events FINAL "
+        "WHERE user_id IN (SELECT user_id FROM customers) GROUP BY user_id "
+        "JOIN customers ON customers.user_id = events.user_id"
+    )
+    aggregate = clickhouse.ClickHouseQueryLogAggregate(
+        namespace="analytics",
+        pod="clickhouse-0",
+        query_hash="42",
+        run_count=3,
+        p95_duration_ms=3000,
+        read_rows=1_000_000,
+        read_bytes=2048,
+        peak_memory_usage=2048,
+        exceptions={"Memory limit exceeded"},
+    )
+
+    advice = clickhouse._clickhouse_table_advice(
+        _clickhouse_table_evidence(), sql, "Parts: 20\nMarks: 30", aggregate
+    )
+    text = "\n".join(advice)
+
+    assert "Sorting key design" in text
+    assert "Partition pruning" in text
+    assert "Skipping-index design" in text
+    assert "Projection design" in text
+    assert "FINAL use" in text
+    assert "Join order/memory" in text
+    assert "Large IN subqueries" in text
+    assert "LowCardinality candidate" in text
+    assert "Codec/compression" in text
+    assert "query_hash=42" in text
+    assert "marks=30" in text
+    assert "CREATE INDEX" not in text
+    assert "ALTER TABLE" not in text
+    assert "Cost/risk" in text
+
+
+def test_recommend_clickhouse_table_design_reports_metadata_and_privilege_gap(monkeypatch) -> None:
+    evidence = _clickhouse_table_evidence()
+    explain_calls: list[str] = []
+
+    def fake_statement(_namespace, _pod, sql, container=None, operation=""):
+        explain_calls.append(sql)
+        raise RuntimeError("SELECT privilege is not granted to user")
+
+    monkeypatch.setattr(clickhouse, "_clickhouse_pod_candidates", lambda *_args, **_kwargs: [_pod("clickhouse-0")])
+    monkeypatch.setattr(tools, "_load_kubernetes_client", lambda: SimpleNamespace(api_client=object()))
+    monkeypatch.setattr(clickhouse, "_collect_clickhouse_table_evidence", lambda *_args, **_kwargs: evidence)
+    monkeypatch.setattr(clickhouse, "_run_clickhouse_statement", fake_statement)
+
+    result = clickhouse.recommend_clickhouse_table_design(
+        "analytics",
+        "clickhouse-0",
+        sql="SELECT user_id FROM analytics.events WHERE user_id = 'x'",
+        output_mode="json",
+    )
+
+    payload = json.loads(result)
+    assert payload["status"] == "ok"
+    assert payload["metadata"]["missing_select_grant"] is True
+    assert explain_calls == ["EXPLAIN indexes = 1 SELECT user_id FROM analytics.events WHERE user_id = 'x'"]
+    report = payload["data"]["report"]
+    assert "SELECT privilege" in report
+    assert "table-metadata-only" in report
+    assert "Skipping-index design" in report
+    assert "No changes were made" in report
+
+
+def test_recommend_clickhouse_table_design_resolves_target_from_query_hash(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+    aggregate = clickhouse.ClickHouseQueryLogAggregate(
+        namespace="analytics",
+        pod="clickhouse-0",
+        query_hash="42",
+        run_count=2,
+        p95_duration_ms=2500,
+        read_rows=1000,
+        read_bytes=2048,
+        normalized_query="SELECT user_id FROM analytics.events WHERE user_id = ?",
+    )
+
+    def fake_hash_aggregate(_namespace, _pod, query_hash, container=None):
+        assert query_hash == "42"
+        return aggregate
+
+    def fake_collect(_namespace, _pod, targets, container=None):
+        captured["targets"] = targets
+        return _clickhouse_table_evidence()
+
+    monkeypatch.setattr(clickhouse, "_clickhouse_pod_candidates", lambda *_args, **_kwargs: [_pod("clickhouse-0")])
+    monkeypatch.setattr(tools, "_load_kubernetes_client", lambda: SimpleNamespace(api_client=object()))
+    monkeypatch.setattr(clickhouse, "_clickhouse_query_hash_aggregate", fake_hash_aggregate)
+    monkeypatch.setattr(clickhouse, "_collect_clickhouse_table_evidence", fake_collect)
+
+    result = clickhouse.recommend_clickhouse_table_design(
+        "analytics",
+        "clickhouse-0",
+        normalized_query_hash="42",
+    )
+
+    assert captured["targets"] == [("analytics", "events")]
+    assert "query_hash=42" in result
+    assert "runs=2" in result
+    assert "Application rows were not read" in result
+    assert "No changes were made" in result
+
+
+def test_get_clickhouse_query_plan_reports_missing_select_grant(monkeypatch) -> None:
+    def failing_statement(*_args, **_kwargs):
+        raise RuntimeError("SELECT privilege(s) are not granted")
+
+    monkeypatch.setattr(clickhouse, "_clickhouse_pod_candidates", lambda *_args, **_kwargs: [_pod("clickhouse-0")])
+    monkeypatch.setattr(tools, "_load_kubernetes_client", lambda: SimpleNamespace(api_client=object()))
+    monkeypatch.setattr(clickhouse, "_run_clickhouse_statement", failing_statement)
+
+    result = clickhouse.get_clickhouse_query_plan(
+        "analytics", "clickhouse-0", "SELECT 1", mode="indexes"
+    )
+
+    assert result.startswith("ClickHouse EXPLAIN failed")
+    assert "SELECT privilege is missing" in result
+
+
+def test_recommend_clickhouse_table_design_rejects_unsafe_sql_before_catalog_or_explain(monkeypatch) -> None:
+    def fail_any(*_args, **_kwargs):
+        raise AssertionError("unsafe SQL must not reach ClickHouse")
+
+    monkeypatch.setattr(clickhouse, "_clickhouse_pod_candidates", fail_any)
+    monkeypatch.setattr(clickhouse, "_collect_clickhouse_table_evidence", fail_any)
+    monkeypatch.setattr(clickhouse, "_run_clickhouse_statement", fail_any)
+
+    result = clickhouse.recommend_clickhouse_table_design(
+        "analytics",
+        "clickhouse-0",
+        sql="SELECT 1 FORMAT JSON",
+    )
+
+    assert result.startswith("Error preparing ClickHouse table-design analysis")
+    assert "FORMAT" in result
