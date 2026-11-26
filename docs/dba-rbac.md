@@ -150,6 +150,8 @@ For common discovery labels, exporter prerequisites, TLS limitations, CLI availa
 
 `get_clickhouse_metrics_trends` reads existing Cloud Monitoring/Managed Prometheus series only. It recognizes a native ClickHouse Prometheus endpoint with `prometheus.io/*` annotations or port 9363, Altinity operator metrics, or an existing GMP/GKE pipeline carrying the `ClickHouseProfileEvents_*`, `ClickHouseMetrics_*`, `ClickHouseAsyncMetrics_*`, or `chi_clickhouse_*` families. It never falls back to pod/exec for trends and never installs an exporter. If no source is discoverable, it reports the prerequisite. Set `DBA_CLICKHOUSE_METRICS_PROJECT_ID` when the default workload credentials do not identify the monitoring project.
 
+`collect_database_idle_assessment(db_type="clickhouse")` reuses those read-only metric families and Altinity aliases for cluster-level idle-cost evidence. It reports ingest work as active work, requires every shard replica to be idle before candidacy, attaches Keeper/ZooKeeper pods as protected cost, and exposes object-storage disks and cross-cluster consumers as approval risks. It never models single-replica removal as savings and remains advisory.
+
 `get_clickhouse_snapshot_diff` makes two bounded reads of selected `system.events`, `system.metrics`, and `system.asynchronous_metrics` values 1-60 minutes apart through the existing versioned registry and readonly profile check. It retains only selected numeric fields and never persists credentials, secrets, raw application data, or query text.
 
 No ClickHouse metrics or snapshot tool changes configuration, resources, or data.

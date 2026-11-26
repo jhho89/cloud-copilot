@@ -12,7 +12,7 @@ from kubernetes import client, config
 
 
 SCHEMA_VERSION = "cloud-copilot.dba.idle-cost.v1"
-SUPPORTED_DATABASE_TYPES = ("mysql", "mariadb", "redis", "valkey")
+SUPPORTED_DATABASE_TYPES = ("mysql", "mariadb", "redis", "valkey", "clickhouse")
 REDIS_DATABASE_TYPES = {"redis", "valkey"}
 
 _GKE_CPU_REQUEST = "kubernetes.io/container/cpu/request_utilization"
@@ -97,6 +97,52 @@ MYSQL_METRIC_KINDS = {
     "active_threads": "gauge",
     "connected_clients": "gauge",
     "uptime": "counter",
+}
+CLICKHOUSE_METRIC_ALIASES: dict[str, tuple[str, ...]] = {
+    "work_total": (
+        "ClickHouseProfileEvents_Query",
+        "chi_clickhouse_event_query",
+        "chi_clickhouse_event_Query",
+    ),
+    "select_work_total": (
+        "ClickHouseProfileEvents_SelectQuery",
+        "chi_clickhouse_event_select_query",
+        "chi_clickhouse_event_SelectQuery",
+    ),
+    "insert_work_total": (
+        "ClickHouseProfileEvents_InsertQuery",
+        "chi_clickhouse_event_insert_query",
+        "chi_clickhouse_event_InsertQuery",
+    ),
+    "inserted_rows_total": (
+        "ClickHouseProfileEvents_InsertedRows",
+        "chi_clickhouse_event_inserted_rows",
+        "chi_clickhouse_event_InsertedRows",
+    ),
+    "active_threads": (
+        "ClickHouseMetrics_Query",
+        "ClickHouseAsyncMetrics_Query",
+        "chi_clickhouse_metric_query",
+    ),
+    "connected_clients": (
+        "ClickHouseMetrics_Connection",
+        "ClickHouseAsyncMetrics_Connection",
+        "chi_clickhouse_metric_connection",
+    ),
+    "merges_running": (
+        "ClickHouseMetrics_Merge",
+        "ClickHouseAsyncMetrics_Merge",
+        "chi_clickhouse_metric_merge",
+    ),
+}
+CLICKHOUSE_METRIC_KINDS = {
+    "work_total": "counter",
+    "select_work_total": "counter",
+    "insert_work_total": "counter",
+    "inserted_rows_total": "counter",
+    "active_threads": "gauge",
+    "connected_clients": "gauge",
+    "merges_running": "gauge",
 }
 REDIS_METRIC_KINDS = {
     "work_total": "counter",
@@ -202,6 +248,25 @@ DATABASE_PROFILES: dict[str, DatabaseMetricProfile] = {
             "valkey.kubernetes.io/role",
         ),
     ),
+    "clickhouse": DatabaseMetricProfile(
+        db_type="clickhouse",
+        aliases=CLICKHOUSE_METRIC_ALIASES,
+        kinds=CLICKHOUSE_METRIC_KINDS,
+        required_metrics=("work_total", "active_threads", "connected_clients", "merges_running"),
+        work_metrics=("work_total", "insert_work_total", "inserted_rows_total"),
+        active_thread_metric="active_threads",
+        exporter_identities=(
+            "altinity/metrics-exporter",
+            "chi-",
+        ),
+        exporter_recommendation="native ClickHouse Prometheus endpoint or Altinity operator metrics",
+        role_label_keys=(
+            "clickhouse-role",
+            "clickhouse.altinity.com/replica",
+            "app.kubernetes.io/component",
+        ),
+        backup_names=("clickhouse-backup", "clickhouse_backup", "backup", "dump", "snapshot"),
+    ),
 }
 
 
@@ -223,6 +288,7 @@ def resolve_metrics_project_id(requested: Optional[str]) -> str:
     if not project:
         for variable in (
             "DBA_DATABASE_METRICS_PROJECT_ID",
+        "DBA_CLICKHOUSE_METRICS_PROJECT_ID",
             "DBA_REDIS_METRICS_PROJECT_ID",
             "GOOGLE_CLOUD_PROJECT",
             "GCP_PROJECT_ID",
@@ -820,6 +886,32 @@ def _work_evidence(
     }
 
 
+def _clickhouse_insert_work_evidence(
+    metrics: Mapping[str, dict[str, Any]],
+    start_time: datetime,
+    end_time: datetime,
+    baseline: float,
+) -> dict[str, Any]:
+    """Treat inserts as work even when query counters are absent or zero."""
+    restarts = 0
+    observed_hours = 0
+    for logical in ("insert_work_total", "inserted_rows_total"):
+        aggregate = aggregate_hourly(metrics.get(logical), start_time, end_time)
+        restarts += int(aggregate["restarts"])
+        observed_hours = max(observed_hours, int(aggregate["hours_with_data"]))
+        if not aggregate["values"]:
+            continue
+        values = [max(0.0, value - baseline) for value in aggregate["values"]]
+        return {
+            "p95": _percentile_95(values),
+            "zero_work_hour_ratio": sum(1 for value in values if value <= 0.0) / len(values),
+            "restarts": restarts,
+            "hours_with_data": observed_hours,
+            "data_gaps": _data_gaps(start_time, end_time, observed_hours),
+        }
+    return {"p95": None, "zero_work_hour_ratio": 0.0, "restarts": restarts, "hours_with_data": observed_hours, "data_gaps": 0}
+
+
 def _active_thread_evidence(
     metrics: Mapping[str, dict[str, Any]],
     profile: DatabaseMetricProfile,
@@ -847,6 +939,11 @@ def _classification(
 ) -> tuple[str, list[str]]:
     reasons: list[str] = []
     missing = [logical for logical in profile.required_metrics if logical not in metrics or not metrics[logical].get("samples")]
+    if profile.db_type == "clickhouse" and "work_total" in missing and any(
+        logical in metrics and metrics[logical].get("samples")
+        for logical in ("insert_work_total", "inserted_rows_total")
+    ):
+        missing.remove("work_total")
     if missing:
         reasons.append(f"missing required metrics: {','.join(sorted(missing))}")
         return "blocked", reasons
@@ -953,6 +1050,201 @@ def _backup_evidence(
     return {"cronjobs": matches, "schedule_known": known_schedule, "active": active_backup}, known_schedule, active_backup
 
 
+def _clickhouse_pod_identity(pod: Any) -> str:
+    metadata = getattr(pod, "metadata", None)
+    labels = dict(getattr(metadata, "labels", None) or {})
+    values = [str(getattr(metadata, "name", "") or ""), *(f"{key}={value}" for key, value in labels.items())]
+    for container in getattr(getattr(pod, "spec", None), "containers", None) or []:
+        values.extend([str(getattr(container, "name", "") or ""), str(getattr(container, "image", "") or "")])
+    return " ".join(values).lower()
+
+
+def _clickhouse_is_keeper_pod(pod: Any) -> bool:
+    return "keeper" in _clickhouse_pod_identity(pod) or "zookeeper" in _clickhouse_pod_identity(pod)
+
+
+def _clickhouse_cluster_name(pod: Any) -> str:
+    labels = _labels(pod)
+    controller_type, controller_name = _controller_context(pod)
+    for key in (
+        "clickhouse.altinity.com/cluster",
+        "clickhouse-keeper.altinity.com/cluster",
+        "app.kubernetes.io/cluster",
+        "app.kubernetes.io/instance",
+    ):
+        value = str(labels.get(key, "")).strip()
+        if value:
+            return value
+    return controller_name or "default"
+
+
+def _clickhouse_topology(pod: Any) -> dict[str, Any]:
+    labels = _labels(pod)
+    metadata = getattr(pod, "metadata", None)
+    match = re.search(r"-(\d+)$", str(getattr(metadata, "name", "") or ""))
+    result: dict[str, Any] = {"ordinal": int(match.group(1)) if match else None}
+    for key, output in (
+        ("clickhouse.altinity.com/shard", "shard"),
+        ("clickhouse.altinity.com/replica", "replica"),
+        ("clickhouse.altinity.com/cluster", "cluster"),
+        ("clickhouse-keeper.altinity.com/shard", "keeper_shard"),
+        ("clickhouse-keeper.altinity.com/replica", "keeper_replica"),
+        ("clickhouse-keeper.altinity.com/cluster", "keeper_cluster"),
+    ):
+        if labels.get(key):
+            result[output] = str(labels[key])
+    return result
+
+
+def _clickhouse_server_clusters(pods: Iterable[Any]) -> dict[tuple[str, str], list[Any]]:
+    clusters: dict[tuple[str, str], list[Any]] = {}
+    for pod in pods:
+        namespace = str(getattr(getattr(pod, "metadata", None), "namespace", "") or "")
+        clusters.setdefault((namespace, _clickhouse_cluster_name(pod)), []).append(pod)
+    return clusters
+
+
+def _clickhouse_keeper_members(
+    pods: Iterable[Any],
+    server_clusters: Mapping[tuple[str, str], list[Any]],
+) -> list[dict[str, Any]]:
+    """Return Keeper/ZooKeeper pods attached as protected cluster members."""
+    protected: list[dict[str, Any]] = []
+    keeper_by_namespace: dict[str, list[Any]] = {}
+    for pod in pods:
+        namespace = str(getattr(getattr(pod, "metadata", None), "namespace", "") or "")
+        if _clickhouse_is_keeper_pod(pod):
+            keeper_by_namespace.setdefault(namespace, []).append(pod)
+    for namespace in sorted(keeper_by_namespace):
+        for pod in keeper_by_namespace[namespace]:
+            keeper_cluster = _clickhouse_cluster_name(pod)
+            pod_labels = _labels(pod)
+            pod_identities = {
+                str(pod_labels.get(key, "")).strip().lower()
+                for key in ("app.kubernetes.io/instance", "app.kubernetes.io/name", "app.kubernetes.io/part-of", "release")
+                if pod_labels.get(key)
+            }
+            candidates = []
+            for (candidate_namespace, cluster_name), members in server_clusters.items():
+                if candidate_namespace != namespace:
+                    continue
+                first_labels = _labels(members[0])
+                server_identities = {
+                    str(first_labels.get(key, "")).strip().lower()
+                    for key in ("app.kubernetes.io/instance", "app.kubernetes.io/name", "app.kubernetes.io/part-of", "release")
+                    if first_labels.get(key)
+                }
+                if cluster_name == keeper_cluster or (pod_identities and pod_identities & server_identities):
+                    candidates.append((cluster_name, members))
+            if not candidates:
+                continue
+            controller_type, controller_name = _controller_context(pod)
+            protected.append(
+                {
+                    "namespace": namespace,
+                    "pod": str(getattr(getattr(pod, "metadata", None), "name", "") or ""),
+                    "controller_name": controller_name,
+                    "controller_type": controller_type,
+                    "role": "protected_keeper",
+                    "topology": _clickhouse_topology(pod),
+                }
+            )
+    return protected
+
+
+def _clickhouse_member_record(pod: Any) -> dict[str, Any]:
+    controller_type, controller_name = _controller_context(pod)
+    return {
+        "namespace": str(getattr(getattr(pod, "metadata", None), "namespace", "") or ""),
+        "pod": str(getattr(getattr(pod, "metadata", None), "name", "") or ""),
+        "controller_name": controller_name,
+        "controller_type": controller_type,
+        "role": "cluster_member",
+        "topology": _clickhouse_topology(pod),
+    }
+
+
+def _clickhouse_backup_sidecars(pods: Iterable[Any]) -> list[dict[str, str]]:
+    evidence: list[dict[str, str]] = []
+    for pod in pods:
+        metadata = getattr(pod, "metadata", None)
+        for container in getattr(getattr(pod, "spec", None), "containers", None) or []:
+            combined = f"{getattr(container, 'name', '') or ''} {getattr(container, 'image', '') or ''}".lower()
+            if "backup" in combined or "dump" in combined or "snapshot" in combined:
+                evidence.append(
+                    {
+                        "namespace": str(getattr(metadata, "namespace", "") or ""),
+                        "pod": str(getattr(metadata, "name", "") or ""),
+                        "container": str(getattr(container, "name", "") or ""),
+                        "image": str(getattr(container, "image", "") or ""),
+                    }
+                )
+    return evidence
+
+
+def _clickhouse_approval_risks(disks: Iterable[Mapping[str, Any]], clusters: Iterable[Mapping[str, Any]]) -> dict[str, list[dict[str, str]]]:
+    object_disks: list[dict[str, str]] = []
+    cross_cluster: list[dict[str, str]] = []
+    for disk in disks:
+        disk_type = str(disk.get("type", "") or "")
+        path = str(disk.get("path", "") or "")
+        if any(term in f"{disk_type} {path}".lower() for term in ("s3", "gcs", "azure", "object", "bucket")):
+            object_disks.append(
+                {
+                    "name": str(disk.get("name", "") or ""),
+                    "type": disk_type,
+                    "path": path,
+                }
+            )
+    for cluster in clusters:
+        if bool(cluster.get("is_local")):
+            continue
+        consumer = {
+            "cluster": str(cluster.get("cluster", "") or ""),
+            "host_name": str(cluster.get("host_name", "") or ""),
+            "host_address": str(cluster.get("host_address", "") or ""),
+        }
+        if consumer not in cross_cluster:
+            cross_cluster.append(consumer)
+    return {"object_storage_disks": object_disks, "cross_cluster_consumers": cross_cluster}
+
+
+def _clickhouse_readonly_idle_evidence(namespace: str, pod_name: str) -> dict[str, Any]:
+    """Collect bounded, read-only catalog evidence when the exec path is configured."""
+    from .clickhouse import _run_clickhouse_query
+
+    evidence: dict[str, Any] = {
+        "system_backups": {"status": "unavailable", "reason": "pod/exec or system.backups is unavailable", "rows": []},
+        "system_disks": {"status": "unavailable", "reason": "pod/exec or system.disks is unavailable", "rows": []},
+        "system_clusters": {"status": "unavailable", "reason": "pod/exec or system.clusters is unavailable", "rows": []},
+    }
+    for key, template in (
+        ("system_backups", "clickhouse_backups.v1"),
+        ("system_disks", "clickhouse_disks.v1"),
+        ("system_clusters", "clickhouse_topology.v1"),
+    ):
+        try:
+            rows, _ = _run_clickhouse_query(namespace, pod_name, template)
+            evidence[key] = {"status": "available", "rows": rows[:20]}
+        except Exception as exc:
+            evidence[key] = {"status": "unavailable", "reason": str(exc), "rows": []}
+    return evidence
+
+
+def _clickhouse_cluster_work_evidence(
+    metrics: Mapping[str, dict[str, Any]],
+    profile: DatabaseMetricProfile,
+    start_time: datetime,
+    end_time: datetime,
+    baseline: float,
+) -> tuple[Mapping[str, Any], Mapping[str, Any], bool]:
+    query_work = _work_evidence({"work_total": metrics.get("work_total")}, profile, start_time, end_time, baseline)
+    insert_work = _clickhouse_insert_work_evidence(metrics, start_time, end_time, baseline)
+    query_idle = query_work.get("p95") is None or float(query_work.get("p95") or 0.0) <= 0.0
+    insert_active = insert_work.get("p95") is not None and float(insert_work.get("p95") or 0.0) > 0.0
+    return query_work, insert_work, query_idle and insert_active
+
+
 def _pvc_evidence(
     claims: Iterable[Any],
     claimed_names: Iterable[str],
@@ -1053,6 +1345,10 @@ def _workload_record(
     filtered = _filter_metrics(metrics, namespace, pod_name, container_names)
     pod_kubernetes_metrics = _filter_metrics(kubernetes_metrics, namespace, pod_name, container_names)
     work = _work_evidence(filtered, profile, start_time, end_time, thresholds.get("work_baseline_ops_per_sec", 0.0))
+    if profile.db_type == "clickhouse":
+        insert_work = _clickhouse_insert_work_evidence(filtered, start_time, end_time, thresholds.get("work_baseline_ops_per_sec", 0.0))
+        if insert_work["p95"] is not None and (work["p95"] is None or insert_work["p95"] > work["p95"]):
+            work = {**work, "p95": insert_work["p95"]}
     active_threads = _active_thread_evidence(filtered, profile, start_time, end_time)
     cpu_p95 = _p95_metric("cpu_request", pod_kubernetes_metrics, start_time, end_time)
     memory_p95 = _p95_metric("memory_request", pod_kubernetes_metrics, start_time, end_time)
@@ -1150,6 +1446,41 @@ def _operator_cluster_context() -> dict[str, str]:
     return context
 
 
+def _clickhouse_cluster_assessment(workloads: list[dict[str, Any]]) -> dict[str, Any]:
+    statuses = [str(workload.get("classification", "blocked")) for workload in workloads]
+    if "active" in statuses:
+        classification = "active"
+        reasons = ["at least one ClickHouse replica has active work evidence"]
+    elif statuses and all(status == "candidate" for status in statuses):
+        classification = "candidate"
+        reasons = ["every shard replica in the ClickHouse cluster meets idle thresholds"]
+    else:
+        classification = "blocked"
+        reasons = sorted(
+            {
+                reason
+                for workload in workloads
+                for reason in workload.get("classification_reasons", [])
+                if classification != "active" or reason
+            }
+        ) or ["no ClickHouse replica met the complete candidate evidence"]
+    counts = {status: statuses.count(status) for status in sorted(set(statuses))}
+    return {
+        "classification": classification,
+        "classification_reasons": reasons,
+        "member_counts": counts,
+        "member_classifications": [
+            {
+                "namespace": workload["namespace"],
+                "pod": workload["pod"],
+                "classification": workload["classification"],
+                "classification_reasons": workload["classification_reasons"],
+            }
+            for workload in workloads
+        ],
+    }
+
+
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
@@ -1178,6 +1509,15 @@ def _render_human(payload: dict[str, Any]) -> str:
                 f"  - Risks: {', '.join(workload['risks']) or 'none'}",
                 f"  - Recommendation: {workload['recommendation']}",
                 f"  - Approvals: {', '.join(workload.get('required_approvals', []))}",
+            ]
+        )
+    cluster = payload.get("metadata", {}).get("cluster_assessment", {})
+    if payload.get("metadata", {}).get("assessment_unit") == "cluster":
+        lines.extend(
+            [
+                f"- Cluster assessment unit: {payload['metadata'].get('cluster_id', 'unknown')} ({cluster.get('classification', 'unknown')})",
+                f"- Cluster ingest-only: {payload['metadata'].get('ingest_only', False)}",
+                f"- Protected members: {len(payload['metadata'].get('protected_members', []))}",
             ]
         )
     metadata = payload.get("metadata", {})
@@ -1231,7 +1571,12 @@ def collect_database_idle_assessment(
             pods = core.list_namespaced_pod(namespace=namespace).items
         else:
             pods = core.list_pod_for_all_namespaces().items
-        matching_pods = [item for item in pods if _matches_profile(item, normalized_type)]
+        matching_pods = [
+            item
+            for item in pods
+            if _matches_profile(item, normalized_type)
+            and not (normalized_type == "clickhouse" and _clickhouse_is_keeper_pod(item))
+        ]
         if pod:
             matching_pods = [
                 item
@@ -1299,6 +1644,7 @@ def collect_database_idle_assessment(
             nodes = []
         nodes_by_name = {str(getattr(getattr(node, "metadata", None), "name", "") or ""): node for node in nodes}
 
+        thresholds = classification_thresholds()
         workloads = [
             _workload_record(
                 item,
@@ -1307,7 +1653,7 @@ def collect_database_idle_assessment(
                 kubernetes_metrics,
                 start_time,
                 end_time,
-                classification_thresholds(),
+                thresholds,
                 namespace_value,
                 pod_name,
                 namespace_labels,
@@ -1317,6 +1663,60 @@ def collect_database_idle_assessment(
             )
             for item, (namespace_value, pod_name) in zip(matching_pods, targets, strict=True)
         ]
+        cluster_id = ""
+        cluster_assessment: dict[str, Any] = {}
+        protected_members: list[dict[str, Any]] = []
+        cluster_members: list[dict[str, Any]] = []
+        ingest_only = False
+        cluster_backup: dict[str, Any] = {}
+        approval_risks: dict[str, list[dict[str, str]]] = {}
+        if normalized_type == "clickhouse":
+            server_clusters = _clickhouse_server_clusters(matching_pods)
+            cluster_key = next(iter(server_clusters), ("", ""))
+            cluster_id = ":".join(cluster_key) if cluster_key != ("", "") else ""
+            server_pods = server_clusters.get(cluster_key, [])
+            protected_members = _clickhouse_keeper_members(pods, server_clusters)
+            cluster_members = [_clickhouse_member_record(item) for item in matching_pods]
+            cluster_assessment = _clickhouse_cluster_assessment(workloads)
+            query_evidence, insert_evidence, ingest_only = _clickhouse_cluster_work_evidence(
+                metrics,
+                profile,
+                start_time,
+                end_time,
+                thresholds.get("work_baseline_ops_per_sec", 0.0),
+            )
+            exec_evidence: dict[str, Any] = {"status": "unavailable", "reason": "no ClickHouse server pod selected", "rows": []}
+            if server_pods:
+                first = server_pods[0]
+                first_namespace = str(getattr(getattr(first, "metadata", None), "namespace", "") or "")
+                first_pod = str(getattr(getattr(first, "metadata", None), "name", "") or "")
+                exec_evidence = _clickhouse_readonly_idle_evidence(first_namespace, first_pod)
+            backup_rows = exec_evidence.get("system_backups", {}).get("rows", []) if isinstance(exec_evidence.get("system_backups"), dict) else []
+            disk_rows = exec_evidence.get("system_disks", {}).get("rows", []) if isinstance(exec_evidence.get("system_disks"), dict) else []
+            topology_rows = exec_evidence.get("system_clusters", {}).get("rows", []) if isinstance(exec_evidence.get("system_clusters"), dict) else []
+            backup_cronjobs_evidence, backup_schedule_known, backup_active = _backup_evidence(
+                backup_cronjobs,
+                cluster_key[0],
+                dict(getattr(getattr(matching_pods[0], "metadata", None), "labels", None) or {}) if matching_pods else {},
+                "",
+                profile,
+                _controller_context(matching_pods[0])[1] if matching_pods else "",
+            )
+            cluster_backup = {
+                **backup_cronjobs_evidence,
+                "sidecars": _clickhouse_backup_sidecars(matching_pods),
+                "system_backups": {
+                    "status": "available" if backup_rows else "unavailable",
+                    "rows": backup_rows,
+                    "reason": "" if backup_rows else "no recent system.backups rows were returned",
+                },
+            }
+            approval_risks = _clickhouse_approval_risks(disk_rows, topology_rows)
+            if not backup_schedule_known and not backup_rows:
+                cluster_assessment["classification"] = "blocked"
+                cluster_assessment["classification_reasons"] = sorted(
+                    set(cluster_assessment["classification_reasons"]) | {"cluster backup schedule is unknown"}
+                )
         # Per-workload gaps: a pod with no series is not covered by another pod's series.
         missing_metrics = sorted({logical for workload in workloads for logical in workload["missing_metrics"]})
         exporter_discovered = bool(workloads and any(_exporter_discovery(item, profile) for item in matching_pods))
@@ -1343,6 +1743,23 @@ def collect_database_idle_assessment(
                 "kubernetes": _operator_cluster_context(),
             },
         }
+        if normalized_type == "clickhouse":
+            payload["metadata"].update(
+                {
+                    "assessment_unit": "cluster",
+                    "cluster_id": cluster_id,
+                    "cluster_members": cluster_members,
+                    "protected_members": protected_members,
+                    "ingest_only": ingest_only,
+                    "cluster_assessment": cluster_assessment,
+                    "cluster_work_evidence": {
+                        "query": query_evidence,
+                        "insert": insert_evidence,
+                    },
+                    "cluster_backup_evidence": cluster_backup,
+                    "approval_risks": approval_risks,
+                }
+            )
         return json.dumps(payload, sort_keys=True, separators=(",", ":")) if output_mode == "json" else _render_human(payload)
     except Exception as exc:
         payload = _error_payload(str(exc))

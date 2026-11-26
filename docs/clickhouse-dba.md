@@ -47,6 +47,7 @@ GRANT SELECT ON system.detached_parts TO copilot_dba;
 GRANT SELECT ON system.part_log TO copilot_dba;
 GRANT SELECT ON system.errors TO copilot_dba;
 GRANT SELECT ON system.metrics TO copilot_dba;
+GRANT SELECT ON system.backups TO copilot_dba;
 GRANT SELECT ON system.asynchronous_metrics TO copilot_dba;
 GRANT SELECT ON system.disks TO copilot_dba;
 GRANT SELECT ON system.storage_policies TO copilot_dba;
@@ -133,6 +134,14 @@ Set `DBA_CLICKHOUSE_METRICS_PROJECT_ID` when the existing project fallbacks do n
 `get_clickhouse_snapshot_diff(namespace, pod, interval_minutes=5, output_mode="human")` reads selected numeric values from `system.events`, `system.metrics`, and `system.asynchronous_metrics`, waits 1-60 minutes, and reads the same bounded selection again. It reports deltas for queries, SELECT/INSERT queries, inserted and merged rows, failed queries, memory, parts, merges, replication delay/queue, read-only replicas, and disk free where those selected values are readable.
 
 Each source is independent and failures remain evidence gaps. The snapshot contains only selected names and numeric values; it does not persist credentials, secrets, raw application data, or query text. The mandatory readonly profile check and direct-argv registry path are unchanged.
+
+## Idle-cost assessment
+
+`collect_database_idle_assessment(db_type="clickhouse")` is metrics-only and read-only. It maps native and Altinity exporter families for query, SELECT and INSERT work, inserted rows, active queries, client connections, and running merges. Set `DBA_CLICKHOUSE_METRICS_PROJECT_ID` when existing project fallbacks do not identify the monitoring project, and set `DBA_IDLE_EXPORTER_BASELINE_OPS_PER_SEC` to subtract measured exporter scrape traffic.
+
+The idle envelope uses the same `cloud-copilot.dba.idle-cost.v1` version and adds cluster metadata. `metadata.assessment_unit` is `cluster`; all server pods are `metadata.cluster_members`, and matching Keeper/ZooKeeper pods are `metadata.protected_members`. A cluster is a candidate only when every replica of every shard is eligible and idle. One busy replica makes it active, one incomplete replica blocks it, and ingest work is never idle. The collector never models removing one replica as savings.
+
+When the read-only exec path is configured, the collector uses the bounded `system.backups`, `system.disks`, and `system.clusters` registry queries. It reports recent backups, sidecars/CronJobs, object-storage disks, and remote/cross-cluster consumers as explicit evidence and approval items. It never starts, stops, resizes, deletes, or mutates a ClickHouse server, Keeper, backup, disk, or consumer.
 
 ## Query plans and table design
 

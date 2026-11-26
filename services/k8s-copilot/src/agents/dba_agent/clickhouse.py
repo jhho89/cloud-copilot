@@ -1088,6 +1088,27 @@ FORMAT JSONEachRow""",
 )
 _register_template(
     ClickHouseSQLTemplate(
+        "clickhouse_backups.v1",
+        1,
+        "Read a bounded list of recent backup jobs from system.backups.",
+        """SELECT
+    id,
+    name,
+    status,
+    error,
+    start_time,
+    end_time,
+    bytes_compressed,
+    bytes_uncompressed,
+    total_size
+FROM system.backups
+ORDER BY start_time DESC
+LIMIT 20
+FORMAT JSONEachRow""",
+    )
+)
+_register_template(
+    ClickHouseSQLTemplate(
         "clickhouse_disks.v1",
         1,
         "Read configured disk free space, total capacity, and keep-free thresholds.",

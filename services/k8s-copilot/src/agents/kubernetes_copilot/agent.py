@@ -120,11 +120,18 @@ This agent can:
 2. **Prefer metrics for trends**: `get_clickhouse_metrics_trends` reads workload, replication, memory, parts, and disk trends without pod/exec. If no ClickHouse Prometheus/Altinity or Cloud Monitoring/GMP series is discoverable, the DBA agent reports the prerequisite.
 3. **Bound snapshot work**: Use get_clickhouse_snapshot_diff only for an agreed 1-60 minute before/after comparison. All results are advisory and no ClickHouse or Kubernetes state is changed.
 
+### For ClickHouse Idle Cost:
+
+1. **Assess the cluster**: Ask dba_agent for `collect_database_idle_assessment(db_type="clickhouse")`. Keep the JSON verbatim; ClickHouse is one assessment unit, and a busy replica, missing replica evidence, ingest work, or a running backup blocks the whole cluster.
+2. **Preserve protected cost**: Do not remove or reclassify Keeper/ZooKeeper members. Object-storage disks and cross-cluster consumers are approval risks, not savings.
+3. **Model as one decision**: Pass the envelope verbatim to `cost_copilot` / `estimate_database_cost_impact`. If `metadata.assessment_unit` is `cluster`, use `result.cluster` for attribution and savings, keep `result.workloads` as per-pod transparency rows, and never model single-replica removal as savings.
+4. **Report approvals**: Name database, backup, service, object-storage, and cross-cluster owners where the evidence requires them. The result is advisory and no shutdown or mutation is automatic.
+
 ### For Database Idle-Cost Engineering:
 
 1. **Assess with DBA Agent**: Ask `dba_agent` for `collect_database_idle_assessment` with the requested database type, optional namespace/pod, and 1-31 day window. Request `output_mode='json'` because Cost Copilot needs the exact JSON envelope. The DBA result includes every matching workload, not only the first one.
 2. **Add context only if needed**: Ask `diagnostic_agent` for missing node, namespace, or resource context. Do not ask Cost Copilot to discover resources.
-3. **Model with Cost Copilot**: Pass the DBA JSON envelope verbatim to `cost_copilot` / `estimate_database_cost_impact`. Cost Copilot cannot discover pods and must process only that supplied envelope. Never add, edit, or infer envelope fields (GKE distribution, node-pool consolidation, approved idle hours, schedules, or eligibility); missing evidence must stay missing. Preserve separate billing attribution and marginal savings for each workload, and never add or convert currencies.
+3. **Model with Cost Copilot**: Pass the DBA JSON envelope verbatim to `cost_copilot` / `estimate_database_cost_impact`. Cost Copilot cannot discover pods and must process only that supplied envelope. Never add, edit, or infer envelope fields (GKE distribution, node-pool consolidation, approved idle hours, schedules, or eligibility); missing evidence must stay missing. Preserve separate billing attribution and marginal savings for each workload, and never add or convert currencies. For ClickHouse clusters, use the cluster result and never model one replica as independent savings.
 4. **Report**: Render a combined report that distinguishes idle evidence, risks, required approvals, per-workload cost attribution, protected costs, and marginal savings. State that every recommendation is advisory; require explicit database, backup, and service-owner approval, and never imply or perform a shutdown.
 
 ### For Cost Queries:
