@@ -13,6 +13,8 @@ from .tools import (
     get_redis_snapshot_diff,
     recommend_mysql_indexes,
     get_clickhouse_slow_queries,
+    get_clickhouse_replication_report,
+    get_clickhouse_workload_report,
 )
 from .idle_metrics import collect_database_idle_assessment
 from dotenv import load_dotenv
@@ -28,6 +30,8 @@ DbaAgent = Agent(
 Available tools:
 - find_database_pods: Discover MySQL/MariaDB/Redis/Valkey/ClickHouse/Keeper/ZooKeeper-compatible pods by image, container name, or labels.
 - get_clickhouse_slow_queries: Read only system.query_log and system.processes for slow/expensive query evidence and advisory recommendations.
+- get_clickhouse_replication_report: Read replica-local system.clusters, system.replicas, replication queues, and Keeper connection evidence for advisory topology analysis.
+- get_clickhouse_workload_report: Read bounded system metrics, processes, errors, query_log aggregates, and quota usage for advisory workload and concurrency analysis.
 - get_mysql_slow_queries: Read recent slow-query entries from database pod logs, or from an operator-allowlisted file via a read-only tail exec.
 - get_mysql_query_plan: Run EXPLAIN for one read-only SQL statement.
 - recommend_mysql_indexes: Analyze a query plan and existing indexes, then suggest indexes without applying them.
@@ -98,6 +102,21 @@ For ClickHouse slow and expensive query analysis:
 5. Every recommendation must identify its evidence, state risk/trade-off context, and explicitly say that no change was applied. Never suggest or run KILL, SYSTEM, OPTIMIZE, ALTER, INSERT, or other mutating statements.
 6. Keeper/ZooKeeper pods may be discovered for topology context, but system.query_log lives on ClickHouse server pods, not Keeper pods.
 
+For ClickHouse replication and topology:
+1. Use get_clickhouse_replication_report. Prefer namespace and pod. The report is replica-local even when it can see configured cluster membership; a single pod cannot prove cluster-wide health.
+2. It reads only bounded local views of system.clusters, system.replicas, system.replication_queue, system.distribution_queue, and system.zookeeper_connection where available. It repeats the exact readonly=1 startup check before every query.
+3. Report shard/replica membership and the local replica identity. Treat Altinity and generic labels only as hints; when runtime system.clusters disagrees, say that runtime evidence is authoritative.
+4. Surface read-only replicas, expired Keeper sessions, absolute replication delay, queue size, inserts/merges, replication-log gap, active replica counts, lost parts, errors, recovery time, oldest queue entries, retries, exceptions, postponement reasons, and pending Distributed files/bytes when the source is readable.
+5. If an optional source is unavailable or malformed, preserve that limitation instead of inventing health. For cluster-wide analysis, repeat the tool per pod rather than assuming a label or one shard proves the whole installation.
+6. Keep every recommendation advisory and evidence-linked. Never suggest or run SYSTEM, DROP, DETACH, OPTIMIZE, ALTER, KILL, Keeper mutations, or restart/remediation actions.
+
+For ClickHouse workload, concurrency, and errors:
+1. Use get_clickhouse_workload_report. Prefer namespace and pod. It supports a bounded window of 1-10080 minutes and a bounded output limit of 1-100 rows per source.
+2. It reads only system.metrics, system.processes, system.errors, system.query_log, and system.quotas_usage where readable, plus selected concurrency-related settings. Every source failure is reported separately.
+3. Report query and connection counters (including HTTP, TCP, MySQL, PostgreSQL, and interserver), pool/task counts, running queries, long-running and memory-heavy queries, recent top errors, and quota usage.
+4. Aggregate recent load by user, client_name, http_user_agent, and initial_address when available. Show normalizeQuery output truncated, redact write/DDL/maintenance/access-management text, and never echo credentials, secrets, tokens, or application data.
+5. Advise on client pool sizing, per-user concurrency, quotas, and misbehaving consumers only with triggering evidence and explicit risk/trade-off context. Do not issue KILL, change settings or quotas, or claim any connection/configuration action was taken.
+
 For Redis/Valkey output:
 1. Every Redis/Valkey diagnostic supports output_mode='human' (default) or output_mode='json'. JSON is a stable envelope with schema_version, tool, status, generated_at, data.report, and metadata/errors; keep the human Markdown text unchanged unless the user asks for JSON.
 2. When JSON is requested, return the JSON verbatim to tooling and do not reformat it into prose. Preserve empty/unavailable fields and evidence errors rather than inventing values.
@@ -125,6 +144,8 @@ The tool reads Kubernetes pod logs by default for MySQL/MariaDB, which must have
         get_redis_remediation_recommendations,
         collect_database_idle_assessment,
         get_clickhouse_slow_queries,
+        get_clickhouse_replication_report,
+        get_clickhouse_workload_report,
     ],
 )
 
