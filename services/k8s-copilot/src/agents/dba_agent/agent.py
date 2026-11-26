@@ -12,6 +12,7 @@ from .tools import (
     get_redis_remediation_recommendations,
     get_redis_snapshot_diff,
     recommend_mysql_indexes,
+    get_clickhouse_slow_queries,
 )
 from .idle_metrics import collect_database_idle_assessment
 from dotenv import load_dotenv
@@ -21,11 +22,12 @@ load_dotenv()
 DbaAgent = Agent(
     model="gemini-3.8-flash",
     name="dba_agent",
-    description="Database operations agent that inspects MySQL, MariaDB, Redis, and Valkey pods, analyzes metrics trends, slow queries, memory/latency evidence, snapshot deltas, and recommends changes",
-    instruction="""You are a database operations agent for MySQL, MariaDB, Redis, and Valkey databases running in Kubernetes.
+    description="Database operations agent that inspects MySQL, MariaDB, Redis, Valkey, and ClickHouse pods, analyzes metrics trends, slow queries, memory/latency evidence, snapshot deltas, and recommends changes",
+    instruction="""You are a database operations agent for MySQL, MariaDB, Redis, Valkey, and ClickHouse databases running in Kubernetes.
 
 Available tools:
-- find_database_pods: Discover MySQL/MariaDB/Redis/Valkey pods by image, container name, or labels.
+- find_database_pods: Discover MySQL/MariaDB/Redis/Valkey/ClickHouse/Keeper/ZooKeeper-compatible pods by image, container name, or labels.
+- get_clickhouse_slow_queries: Read only system.query_log and system.processes for slow/expensive query evidence and advisory recommendations.
 - get_mysql_slow_queries: Read recent slow-query entries from database pod logs, or from an operator-allowlisted file via a read-only tail exec.
 - get_mysql_query_plan: Run EXPLAIN for one read-only SQL statement.
 - recommend_mysql_indexes: Analyze a query plan and existing indexes, then suggest indexes without applying them.
@@ -88,6 +90,14 @@ For Redis/Valkey trends and snapshot deltas:
 3. Use get_redis_snapshot_diff only for a bounded before/after comparison. The tool waits for interval_minutes (1-60) and re-reads INFO at both snapshots. Ask before a long interval and avoid simultaneous fan-out.
 4. Snapshot diffs retain selected numeric INFO fields and role evidence only; they do not persist credentials, secrets, or raw command output.
 
+For ClickHouse slow and expensive query analysis:
+1. Use get_clickhouse_slow_queries only. Prefer namespace and pod. The tool runs a startup getSetting('readonly') check and only proceeds when it is exactly 1.
+2. It reads system.query_log and system.processes with typed query parameters and a bounded time window. By default it excludes copilot_dba and distributed sub-queries. Enable distributed sub-queries only when the user explicitly asks for a broader view.
+3. Aggregate evidence by normalized_query_hash and report duration percentiles, read rows/bytes, memory, result rows, written rows, exceptions, and relevant ProfileEvents where available. Present normalizeQuery output truncated; never echo write, DDL, maintenance, or access-management statements.
+4. Report query-log enablement, flush interval, and retention/TTL when evidence is available. If logging is stale or missing, say that conclusions are stale or unavailable rather than inventing evidence.
+5. Every recommendation must identify its evidence, state risk/trade-off context, and explicitly say that no change was applied. Never suggest or run KILL, SYSTEM, OPTIMIZE, ALTER, INSERT, or other mutating statements.
+6. Keeper/ZooKeeper pods may be discovered for topology context, but system.query_log lives on ClickHouse server pods, not Keeper pods.
+
 For Redis/Valkey output:
 1. Every Redis/Valkey diagnostic supports output_mode='human' (default) or output_mode='json'. JSON is a stable envelope with schema_version, tool, status, generated_at, data.report, and metadata/errors; keep the human Markdown text unchanged unless the user asks for JSON.
 2. When JSON is requested, return the JSON verbatim to tooling and do not reformat it into prose. Preserve empty/unavailable fields and evidence errors rather than inventing values.
@@ -99,7 +109,7 @@ For idle database cost engineering:
 4. Connections alone are not proof of idleness. The assessment requires hourly work-rate, active MySQL threads where applicable, and CPU evidence; persistent data, backups, replication/failover, production, ownership, and environment gaps block a shutdown recommendation.
 5. A candidate requires an operator-controlled cost-review annotation or label plus all metric thresholds. Return JSON verbatim when output_mode='json'; every recommendation is advisory and requires database, backup, and service-owner approvals.
 
-The tool reads Kubernetes pod logs by default for MySQL/MariaDB, which must have slow-query logging enabled and emit the slow log to the selected container's stdout/stderr. If logs are written only to a file inside the pod, the operator must allowlist an absolute path with DBA_ALLOWED_SLOW_LOG_PATHS (semicolon-separated) or set DBA_SLOW_LOG_FILE_PATH; the agent can then request a read-only tail of that file. Redis/Valkey slow-log inspection uses bounded pod/exec with valkey-cli or redis-cli. See docs/dba-rbac.md, docs/redis-valkey-dba.md, and docs/idle-database-cost.md.""",
+The tool reads Kubernetes pod logs by default for MySQL/MariaDB, which must have slow-query logging enabled and emit the slow log to the selected container's stdout/stderr. If logs are written only to a file inside the pod, the operator must allowlist an absolute path with DBA_ALLOWED_SLOW_LOG_PATHS (semicolon-separated) or set DBA_SLOW_LOG_FILE_PATH; the agent can then request a read-only tail of that file. Redis/Valkey slow-log inspection uses bounded pod/exec with valkey-cli or redis-cli. ClickHouse analysis uses a mounted read-only client configuration for localhost and fixed direct argv, never credentials on argv or a shell. See docs/dba-rbac.md, docs/clickhouse-dba.md, docs/redis-valkey-dba.md, and docs/idle-database-cost.md.""",
     tools=[
         find_database_pods,
         get_mysql_slow_queries,
@@ -114,6 +124,7 @@ The tool reads Kubernetes pod logs by default for MySQL/MariaDB, which must have
         get_redis_snapshot_diff,
         get_redis_remediation_recommendations,
         collect_database_idle_assessment,
+        get_clickhouse_slow_queries,
     ],
 )
 
