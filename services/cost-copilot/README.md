@@ -127,7 +127,7 @@ The service account needs:
 - `suggest_committed_use_discounts(project_id)` - CUD opportunities
 - `estimate_cost_savings(summary)` - Calculate potential savings
 - `analyze_storage_costs(project_id)` - Storage optimization guide
-- `estimate_database_cost_impact(idle_assessment, days=30, end_date=None, project_id=None, output_mode="markdown")` - Attribute database billing and model marginal savings for every workload in a DBA envelope
+- `estimate_database_cost_impact(idle_assessment, days=30, end_date=None, project_id=None, output_mode="markdown")` - Attribute database billing and model marginal savings for every workload in a DBA envelope; ClickHouse cluster envelopes use one whole-cluster decision
 
 ### Database Idle Impact
 
@@ -169,6 +169,14 @@ Savings remain conservative:
 - **Permanent decommission**: only marginal compute is savings. Persistent
   storage, backups, snapshots, load balancers, and static IPs remain visible and
   are not counted.
+
+For a ClickHouse envelope with `metadata.assessment_unit="cluster"`, Cost Copilot
+aggregates billing attribution across all member pods and Keeper, keeps per-pod
+results as transparency rows, and models savings only for decommissioning the
+whole cluster, approved scheduled shutdown, or dedicated/tainted node-pool
+consolidation. Keeper compute is protected. A single replica removal is always
+reported as zero savings and owner-approval right-sizing. Object storage, backups,
+cross-cluster consumers, and missing attribution remain explicit evidence gaps.
 
 ## Deployment
 

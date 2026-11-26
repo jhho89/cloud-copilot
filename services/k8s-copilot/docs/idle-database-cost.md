@@ -1,12 +1,12 @@
 # Idle database cost engineering
 
-`collect_database_idle_assessment` is a metrics-only cost assessment for MySQL, MariaDB, Redis, and Valkey. It returns `schema_version=cloud-copilot.dba.idle-cost.v1`, preserves attribution for every matching workload in `data.workloads`, and is advisory. It does not use pod/exec as a metrics fallback, install an exporter, read Secrets, accept credentials, or mutate Kubernetes or database state.
+`collect_database_idle_assessment` is a metrics-only cost assessment for MySQL, MariaDB, Redis, Valkey, and ClickHouse. It returns `schema_version=cloud-copilot.dba.idle-cost.v1`, preserves attribution for every matching workload in `data.workloads`, and is advisory. It does not use pod/exec as a metrics fallback, install an exporter, read Secrets, accept credentials, or mutate Kubernetes or database state.
 
 ## Prerequisites and IAM
 
-The function reads an existing Google Managed Prometheus exporter through Cloud Monitoring. Operators must already run and scrape `mysqld_exporter`, `redis_exporter`, or `valkey-exporter`; the service never installs one. Sidecars, database-native metric ports, and `prometheus.io/*` annotations are discovery evidence only. The profile-specific recommendation is `mysqld_exporter`, `redis_exporter`, or `valkey-exporter` when no enabled exporter or matching series is found.
+The function reads an existing Google Managed Prometheus exporter through Cloud Monitoring. Operators must already run and scrape `mysqld_exporter`, `redis_exporter`, `valkey-exporter`, native ClickHouse Prometheus metrics, or Altinity operator metrics; the service never installs one. Sidecars, database-native metric ports, and `prometheus.io/*` annotations are discovery evidence only. The profile-specific recommendation is shown when no enabled exporter or matching series is found.
 
-The caller needs read access to the configured Cloud Monitoring project, typically `roles/monitoring.viewer`, plus Kubernetes read access for pods, namespaces, PVCs, CronJobs, and nodes. Configure `DBA_DATABASE_METRICS_PROJECT_ID`; the service falls back to `DBA_REDIS_METRICS_PROJECT_ID`, `GOOGLE_CLOUD_PROJECT`, and `GCP_PROJECT_ID`, then inferred Application Default Credentials. Never place database credentials in annotations or function arguments.
+The caller needs read access to the configured Cloud Monitoring project, typically `roles/monitoring.viewer`, plus Kubernetes read access for pods, namespaces, PVCs, CronJobs, and nodes. Configure `DBA_DATABASE_METRICS_PROJECT_ID`; the service falls back to `DBA_CLICKHOUSE_METRICS_PROJECT_ID`, `DBA_REDIS_METRICS_PROJECT_ID`, `GOOGLE_CLOUD_PROJECT`, and `GCP_PROJECT_ID`, then inferred Application Default Credentials. Never place database credentials in annotations or function arguments.
 
 ## Profiles and evidence
 
@@ -39,6 +39,14 @@ The supported window is 1-31 days (default minimum 7). Classification is `active
 
 Shutdown is never recommended for failover replicas, primaries with active backups, production workloads, or workloads lacking an owner or environment marker. Persistent data and unknown backup schedules are risks and block candidacy. Recommendations include database-operator, backup-owner, and service-owner approval requirements and are advisory only.
 
+## ClickHouse clusters
+
+ClickHouse is assessed as `metadata.assessment_unit="cluster"`. The reader recognizes native `ClickHouseProfileEvents_*`, `ClickHouseMetrics_*`, and `ClickHouseAsyncMetrics_*` names plus Altinity `chi_clickhouse_event_*` and `chi_clickhouse_metric_*` aliases for queries, SELECT and INSERT work, inserted rows, active queries, client connections, and running merges. Query work and inserted rows are both work, so Kafka or S3Queue ingestion is reported as active and `metadata.ingest_only` distinguishes insert-only traffic.
+
+The cluster is `candidate` only when every member of every shard passes work, CPU, coverage, and safety checks. One busy replica makes the cluster active; one incomplete replica blocks it. `metadata.cluster_members` preserves shard/replica hints. Keeper or ZooKeeper pods attached by cluster/instance labels are `metadata.protected_members` and are protected cluster cost, not independent savings. The tool never models removing one replica as savings; replica-count right-sizing is an owner-approval item.
+
+ClickHouse backup evidence combines matching CronJobs, sidecar/container names, and recent `system.backups` rows when the existing read-only exec path is available. `system.disks` and `system.clusters` supply object-storage disks and remote/cross-cluster consumers as `metadata.approval_risks`; those approvals are separate from compute savings. Missing evidence stays missing and is never fabricated.
+
 ## Output envelope
 
 JSON is the default and is intended for Cost Copilot. Stable fields are `schema_version`, `generated_at`, `status`, `data.workloads[*]` attribution, classification, metrics, risks, owner, environment, and eligibility evidence, plus project, window, source, and missing-metric metadata. Each workload also carries a `kubernetes` envelope with node/controller context, requests and limits, PVCs, backup evidence, and node-pool information so downstream services need no Kubernetes access. Non-secret metadata may be added, but existing fields and the schema version remain stable.
@@ -49,5 +57,5 @@ Human output summarizes the same evidence for operators. All output avoids Secre
 
 1. Ask DBA Agent for `collect_database_idle_assessment` and use `output_mode=json`.
 2. If modeling needs missing node, namespace, or resource context, ask Diagnostic Agent. Cost Copilot has no Kubernetes access.
-3. Pass the DBA JSON envelope verbatim to Cost Copilot's `estimate_database_cost_impact`. It models every workload in `data.workloads`, preserving separate attribution, protected costs, savings, and currency.
+3. Pass the DBA JSON envelope verbatim to Cost Copilot's `estimate_database_cost_impact`. It models every workload in `data.workloads`, preserving separate attribution, protected costs, savings, and currency. For ClickHouse, read `result.cluster` for the single cluster decision; `result.workloads` remains per-pod transparency.
 4. Render a combined report with idle evidence, risks, required approvals, cost attribution, and marginal savings. The result is advisory: explicit database, backup, and service-owner approval is required, and no shutdown or mutation is automatic.

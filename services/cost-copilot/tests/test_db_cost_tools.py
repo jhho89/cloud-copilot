@@ -252,7 +252,7 @@ def test_permanent_decommission_saves_only_compute():
     rows = [_row(cost=20), _row(sku="Persistent SSD", cost=5), _row(sku="Backup", cost=2)]
     result = build_idle_cost_result(envelope, rows, 30)
     scenario = next(item for item in result["remediation_scenarios"] if item["name"] == "permanent_decommission")
-    assert scenario["monthly_savings"] == {"currency": "USD", "amount": 20.0}
+    assert scenario["monthly_savings"] == {"currency": "USD", "amount": 50.0}
     assert result["protected_costs"]["window_observed"]["backups_snapshots"] == {"USD": 2.0}
 
 
@@ -372,7 +372,7 @@ def test_explicit_eligibility_flag_is_honoured_over_evidence_string():
     envelope = _envelope(eligibility_evidence="annotation=eligible", cost_review_eligible=True)
     envelope["metadata"]["kubernetes"] = {"distribution": "Autopilot"}
     result = build_idle_cost_result(envelope, [_row(service="Kubernetes Engine", sku="Autopilot Pod mCPU", cost=100.0)], 30)
-    assert _scenario(result, "autopilot_idle_scale_down")["status"] == "estimate"
+    assert _scenario(result, "autopilot_idle_scale_down")["status"] == "conditional"
     assert _scenario(result, "permanent_decommission")["status"] == "estimate"
     envelope["data"]["workloads"][0]["cost_review_eligible"] = False
     result = build_idle_cost_result(envelope, [_row(service="Kubernetes Engine", sku="Autopilot Pod mCPU", cost=100.0)], 30)
@@ -450,3 +450,64 @@ def test_cluster_pin_selects_one_cluster():
     workload = build_idle_cost_result(envelope, rows, 30)["workloads"][0]
     assert workload["billing_attribution"]["status"] == "available"
     assert workload["observed_cost"]["amount"] == 30.0
+
+
+def _clickhouse_cluster_envelope():
+    envelope = deepcopy(ENVELOPE)
+    member = deepcopy(envelope["data"]["workloads"][0])
+    member.update(pod="clickhouse-0", db_type="clickhouse", controller_name="clickhouse", controller_type="StatefulSet")
+    replica = deepcopy(member)
+    replica["pod"] = "clickhouse-1"
+    envelope["data"]["workloads"] = [member, replica]
+    envelope["metadata"]["assessment_unit"] = "cluster"
+    envelope["metadata"]["cluster_members"] = [
+        {"namespace": "database", "pod": "clickhouse-0", "controller_name": "clickhouse", "controller_type": "StatefulSet"},
+        {"namespace": "database", "pod": "clickhouse-1", "controller_name": "clickhouse", "controller_type": "StatefulSet"},
+    ]
+    envelope["metadata"]["protected_members"] = [
+        {"namespace": "database", "pod": "clickhouse-keeper-0", "controller_name": "clickhouse-keeper", "controller_type": "StatefulSet"},
+    ]
+    envelope["metadata"]["cluster_assessment"] = {"classification": "candidate", "classification_reasons": ["all replicas idle"]}
+    envelope["metadata"]["dedicated_node_pool_consolidation"] = {
+        "dedicated_node_pool": True,
+        "taints_compatible": True,
+        "other_non_daemonset_workloads": 0,
+        "remaining_pods_fit_existing_nodes": True,
+        "node_monthly_cost": 50.0,
+    }
+    return envelope
+
+
+def test_clickhouse_cluster_attribution_and_savings_are_whole_cluster():
+    envelope = parse_idle_assessment(_clickhouse_cluster_envelope())
+    rows = [
+        _row(workload="clickhouse", cost=20.0),
+        _row(workload="clickhouse-keeper", service="Kubernetes Engine", cost=5.0),
+        _row(workload="clickhouse", service="Compute Engine", sku="Persistent SSD", cost=3.0),
+    ]
+    result = build_idle_cost_result(envelope, rows, 30)
+
+    cluster = result["cluster"]
+    assert cluster["assessment_unit"] == "cluster"
+    assert cluster["billing_attribution"]["detail"]["status"] == "available"
+    assert cluster["observed_cost"]["amount"] == 28.0
+    assert cluster["compute_cost"]["monthly_cost"]["amount"] == 20.0
+    assert cluster["protected_costs"]["keeper_compute"]["window_observed"] == {"USD": 5.0}
+    assert [item["pod"] for item in cluster["protected_members"]] == ["clickhouse-keeper-0"]
+    assert all(item["remediation_scenarios"][0]["monthly_savings"]["amount"] == 0.0 for item in result["workloads"])
+    single = _scenario(cluster, "single_replica_removal")
+    assert single["status"] == "no_savings"
+    assert single["monthly_savings"]["amount"] == 0.0
+    assert _scenario(cluster, "dedicated_node_pool_consolidation")["monthly_savings"]["amount"] == 50.0
+    assert _scenario(cluster, "whole_cluster_decommission")["monthly_savings"]["amount"] == 50.0
+
+
+def test_clickhouse_active_member_blocks_cluster_savings():
+    envelope = _clickhouse_cluster_envelope()
+    envelope["data"]["workloads"][0]["classification"] = "active"
+    envelope["metadata"]["cluster_assessment"] = {"classification": "active", "classification_reasons": ["one replica active"]}
+    result = build_idle_cost_result(parse_idle_assessment(envelope), [_row(workload="clickhouse", cost=20.0)], 30)
+    cluster = result["cluster"]
+    assert _scenario(cluster, "not_a_cluster_candidate")["status"] == "not_recommended"
+    assert cluster["marginal_monthly_savings"]["amount"] == 0.0
+    assert _scenario(cluster, "single_replica_removal")["monthly_savings"]["amount"] == 0.0

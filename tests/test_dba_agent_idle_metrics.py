@@ -62,8 +62,8 @@ def _database_profile_pod(
     role: str = "primary",
     pod_name: str | None = None,
 ) -> SimpleNamespace:
-    images = {"mysql": "mysql:8.0", "mariadb": "mariadb:11", "redis": "redis:7", "valkey": "valkey/valkey:8.0"}
-    labels = {"app.kubernetes.io/name": db_type, "team": owner}
+    images = {"mysql": "mysql:8.0", "mariadb": "mariadb:11", "redis": "redis:7", "valkey": "valkey/valkey:8.0", "clickhouse": "clickhouse/clickhouse-server:24.8"}
+    labels = {"app.kubernetes.io/name": db_type, "app.kubernetes.io/instance": db_type, "team": owner}
     if environment:
         labels["environment"] = environment
     if role:
@@ -76,7 +76,7 @@ def _database_profile_pod(
         )
     ]
     if exporter:
-        exporter_image = {"mysql": "prom/mysqld-exporter:v0.15", "mariadb": "prom/mysqld-exporter:v0.15", "redis": "oliver006/redis_exporter:v1.70", "valkey": "valkey-exporter:v1.7"}[db_type]
+        exporter_image = {"mysql": "prom/mysqld-exporter:v0.15", "mariadb": "prom/mysqld-exporter:v0.15", "redis": "oliver006/redis_exporter:v1.70", "valkey": "valkey-exporter:v1.7", "clickhouse": "altinity/metrics-exporter:v0.1"}[db_type]
         containers.append(SimpleNamespace(name="metrics", image=exporter_image))
     return SimpleNamespace(
         metadata=SimpleNamespace(
@@ -183,10 +183,17 @@ def _profile_series(db_type: str) -> dict[str, list[SimpleNamespace]]:
             "mysql_global_status_threads_running": "gauge",
             "mysql_global_status_threads_connected": "gauge",
         }
-    else:
+    elif db_type in {"redis", "valkey"}:
         aliases = {
             "redis_commands_processed_total": "counter",
             "redis_connected_clients": "gauge",
+        }
+    else:
+        aliases = {
+            "ClickHouseProfileEvents_Query": "counter",
+            "ClickHouseMetrics_Query": "gauge",
+            "ClickHouseMetrics_Connection": "gauge",
+            "ClickHouseMetrics_Merge": "gauge",
         }
     series: dict[str, list[SimpleNamespace]] = {}
     for metric_name, kind in aliases.items():
@@ -205,6 +212,57 @@ def _profile_series(db_type: str) -> dict[str, list[SimpleNamespace]]:
             points = [_point(_timestamp(1, hour), 0.01 if metric_name.endswith("running") else 2) for hour in range(4)]
             points.extend(_point(_timestamp(2, hour), 0.01 if metric_name.endswith("running") else 2) for hour in range(4))
         series[metric_type] = [_series("database", f"{db_type}-0", points=points)]
+    return series
+
+
+def _clickhouse_series_for_pods(pod_names: list[str], busy_pods: set[str] | None = None) -> dict[str, list[SimpleNamespace]]:
+    aliases = {
+        "ClickHouseProfileEvents_Query": "counter",
+        "ClickHouseMetrics_Query": "gauge",
+        "ClickHouseMetrics_Connection": "gauge",
+        "ClickHouseMetrics_Merge": "gauge",
+    }
+    busy_pods = busy_pods or set()
+    series: dict[str, list[SimpleNamespace]] = {}
+    for metric_name, kind in aliases.items():
+        metric_type = f"prometheus.googleapis.com/{metric_name}/{kind}"
+        samples = []
+        for pod_name in pod_names:
+            points = []
+            busy = pod_name in busy_pods
+            for day in (1, 2):
+                for hour in range(4):
+                    if kind == "counter":
+                        points.extend(
+                            [
+                                _point(_timestamp(day, hour), 0.0),
+                                _point(_timestamp(day, hour, 30), 0.0 if not busy else 3600.0),
+                            ]
+                        )
+                    else:
+                        points.append(_point(_timestamp(day, hour), 2))
+            samples.append(_series("database", pod_name, points=points))
+        series[metric_type] = samples
+    return series
+
+
+def _clickhouse_ingest_series(pod_name: str) -> dict[str, list[SimpleNamespace]]:
+    aliases = {
+        "ClickHouseProfileEvents_InsertedRows": "counter",
+        "ClickHouseMetrics_Query": "gauge",
+        "ClickHouseMetrics_Connection": "gauge",
+        "ClickHouseMetrics_Merge": "gauge",
+    }
+    series: dict[str, list[SimpleNamespace]] = {}
+    for metric_name, kind in aliases.items():
+        points = []
+        for day in (1, 2):
+            for hour in range(4):
+                if kind == "counter":
+                    points.extend([_point(_timestamp(day, hour), 0.0), _point(_timestamp(day, hour, 30), 3600.0)])
+                else:
+                    points.append(_point(_timestamp(day, hour), 2))
+        series[f"prometheus.googleapis.com/{metric_name}/{kind}"] = [_series("database", pod_name, points=points)]
     return series
 
 
@@ -865,3 +923,134 @@ def test_redis_and_empty_evidence_envelopes_pass_the_cost_contract(monkeypatch) 
     assert validated["data"]["workloads"][0]["metrics"]["mean_active_threads"] is None
     raw, _ = _run_assessment(monkeypatch, "valkey", exporter=False, series={})
     assert db_cost_tools.parse_idle_assessment(raw)["data"]["workloads"][0]["metrics"]["p95_work_per_second"] is None
+
+
+def _keeper_pod() -> SimpleNamespace:
+    return SimpleNamespace(
+        metadata=SimpleNamespace(
+            name="clickhouse-keeper-0",
+            namespace="database",
+            labels={"app.kubernetes.io/name": "clickhouse-keeper", "app.kubernetes.io/instance": "clickhouse"},
+            annotations={},
+            owner_references=[SimpleNamespace(kind="StatefulSet", name="clickhouse-keeper", controller=True)],
+        ),
+        spec=SimpleNamespace(
+            node_name="gke-pool-1-abc",
+            containers=[SimpleNamespace(name="keeper", image="clickhouse/clickhouse-keeper:24.8")],
+            volumes=[],
+        ),
+        status=SimpleNamespace(phase="Running"),
+    )
+
+
+def _run_clickhouse_assessment(
+    monkeypatch,
+    pods: list[SimpleNamespace],
+    series: dict[str, list[SimpleNamespace]],
+    *,
+    exec_evidence: dict | None = None,
+) -> tuple[str, dict]:
+    monkeypatch.setattr(idle_metrics, "_load_kubernetes_client", lambda: FakeCoreApi(pods))
+    monkeypatch.setattr(idle_metrics, "load_cloud_monitoring_client", lambda: FakeMonitoringApi({**series, **_gke_series_for_pods([pod.metadata.name for pod in pods])}))
+    monkeypatch.setattr(idle_metrics.client, "BatchV1Api", lambda: FakeBatchApi([]))
+    monkeypatch.setattr(
+        idle_metrics,
+        "_clickhouse_readonly_idle_evidence",
+        lambda namespace, pod: exec_evidence
+        or {
+            "system_backups": {
+                "status": "available",
+                "rows": [{"id": "1", "name": "daily", "status": "Finished", "start_time": "2026-01-02T00:00:00Z"}],
+            },
+            "system_disks": {"status": "unavailable", "reason": "unavailable", "rows": []},
+            "system_clusters": {"status": "unavailable", "reason": "unavailable", "rows": []},
+        },
+    )
+    raw = idle_metrics.collect_database_idle_assessment(
+        "clickhouse", namespace="database", days=2, project_id="example-project", output_mode="json"
+    )
+    return raw, json.loads(raw)
+
+
+def test_clickhouse_profile_supports_native_and_altinity_aliases(monkeypatch) -> None:
+    profile = idle_metrics.DATABASE_PROFILES["clickhouse"]
+    for logical, names in profile.aliases.items():
+        assert profile.kinds[logical] in {"counter", "gauge"}
+        assert names
+    assert any("ClickHouseProfileEvents_Query" in names for names in profile.aliases.values())
+    assert any("chi_clickhouse_event_Query" in names for names in profile.aliases.values())
+    assert any("ClickHouseProfileEvents_InsertedRows" in names for names in profile.aliases.values())
+    assert any("chi_clickhouse_event_inserted_rows" in names for names in profile.aliases.values())
+
+    aliases = {
+        "chi_clickhouse_event_Query": "counter",
+        "chi_clickhouse_metric_query": "gauge",
+        "chi_clickhouse_metric_connection": "gauge",
+        "chi_clickhouse_metric_merge": "gauge",
+    }
+    series = {
+        f"prometheus.googleapis.com/{name}/{kind}": [
+            _series(
+                "database",
+                "clickhouse-0",
+                points=[_point(_timestamp(1, hour), 0.0 if kind == "counter" else 0.01) for hour in range(4)],
+            )
+        ]
+        for name, kind in aliases.items()
+    }
+    _, payload = _run_clickhouse_assessment(monkeypatch, [_database_profile_pod("clickhouse", True)], series)
+    assert set(payload["metadata"]["resolved_metrics"]) == {"work_total", "active_threads", "connected_clients", "merges_running"}
+    assert payload["metadata"]["exporter_recommendation"].startswith("native ClickHouse")
+
+
+def test_clickhouse_busy_replica_makes_the_whole_cluster_active(monkeypatch) -> None:
+    pods = [
+        _database_profile_pod("clickhouse", True, pod_name="clickhouse-0", role="primary"),
+        _database_profile_pod("clickhouse", True, pod_name="clickhouse-1", role="replica"),
+    ]
+    _, payload = _run_clickhouse_assessment(monkeypatch, pods, _clickhouse_series_for_pods(["clickhouse-0", "clickhouse-1"], {"clickhouse-1"}))
+    assert payload["metadata"]["assessment_unit"] == "cluster"
+    assert payload["metadata"]["cluster_assessment"]["classification"] == "active"
+    assert [member["pod"] for member in payload["metadata"]["cluster_members"]] == ["clickhouse-0", "clickhouse-1"]
+    assert db_cost_tools.parse_idle_assessment(json.dumps(payload))["metadata"]["assessment_unit"] == "cluster"
+
+
+def test_clickhouse_insert_only_traffic_is_work(monkeypatch) -> None:
+    pod = _database_profile_pod("clickhouse", True, pod_name="clickhouse-0", role="primary")
+    _, payload = _run_clickhouse_assessment(monkeypatch, [pod], _clickhouse_ingest_series("clickhouse-0"))
+    workload = payload["data"]["workloads"][0]
+    assert workload["metrics"]["p95_work_per_second"] == 2.0
+    assert workload["classification"] == "active"
+    assert payload["metadata"]["ingest_only"] is True
+    assert db_cost_tools.parse_idle_assessment(json.dumps(payload))["metadata"]["ingest_only"] is True
+
+
+def test_clickhouse_keeper_is_a_protected_cluster_member(monkeypatch) -> None:
+    pods = [_database_profile_pod("clickhouse", True, pod_name="clickhouse-0", role="primary"), _keeper_pod()]
+    _, payload = _run_clickhouse_assessment(monkeypatch, pods, _clickhouse_series_for_pods(["clickhouse-0"]))
+    assert [member["pod"] for member in payload["metadata"]["protected_members"]] == ["clickhouse-keeper-0"]
+    assert all(member["role"] == "protected_keeper" for member in payload["metadata"]["protected_members"])
+
+
+def test_clickhouse_backup_and_storage_approval_evidence(monkeypatch) -> None:
+    pod = _database_profile_pod("clickhouse", True, pod_name="clickhouse-0", role="primary")
+    exec_evidence = {
+        "system_backups": {
+            "status": "available",
+            "rows": [{"id": "1", "name": "daily", "status": "Finished", "start_time": "2026-01-02T00:00:00Z"}],
+        },
+        "system_disks": {
+            "status": "available",
+            "rows": [{"name": "s3", "type": "s3", "path": "s3://bucket/path"}],
+        },
+        "system_clusters": {
+            "status": "available",
+            "rows": [{"cluster": "remote", "host_name": "remote-a", "host_address": "10.0.0.1", "is_local": 0}],
+        },
+    }
+    _, payload = _run_clickhouse_assessment(monkeypatch, [pod], _clickhouse_series_for_pods(["clickhouse-0"]), exec_evidence=exec_evidence)
+    cluster_backup = payload["metadata"]["cluster_backup_evidence"]
+    approval_risks = payload["metadata"]["approval_risks"]
+    assert cluster_backup["system_backups"]["rows"][0]["name"] == "daily"
+    assert approval_risks["object_storage_disks"][0]["name"] == "s3"
+    assert approval_risks["cross_cluster_consumers"][0]["host_name"] == "remote-a"

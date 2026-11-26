@@ -124,6 +124,25 @@ def parse_idle_assessment(raw: str | dict[str, Any]) -> dict[str, Any]:
         if not isinstance(workload.get("labels", {}), dict):
             raise IdleAssessmentError(f"{prefix}.labels must be an object")
 
+    assessment_unit = metadata.get("assessment_unit")
+    if assessment_unit is not None and assessment_unit != "cluster":
+        raise IdleAssessmentError("metadata.assessment_unit must be 'cluster' when present")
+
+    def _require_member_list(field: str) -> None:
+        members = metadata.get(field)
+        if not isinstance(members, list) or any(
+            not isinstance(member, dict)
+            or not isinstance(member.get("namespace"), str)
+            or not isinstance(member.get("pod"), str)
+            for member in members
+        ):
+            raise IdleAssessmentError(f"metadata.{field} must be an array of member objects")
+
+    if assessment_unit == "cluster":
+        _require_member_list("cluster_members")
+        if metadata.get("protected_members") is not None:
+            _require_member_list("protected_members")
+
     _require_text(metadata.get("project_id"), "metadata.project_id")
     window_days = _require_number(metadata.get("window_days"), "metadata.window_days", 1)
     if not float(window_days).is_integer() or int(window_days) > 90:
@@ -530,6 +549,142 @@ def _schedule_scenario(compute: dict[str, Any], workload: dict[str, Any], metada
     }
 
 
+def _dedicated_node_pool_scenario(
+    compute: dict[str, Any], metadata: dict[str, Any], rows: list[dict[str, Any]], days: int
+) -> dict[str, Any]:
+    evidence = metadata.get("dedicated_node_pool_consolidation")
+    missing = [
+        "dedicated_node_pool_consolidation.dedicated_node_pool",
+        "dedicated_node_pool_consolidation.taints_compatible",
+        "dedicated_node_pool_consolidation.other_non_daemonset_workloads",
+        "dedicated_node_pool_consolidation.remaining_pods_fit_existing_nodes",
+        "removable node monthly cost",
+    ]
+    if not isinstance(evidence, dict):
+        return {
+            "name": "dedicated_node_pool_consolidation",
+            "status": "requires_evidence",
+            "monthly_savings": {"currency": "", "amount": 0.0},
+            "missing_evidence": missing,
+            "note": "A dedicated or tainted pool must be proven before removing shared nodes.",
+        }
+    dedicated = evidence.get("dedicated_node_pool")
+    taints = evidence.get("taints_compatible")
+    other = evidence.get("other_non_daemonset_workloads")
+    fits = evidence.get("remaining_pods_fit_existing_nodes")
+    if dedicated is not True or taints is not True:
+        return {
+            "name": "dedicated_node_pool_consolidation",
+            "status": "no_savings",
+            "monthly_savings": {"currency": _currency_or_empty(compute), "amount": 0.0},
+            "missing_evidence": [],
+            "note": "Only a dedicated pool with compatible taints and no other tenants is removable.",
+        }
+    if not isinstance(other, int) or isinstance(other, bool) or other < 0:
+        return {
+            "name": "dedicated_node_pool_consolidation",
+            "status": "requires_evidence",
+            "monthly_savings": {"currency": "", "amount": 0.0},
+            "missing_evidence": [missing[2]],
+        }
+    if not isinstance(fits, bool):
+        return {
+            "name": "dedicated_node_pool_consolidation",
+            "status": "requires_evidence",
+            "monthly_savings": {"currency": "", "amount": 0.0},
+            "missing_evidence": [missing[3]],
+        }
+    if other > 0 or not fits:
+        return {
+            "name": "dedicated_node_pool_consolidation",
+            "status": "no_savings",
+            "monthly_savings": {"currency": _currency_or_empty(compute), "amount": 0.0},
+            "missing_evidence": [],
+            "note": "Another workload shares the pool or remaining pods do not fit.",
+        }
+    node_cost = _amount(evidence.get("node_monthly_cost"))
+    currency = _currency_or_empty(compute)
+    node_pool = evidence.get("node_pool")
+    if node_cost is None and _is_labeled(node_pool) and currency:
+        pin = _cluster_pin(metadata)
+        pool_rows = [
+            row
+            for row in rows
+            if row.get("project") == metadata["project_id"]
+            and row.get("node_pool") == node_pool
+            and row.get("currency") == currency
+            and all(row.get(key) == value for key, value in pin.items())
+        ]
+        pool_total = sum(_amount(row.get("total_cost")) or 0.0 for row in pool_rows)
+        node_count = evidence.get("node_count")
+        if pool_total > 0 and isinstance(node_count, int) and not isinstance(node_count, bool) and node_count > 0:
+            node_cost = _monthly(pool_total, days) / node_count
+    if node_cost is None or node_cost <= 0:
+        return {
+            "name": "dedicated_node_pool_consolidation",
+            "status": "requires_evidence",
+            "monthly_savings": {"currency": "", "amount": 0.0},
+            "missing_evidence": [missing[4]],
+        }
+    return {
+        "name": "dedicated_node_pool_consolidation",
+        "status": "estimate",
+        "monthly_savings": {"currency": currency, "amount": round(node_cost, 6)},
+        "note": "Savings use the supplied removable-node cost and dedicated-pool fit evidence.",
+    }
+
+
+def _whole_cluster_decommission(
+    compute: dict[str, Any],
+    workload: dict[str, Any],
+    metadata: dict[str, Any],
+    node_scenario: dict[str, Any] | None,
+) -> dict[str, Any]:
+    if compute["status"] != "available":
+        return {
+            "name": "whole_cluster_decommission",
+            "status": "unavailable",
+            "monthly_savings": {"currency": "", "amount": 0.0},
+            "missing_evidence": ["cluster compute attribution"],
+        }
+    distribution = metadata.get("kubernetes", {}).get("distribution")
+    if distribution == "Autopilot":
+        savings = copy.deepcopy(compute["monthly_cost"])
+    elif distribution == "Standard":
+        if node_scenario is None or node_scenario.get("status") != "estimate":
+            return {
+                "name": "whole_cluster_decommission",
+                "status": "requires_evidence",
+                "monthly_savings": {"currency": "", "amount": 0.0},
+                "missing_evidence": ["dedicated_node_pool_consolidation evidence for removable nodes"],
+                "note": "Standard cluster decommission is not modeled unless its dedicated nodes can be removed.",
+            }
+        savings = copy.deepcopy(node_scenario["monthly_savings"])
+    else:
+        return {
+            "name": "whole_cluster_decommission",
+            "status": "requires_evidence",
+            "monthly_savings": {"currency": "", "amount": 0.0},
+            "missing_evidence": ["kubernetes.distribution (Autopilot or Standard)"],
+        }
+    return {
+        "name": "whole_cluster_decommission",
+        "status": "requires_approval" if not _cost_review_eligible(workload) else "estimate",
+        "monthly_savings": savings,
+        "note": "The whole cluster is the decision. Object storage, backups, Keeper costs, and cross-cluster consumers still require review.",
+    }
+
+
+def _single_replica_scenario() -> dict[str, Any]:
+    return {
+        "name": "single_replica_removal",
+        "status": "no_savings",
+        "monthly_savings": {"currency": "", "amount": 0.0},
+        "missing_evidence": [],
+        "note": "Replica-count right-sizing requires owner approval and is never modeled as removal savings.",
+    }
+
+
 def _decommission_scenario(
     compute: dict[str, Any], workload: dict[str, Any], distribution: Any, node_scenario: dict[str, Any] | None
 ) -> dict[str, Any]:
@@ -593,8 +748,177 @@ def _merge_missing_evidence(scenarios: list[dict[str, Any]]) -> list[str]:
     return evidence
 
 
+def _deduplicate_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    unique: dict[tuple[tuple[str, Any], ...], dict[str, Any]] = {}
+    for row in rows:
+        key = tuple(sorted((key, row.get(key)) for key in row))
+        unique.setdefault(key, row)
+    return list(unique.values())
+
+
+def _cluster_member_rows(
+    rows: list[dict[str, Any]],
+    members: list[dict[str, Any]],
+    project_id: str,
+    metadata: dict[str, Any],
+) -> list[dict[str, Any]]:
+    matched: list[dict[str, Any]] = []
+    for member in members:
+        matched.extend(_match_workload_rows(rows, member, project_id, metadata))
+    return _deduplicate_rows(matched)
+
+
+def _cluster_attribution(rows: list[dict[str, Any]], days: int) -> dict[str, Any]:
+    if not rows:
+        return {
+            "status": "unavailable",
+            "reason": "no billing rows for cluster members or protected members; GKE cost allocation may be disabled or labels may be absent",
+            "currencies": [],
+        }
+    currencies = sorted({str(row.get("currency")) for row in rows if row.get("currency")})
+    if _spans_multiple_clusters(rows):
+        return {
+            "status": "unavailable",
+            "reason": (
+                "cluster member names match billing rows in more than one GKE cluster; "
+                "set DBA_GKE_CLUSTER_NAME and DBA_GKE_CLUSTER_LOCATION so costs are not summed across clusters"
+            ),
+            "currencies": currencies,
+        }
+    attribution = _single_currency_total(rows)
+    if attribution is None:
+        return {
+            "status": "unavailable",
+            "reason": "cluster attribution spans multiple currencies; currencies were not mixed",
+            "currencies": currencies,
+        }
+    fully_labeled = all(_has_attribution_labels(row) for row in rows)
+    return {
+        "status": "available" if fully_labeled else "partial",
+        "observed_cost": attribution,
+        "observed_window_days": days,
+        "attributed_monthly_cost": {
+            "currency": attribution["currency"],
+            "amount": _monthly(attribution["amount"], days),
+        },
+        "currencies": currencies,
+        "missing_labels": [] if fully_labeled else ["one or more GKE cost-allocation labels"],
+    }
+
+
+def _cluster_protected_costs(
+    rows: list[dict[str, Any]], protected_rows: list[dict[str, Any]], days: int
+) -> dict[str, Any]:
+    protected = _protected_costs(rows, days)
+    keeper_compute_rows = [row for row in protected_rows if _cost_bucket(row.get("service"), row.get("sku")) == "compute"]
+    totals: dict[str, float] = {}
+    for row in keeper_compute_rows:
+        _add_amount(totals, row.get("currency"), row.get("total_cost"))
+    shaped = {currency: round(total, 6) for currency, total in sorted(totals.items())}
+    protected["keeper_compute"] = {
+        "window_observed": shaped,
+        "monthly_projection": {currency: _monthly(total, days) for currency, total in totals.items()},
+    }
+    return protected
+
+
+def _model_cluster(
+    envelope: dict[str, Any], rows: list[dict[str, Any]], days: int
+) -> dict[str, Any]:
+    metadata = envelope["metadata"]
+    project_id = metadata["project_id"]
+    workloads = envelope["data"]["workloads"]
+    protected_members = metadata.get("protected_members", [])
+    server_rows = _cluster_member_rows(rows, workloads, project_id, metadata)
+    protected_rows = _cluster_member_rows(rows, protected_members, project_id, metadata)
+    all_rows = _deduplicate_rows([*server_rows, *protected_rows])
+    attribution = _cluster_attribution(all_rows, days)
+    compute = _compute_cost(server_rows, days)
+    protected = _cluster_protected_costs(all_rows, protected_rows, days)
+
+    cluster_assessment = metadata.get("cluster_assessment", {})
+    classification = cluster_assessment.get("classification") if isinstance(cluster_assessment, dict) else None
+    if not classification:
+        member_statuses = [workload.get("classification") for workload in workloads]
+        classification = "active" if "active" in member_statuses else "candidate" if all(status == "candidate" for status in member_statuses) else "blocked"
+    reasons = cluster_assessment.get("classification_reasons", []) if isinstance(cluster_assessment, dict) else []
+
+    scenarios: list[dict[str, Any]] = []
+    if classification != "candidate":
+        scenarios.append(
+            {
+                "name": "not_a_cluster_candidate",
+                "status": "not_recommended",
+                "monthly_savings": {"currency": "", "amount": 0.0},
+                "missing_evidence": [],
+                "note": f"DBA classified this cluster as {classification}; no savings are modeled.",
+            }
+        )
+    else:
+        pseudo_workload = {
+            "classification": "candidate",
+            "cost_review_eligible": all(bool(workload.get("cost_review_eligible")) for workload in workloads),
+            "metrics": {
+                # The lowest member's zero-work ratio is the safest cluster evidence.
+                "zero_work_hour_ratio": min(_zero_work_ratio(workload) for workload in workloads),
+            },
+        }
+        distribution = metadata.get("kubernetes", {}).get("distribution")
+        node_scenario = None
+        if distribution == "Autopilot":
+            scenarios.append(_autopilot_scenario(compute, pseudo_workload, metadata, days))
+        elif distribution == "Standard":
+            node_scenario = _dedicated_node_pool_scenario(compute, metadata, rows, days)
+            scenarios.append(node_scenario)
+        else:
+            scenarios.append(
+                {
+                    "name": "cluster_attribution",
+                    "status": "requires_evidence",
+                    "monthly_savings": {"currency": "", "amount": 0.0},
+                    "missing_evidence": ["kubernetes.distribution (Autopilot or Standard)"],
+                }
+            )
+        scenarios.append(_schedule_scenario(compute, pseudo_workload, metadata, days))
+        scenarios.append(_whole_cluster_decommission(compute, pseudo_workload, metadata, node_scenario))
+    scenarios.append(_single_replica_scenario())
+
+    missing_evidence = _merge_missing_evidence(scenarios)
+    if attribution["status"] == "unavailable":
+        missing_evidence.insert(0, "GKE cluster billing attribution")
+    scenario = next(
+        (item for item in scenarios if item["name"] in {"autopilot_idle_scale_down", "dedicated_node_pool_consolidation", "whole_cluster_decommission"}),
+        scenarios[0],
+    )
+    return {
+        "assessment_unit": "cluster",
+        "classification": classification,
+        "classification_reasons": reasons,
+        "cluster_members": metadata.get("cluster_members", []),
+        "protected_members": protected_members,
+        "billing_attribution": {
+            "status": attribution["status"],
+            "system_labels": list(_ATTRIBUTION_KEYS),
+            "detail": attribution,
+        },
+        "observed_cost": attribution.get("observed_cost"),
+        "attributed_monthly_cost": attribution.get("attributed_monthly_cost"),
+        "marginal_monthly_savings": scenario.get("monthly_savings", {"currency": "", "amount": 0.0}),
+        "compute_cost": compute,
+        "protected_costs": protected,
+        "remediation_scenarios": scenarios,
+        "confidence": _confidence(attribution, metadata["missing_metrics"], scenarios, days),
+        "missing_evidence": missing_evidence,
+    }
+
+
 def _model_workload(
-    envelope: dict[str, Any], workload: dict[str, Any], rows: list[dict[str, Any]], days: int
+    envelope: dict[str, Any],
+    workload: dict[str, Any],
+    rows: list[dict[str, Any]],
+    days: int,
+    *,
+    cluster_member: bool = False,
 ) -> dict[str, Any]:
     """Model one workload in isolation so currency and attribution stay separate."""
     metadata = envelope["metadata"]
@@ -609,7 +933,17 @@ def _model_workload(
     distribution = metadata.get("kubernetes", {}).get("distribution") if isinstance(metadata.get("kubernetes"), dict) else None
     scenarios: list[dict[str, Any]] = []
     primary: dict[str, Any] | None = None
-    if workload["classification"] != "candidate":
+    if cluster_member:
+        scenarios.append(
+            {
+                "name": "cluster_member_transparency",
+                "status": "not_recommended",
+                "monthly_savings": {"currency": "", "amount": 0.0},
+                "missing_evidence": [],
+                "note": "This row is per-pod evidence only; savings are modeled for the whole cluster.",
+            }
+        )
+    elif workload["classification"] != "candidate":
         # Savings are modeled only for workloads DBA judged safe to review.
         scenarios.append({
             "name": "not_a_candidate",
@@ -667,7 +1001,11 @@ def build_idle_cost_result(
     metadata = envelope["metadata"]
     project_id = metadata["project_id"]
     relevant_rows = [row for row in rows if row.get("project") == project_id]
-    workload_results = [_model_workload(envelope, workload, relevant_rows, days) for workload in envelope["data"]["workloads"]]
+    cluster_mode = metadata.get("assessment_unit") == "cluster"
+    workload_results = [
+        _model_workload(envelope, workload, relevant_rows, days, cluster_member=cluster_mode)
+        for workload in envelope["data"]["workloads"]
+    ]
     first = workload_results[0]
 
     return {
@@ -681,10 +1019,12 @@ def build_idle_cost_result(
         **first,
         "unattributed_costs": _unattributed_costs(relevant_rows),
         "workloads": workload_results,
+        "cluster": _model_cluster(envelope, relevant_rows, days) if cluster_mode else None,
         "limits": [
             "No Kubernetes discovery or mutation calls.",
             "Only workload-attributed GKE system-label rows are used for savings.",
             "Currencies are never mixed.",
+            "Cluster assessments model the whole cluster; a single replica removal is never savings.",
         ],
     }
 
@@ -736,6 +1076,26 @@ def format_idle_cost_markdown(result: dict[str, Any]) -> str:
         if item["missing_evidence"]:
             lines.append("Missing evidence: " + "; ".join(item["missing_evidence"]))
         lines.append("")
+
+    cluster = result.get("cluster")
+    if cluster:
+        lines.extend(
+            [
+                "### Cluster Decision",
+                f"Assessment unit: **{cluster['assessment_unit']}** | Classification: **{cluster['classification']}**",
+                f"Attributed monthly cost: {cluster['attributed_monthly_cost']['currency']} {cluster['attributed_monthly_cost']['amount']:,.2f}"
+                if cluster.get("attributed_monthly_cost")
+                else "Attributed monthly cost: unavailable",
+                "Marginal savings scenarios:",
+            ]
+        )
+        for scenario in cluster["remediation_scenarios"]:
+            savings = scenario.get("monthly_savings") or {"currency": "", "amount": 0.0}
+            lines.append(f"- **{scenario['name']}**: {scenario['status']} - {savings['currency']} {savings['amount']:,.2f}/month")
+            if scenario.get("note"):
+                lines.append(f"  - {scenario['note']}")
+        if cluster["missing_evidence"]:
+            lines.append("Missing evidence: " + "; ".join(cluster["missing_evidence"]))
 
     lines.extend(["", result["limits"][0], result["limits"][1]])
     return "\n".join(lines)
